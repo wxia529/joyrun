@@ -1,0 +1,70 @@
+package localfs
+
+import (
+	"fmt"
+	"path"
+	"runtime"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/wxia529/joyrun/internal/fault"
+)
+
+func ValidatePullPaths(files []string) error {
+	return validatePullPaths(files, runtime.GOOS)
+}
+
+func validatePullPaths(files []string, goos string) error {
+	seen := make(map[string]string, len(files))
+	for _, file := range files {
+		cleaned := path.Clean(file)
+		if file == "" || !utf8.ValidString(file) || strings.ContainsRune(file, '\x00') || path.IsAbs(file) ||
+			cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || cleaned != file {
+			return fault.New("LOCAL_PATH_UNSUPPORTED", fmt.Sprintf("remote result path %q is not a safe relative path", file), false)
+		}
+		key := cleaned
+		if goos == "windows" {
+			if err := validateWindowsPath(cleaned); err != nil {
+				return fault.New("LOCAL_PATH_UNSUPPORTED", err.Error(), false)
+			}
+			key = strings.ToLower(cleaned)
+		}
+		if previous, ok := seen[key]; ok && previous != cleaned {
+			return fault.New("LOCAL_PATH_COLLISION", fmt.Sprintf("remote results %q and %q map to the same local path", previous, cleaned), false)
+		}
+		seen[key] = cleaned
+	}
+	return nil
+}
+
+func validateWindowsPath(value string) error {
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || strings.HasSuffix(component, ".") || strings.HasSuffix(component, " ") {
+			return fmt.Errorf("remote result path %q cannot be represented safely on Windows", value)
+		}
+		original := component
+		for len(component) > 0 {
+			r, size := utf8.DecodeRuneInString(component)
+			if r < 32 || strings.ContainsRune(`<>:"\|?*`, r) {
+				return fmt.Errorf("remote result path %q contains a character unsupported by Windows", value)
+			}
+			component = component[size:]
+		}
+		name := strings.ToUpper(strings.SplitN(original, ".", 2)[0])
+		if windowsReservedName(name) {
+			return fmt.Errorf("remote result path %q uses a reserved Windows filename", value)
+		}
+	}
+	return nil
+}
+
+func windowsReservedName(name string) bool {
+	switch name {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(name) == 4 && (strings.HasPrefix(name, "COM") || strings.HasPrefix(name, "LPT")) {
+		return name[3] >= '1' && name[3] <= '9'
+	}
+	return false
+}

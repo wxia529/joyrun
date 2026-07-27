@@ -1,0 +1,6 @@
+/joyrun
+/bin/
+*.db
+*.db-shm
+*.db-wal
+coverage.out

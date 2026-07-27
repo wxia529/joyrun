@@ -1,0 +1,96 @@
+version: 1
+
+clusters:
+  gibbs:
+    # Use an OpenSSH host alias. JoyRun inherits ~/.ssh/config, ssh-agent,
+    # ProxyJump, known_hosts, usernames, ports, and keys from OpenSSH.
+    host: gibbs
+    scheduler: slurm
+    remote_root: /scratch/your-user/joyrun
+    # auto: Windows uses SFTP; Linux/macOS prefer rsync and fall back to SFTP.
+    transfer: auto
+
+targets:
+  gibbs/orca:
+    cluster: gibbs
+
+    params:
+      cpus:
+        type: int
+        default: 32
+        description: Number of CPU cores requested from Slurm.
+
+      memory:
+        type: string
+        default: 150G
+        description: Total Slurm memory request.
+
+      partition:
+        type: string
+        default: community
+        choices:
+          - community
+          - highio
+
+    script: |
+      #!/bin/bash
+      #SBATCH --cpus-per-task={{ .Params.cpus }}
+      #SBATCH --mem={{ .Params.memory }}
+      #SBATCH --partition={{ .Params.partition }}
+      #SBATCH --job-name={{ .Stem }}
+
+      /share/software/orca/orca {{ .Input }} > {{ .Stem }}.out
+
+    push:
+      exclude:
+        - "*.out"
+        - "*.gbw"
+        - "*.tmp"
+
+    pull:
+      default:
+        - "*.out"
+        - "*.xyz"
+        - "*.gbw"
+
+    logs:
+      - "{{ .Stem }}.out"
+
+  gibbs/vasp:
+    cluster: gibbs
+
+    params:
+      executable:
+        type: string
+        default: std
+        choices:
+          - std
+          - gam
+          - ncl
+
+    script: |
+      #!/bin/bash
+      #SBATCH --nodes=4
+      #SBATCH --ntasks=96
+      #SBATCH --job-name={{ .Name }}
+
+      module load vasp
+      srun vasp_{{ .Params.executable }}
+
+    push:
+      exclude:
+        - OUTCAR
+        - OSZICAR
+        - WAVECAR
+        - CHGCAR
+
+    pull:
+      default:
+        - OUTCAR
+        - CONTCAR
+        - OSZICAR
+        - vasprun.xml
+
+    logs:
+      - OUTCAR
+      - OSZICAR
