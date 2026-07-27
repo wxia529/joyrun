@@ -30,9 +30,8 @@ Treat stdout as the JSON interface and stderr as diagnostics.
 3. Discover targets instead of guessing:
 
    ```bash
-   joyrun targets --json
+   joyrun target list --json
    joyrun target show TARGET --json
-   joyrun target params TARGET --json
    ```
 
 4. If multiple targets are plausible and the user's intent does not determine
@@ -50,8 +49,9 @@ joyrun submit SOURCE -t TARGET --dry-run --json
 
 Inspect:
 
-- resolved source and work directory;
-- files included in the snapshot;
+- resolved source kind, work directory, and entry file;
+- resolved `.Input`, `.Stem`, `.Name`, and `.WorkDir` values;
+- files included in the upload snapshot;
 - ignored files;
 - resolved parameters and their sources;
 - remote directory;
@@ -59,6 +59,9 @@ Inspect:
 
 Do not submit if required inputs are absent, unintended large files are
 included, or the rendered command does not match the requested calculation.
+Treat `SOURCE_KIND_MISMATCH` and `SOURCE_PATTERN_MISMATCH` as input-selection
+errors; do not work around them by submitting a containing directory to a file
+target.
 
 Before the first real use of a target on the current machine, run:
 
@@ -66,9 +69,8 @@ Before the first real use of a target on the current machine, run:
 joyrun doctor TARGET --json
 ```
 
-Inspect `result.ok` and every item in `result.checks`. Do not rely only on the
-process exit code or the outer JSON `ok`, because doctor reports failed checks
-as data.
+Inspect `result.ready` and every item in `result.checks`. `warn` checks are
+non-blocking; `fail` checks are blocking and make the command exit nonzero.
 
 ## Submit
 
@@ -106,8 +108,11 @@ Query an exact task:
 joyrun status jr_TASK_ID --json
 ```
 
-Interpret normalized states:
+Interpret `compute_state`:
 
+- `created`: local task exists but scheduler acceptance is not confirmed;
+- `submission_failed`: submission pipeline failed; check status before considering
+  another submission;
 - `queued`: accepted and waiting for resources;
 - `running`: executing remotely;
 - `completed`: computation finished and normal pull is allowed;
@@ -115,11 +120,37 @@ Interpret normalized states:
 - `cancelled`: explicitly cancelled;
 - `unknown`: scheduler has no usable state; investigate before acting.
 
+Interpret `pull_state` independently:
+
+- `not_pulled`: no successful pull has been recorded;
+- `pulling`: a pull is in progress;
+- `pulled`: the latest requested file set was pulled successfully;
+- `partial`: files were pulled with `--live`;
+- `failed`: the latest pull failed; computation state is unchanged.
+
+Do not interpret `pull_state` as a claim that all remote files still exist or
+that every scientifically important file has been downloaded.
+
+At the start of a new session, restore context with:
+
+```bash
+joyrun list --json
+joyrun inspect jr_TASK_ID --json
+joyrun inspect jr_TASK_ID --events --json
+```
+
+Use `joyrun status --all --json` to refresh all non-terminal tasks. Status
+refresh never submits a replacement task.
+
 Read logs without downloading the complete result:
 
 ```bash
 joyrun logs jr_TASK_ID --lines 200 --json
 ```
+
+JoyRun selects an existing configured application log and automatically falls
+back to its reserved scheduler log. `LOG_NOT_READY` is retryable and lists the
+paths checked.
 
 Do not poll in a tight loop. Check only when requested or after a meaningful
 interval appropriate to the calculation.
@@ -130,7 +161,7 @@ workflow.
 
 ## Pull results safely
 
-After `completed`, use the target's default artifact policy:
+After `completed`, use the target's default pull patterns:
 
 ```bash
 joyrun pull jr_TASK_ID --json
@@ -168,10 +199,10 @@ resubmit the calculation.
 
 ## History, cancellation, and recovery
 
-Use history to inspect repeated submissions:
+Pass a source to `list` to inspect repeated submissions:
 
 ```bash
-joyrun history SOURCE --json
+joyrun list SOURCE --json
 ```
 
 Cancel only when the user explicitly requests cancellation, and use an exact
@@ -214,5 +245,5 @@ Retry only the failed stage when `retryable` is true:
   accepted the job;
 - do not treat `PULL_FAILED` as a reason to recompute.
 
-Report the error code, task ID if available, compute state, and safest next
-action to the user.
+Report the error code, task ID if available, compute state, pull state, and
+safest next action to the user.

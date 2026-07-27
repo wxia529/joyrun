@@ -14,6 +14,11 @@ targets:
   gibbs/orca:
     cluster: gibbs
 
+    source:
+      kind: file
+      patterns:
+        - "*.inp"
+
     params:
       cpus:
         type: int
@@ -58,6 +63,9 @@ targets:
 
   gibbs/vasp:
     cluster: gibbs
+
+    source:
+      kind: directory
 
     params:
       executable:

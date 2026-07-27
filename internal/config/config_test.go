@@ -17,6 +17,9 @@ clusters:
 targets:
   gibbs/orca:
     cluster: gibbs
+    source:
+      kind: file
+      patterns: ["*.inp"]
     params:
       cpus:
         type: int
@@ -39,6 +42,9 @@ targets:
 	if cfg.Clusters["gibbs"].Transfer != "auto" {
 		t.Fatalf("expected default auto transfer, got %#v", cfg.Clusters["gibbs"])
 	}
+	if cfg.Targets["gibbs/orca"].Source.Kind != "file" {
+		t.Fatalf("unexpected source policy: %#v", cfg.Targets["gibbs/orca"].Source)
+	}
 	values, sources, err := ResolveParams(cfg.Targets["gibbs/orca"], []string{"cpus=64"})
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +54,43 @@ targets:
 	}
 	if sources["cpus"] != "cli" || sources["executable"] != "target_default" {
 		t.Fatalf("unexpected sources: %#v", sources)
+	}
+}
+
+func TestLoadRequiresExplicitSourceContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `version: 1
+clusters:
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+targets:
+  c/run:
+    cluster: c
+    script: "run {{ .Input }} > {{ .Stem }}.out"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected missing source.kind to be rejected")
+	}
+}
+
+func TestLoadRejectsDirectoryTargetUsingEntryVariables(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `version: 1
+clusters:
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+targets:
+  c/run:
+    cluster: c
+    source: {kind: directory}
+    script: "run {{ .Input }}"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected directory target using .Input to be rejected")
 	}
 }
 
@@ -74,6 +117,7 @@ clusters:
 targets:
   c/run:
     cluster: c
+    source: {kind: either}
     params:
       mode: {type: string, default: a, choices: [a, b]}
     script: "echo {{ .Params.mode }}"

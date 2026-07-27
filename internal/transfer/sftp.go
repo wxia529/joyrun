@@ -190,7 +190,7 @@ func (s *SFTP) pull(ctx context.Context, client *sftp.Client, remoteDir, localDi
 		}
 		rel, err := cleanRelative(file)
 		if err != nil {
-			return fault.Wrap("PULL_FAILED", "unsafe remote result path", false, err)
+			return fault.Wrap("PULL_FAILED", "unsafe remote file path", false, err)
 		}
 		if err := downloadFile(client, path.Join(remoteDir, rel), filepath.Join(localDir, filepath.FromSlash(rel))); err != nil {
 			return fault.Wrap("PULL_FAILED", "SFTP download failed for "+rel, true, err)
@@ -210,7 +210,7 @@ func downloadFile(client *sftp.Client, remotePath, localPath string) error {
 		return err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("remote result is not a regular file: %s", remotePath)
+		return fmt.Errorf("remote path is not a regular file: %s", remotePath)
 	}
 	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 		return err

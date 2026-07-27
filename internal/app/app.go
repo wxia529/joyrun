@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -46,10 +47,19 @@ type Preview struct {
 	RemoteDir      string                `json:"remote_dir"`
 	Params         map[string]any        `json:"params"`
 	ParamSources   map[string]string     `json:"param_sources"`
-	Files          []string              `json:"files"`
+	Files          []string              `json:"upload_files"`
 	Ignored        []string              `json:"ignored"`
 	RenderedScript string                `json:"rendered_script"`
 	InputManifest  []model.ManifestEntry `json:"input_manifest"`
+	TemplateValues TemplateValues        `json:"template_values"`
+	SchedulerLog   string                `json:"scheduler_log"`
+}
+
+type TemplateValues struct {
+	Input   string `json:"input"`
+	Stem    string `json:"stem"`
+	Name    string `json:"name"`
+	WorkDir string `json:"workdir"`
 }
 
 type SubmitResult struct {
@@ -69,10 +79,40 @@ type PullResult struct {
 	Destination string     `json:"destination"`
 }
 
+type LogResult struct {
+	TaskID  string `json:"task_id"`
+	Path    string `json:"path"`
+	Kind    string `json:"kind"`
+	Content string `json:"content"`
+}
+
+type TraceResult struct {
+	Task   model.Task        `json:"task"`
+	Events []model.TaskEvent `json:"events"`
+}
+
+type StatusFailure struct {
+	TaskID string       `json:"task_id"`
+	Error  *fault.Error `json:"error"`
+}
+
+type StatusAllResult struct {
+	Tasks    []model.Task    `json:"tasks"`
+	Failures []StatusFailure `json:"failures,omitempty"`
+}
+
 type DoctorCheck struct {
-	Name    string `json:"name"`
-	OK      bool   `json:"ok"`
-	Message string `json:"message,omitempty"`
+	Name            string `json:"name"`
+	Status          string `json:"status"`
+	OK              bool   `json:"ok"`
+	Blocking        bool   `json:"blocking"`
+	Message         string `json:"message,omitempty"`
+	SuggestedAction string `json:"suggested_action,omitempty"`
+}
+
+type DoctorResult struct {
+	Ready  bool          `json:"ready"`
+	Checks []DoctorCheck `json:"checks"`
 }
 
 func (a *App) Close() error {
@@ -108,6 +148,9 @@ func (a *App) Preview(ctx context.Context, cwd, sourcePath, targetName string, s
 	target, ok := a.Config.Targets[targetName]
 	if !ok {
 		return Preview{}, model.Task{}, "", fault.New("TARGET_NOT_FOUND", fmt.Sprintf("target %q not found", targetName), false)
+	}
+	if err := validateSourceContract(src, localWorkDir, targetName, target); err != nil {
+		return Preview{}, model.Task{}, "", err
 	}
 	cluster := a.Config.Clusters[target.Cluster]
 	params, paramSources, err := config.ResolveParams(target, sets)
@@ -145,7 +188,8 @@ func (a *App) Preview(ctx context.Context, cwd, sourcePath, targetName string, s
 	task := model.Task{
 		ID: taskID, ProjectID: p.ProjectID, SourcePath: src.RelativePath, SourceWorkDir: src.WorkDir,
 		SourceEntry: src.Entry, TargetName: targetName, ClusterName: target.Cluster,
-		RemoteDir: remoteDir, State: model.StateCreated, ResolvedParams: params,
+		RemoteDir: remoteDir, ComputeState: model.ComputeCreated, PullState: model.PullNotPulled,
+		ResolvedParams: params,
 		RenderedScript: script, TargetHash: jtemplate.TargetHash(target), InputManifest: inputManifest,
 		PullPatterns: append([]string{}, target.Pull.Default...),
 		PushExcludes: manifest.ExcludePatterns(p.Root, localWorkDir, target.Push.Exclude),
@@ -155,8 +199,71 @@ func (a *App) Preview(ctx context.Context, cwd, sourcePath, targetName string, s
 		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster,
 		RemoteDir: remoteDir, Params: params, ParamSources: paramSources, Files: files,
 		Ignored: ignored, RenderedScript: script, InputManifest: inputManifest,
+		TemplateValues: TemplateValues{
+			Input: values.Input, Stem: values.Stem, Name: values.Name, WorkDir: values.WorkDir,
+		},
+		SchedulerLog: "joyrun-slurm-<jobid>.log",
 	}
 	return preview, task, localWorkDir, nil
+}
+
+func validateSourceContract(src model.Source, localWorkDir, targetName string, target model.Target) error {
+	if target.Source.Kind == "file" && src.Entry == nil {
+		suggestion := filepath.ToSlash(filepath.Join(src.RelativePath, "<input-file>"))
+		if candidate := singleSourceCandidate(localWorkDir, target.Source.Patterns); candidate != "" {
+			suggestion = filepath.ToSlash(filepath.Join(src.RelativePath, candidate))
+		}
+		return fault.New("SOURCE_KIND_MISMATCH", fmt.Sprintf(
+			"target %q requires a file source, but %q is a directory; try: joyrun submit %s -t %s",
+			targetName, src.RelativePath, suggestion, targetName), false)
+	}
+	if target.Source.Kind == "directory" && src.Entry != nil {
+		directory := src.WorkDir
+		if directory == "" {
+			directory = "."
+		}
+		return fault.New("SOURCE_KIND_MISMATCH", fmt.Sprintf(
+			"target %q requires a directory source, but %q is a file; try: joyrun submit %s -t %s",
+			targetName, src.RelativePath, directory, targetName), false)
+	}
+	if src.Entry != nil && len(target.Source.Patterns) > 0 {
+		for _, pattern := range target.Source.Patterns {
+			if matched, _ := path.Match(pattern, *src.Entry); matched {
+				return nil
+			}
+		}
+		return fault.New("SOURCE_PATTERN_MISMATCH", fmt.Sprintf(
+			"source %q does not match target %q patterns: %s",
+			*src.Entry, targetName, strings.Join(target.Source.Patterns, ", ")), false)
+	}
+	return nil
+}
+
+func singleSourceCandidate(workDir string, patterns []string) string {
+	if len(patterns) == 0 {
+		return ""
+	}
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return ""
+	}
+	var candidate string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		for _, pattern := range patterns {
+			if matched, _ := path.Match(pattern, name); matched {
+				if candidate != "" {
+					return ""
+				}
+				candidate = name
+				break
+			}
+		}
+	}
+	return candidate
 }
 
 func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, sets []string) (SubmitResult, error) {
@@ -175,20 +282,35 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 	}
 	cluster := a.Config.Clusters[task.ClusterName]
 	workDir := path.Join(task.RemoteDir, "work")
-	task.State = model.StateUploading
 	task.UpdatedAt = time.Now().UTC()
-	_ = a.Store.UpdateTask(ctx, task)
+	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "UPLOAD_STARTED", "upload",
+		"Uploading immutable input snapshot", nil)); err != nil {
+		return SubmitResult{}, err
+	}
 	if _, stderr, err := a.Runner.Exec(ctx, cluster.Host, "mkdir -p "+remote.Quote(workDir), nil); err != nil {
-		return SubmitResult{}, a.failTask(ctx, &task, "SSH_FAILED", message("cannot create remote task directory", stderr), true, err)
+		return SubmitResult{}, a.failSubmission(ctx, &task, "SSH_FAILED", "upload",
+			message("cannot create remote task directory", stderr), true, err)
 	}
 	if err := a.writeMetadata(ctx, cluster, task); err != nil {
-		return SubmitResult{}, a.failTask(ctx, &task, "REMOTE_METADATA_FAILED", "cannot write recovery metadata", true, err)
+		return SubmitResult{}, a.failSubmission(ctx, &task, "REMOTE_METADATA_FAILED", "upload",
+			"cannot write recovery metadata", true, err)
 	}
 	if err := a.Transfer.Push(ctx, cluster, snapshotDir, workDir, nil); err != nil {
-		return SubmitResult{}, a.failTask(ctx, &task, "UPLOAD_FAILED", "cannot upload task files", true, err)
+		return SubmitResult{}, a.failSubmission(ctx, &task, "UPLOAD_FAILED", "upload",
+			"cannot upload task files", true, err)
 	}
 	if err := remote.WriteFile(ctx, a.Runner, cluster.Host, path.Join(workDir, "joyrun-job.sh"), []byte(task.RenderedScript), "700"); err != nil {
-		return SubmitResult{}, a.failTask(ctx, &task, "UPLOAD_FAILED", "cannot upload rendered job script", true, err)
+		return SubmitResult{}, a.failSubmission(ctx, &task, "UPLOAD_FAILED", "upload",
+			"cannot upload rendered job script", true, err)
+	}
+	task.UpdatedAt = time.Now().UTC()
+	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "UPLOAD_COMPLETED", "upload",
+		"Input snapshot and rendered script uploaded", nil)); err != nil {
+		return SubmitResult{}, err
+	}
+	if err := a.Store.AppendEvent(ctx, taskEvent(task, "SUBMIT_STARTED", "submit",
+		"Submitting task to scheduler", nil)); err != nil {
+		return SubmitResult{}, err
 	}
 	slurm := scheduler.Slurm{Runner: a.Runner}
 	schedulerID, err := slurm.Submit(ctx, cluster.Host, workDir)
@@ -197,16 +319,18 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 		// stdout arrived. The remote scheduler_id marker resolves that ambiguity.
 		data, recoveryErr := remote.ReadFile(ctx, a.Runner, cluster.Host, path.Join(task.RemoteDir, "scheduler_id"))
 		if recoveryErr != nil || strings.TrimSpace(string(data)) == "" {
-			return SubmitResult{}, a.failTask(ctx, &task, "SUBMIT_FAILED", "cannot submit task to Slurm", true, err)
+			return SubmitResult{}, a.failSubmission(ctx, &task, "SUBMIT_FAILED", "submit",
+				"cannot submit task to Slurm", true, err)
 		}
 		schedulerID = strings.TrimSpace(string(data))
 	}
 	now := time.Now().UTC()
 	task.SchedulerID = schedulerID
-	task.State = model.StateQueued
+	task.ComputeState = model.ComputeQueued
 	task.SubmittedAt = &now
 	task.UpdatedAt = now
-	if err := a.Store.UpdateTask(ctx, task); err != nil {
+	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "SCHEDULER_ACCEPTED", "submit",
+		"Scheduler accepted task", map[string]string{"scheduler_id": schedulerID})); err != nil {
 		// The scheduler accepted the job. Preserve the complete recovery record
 		// remotely even when local persistence is unavailable.
 		_ = a.writeMetadata(ctx, cluster, task)
@@ -218,7 +342,8 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 		}
 		task.Metadata["remote_metadata_error"] = err.Error()
 		task.UpdatedAt = time.Now().UTC()
-		_ = a.Store.UpdateTask(ctx, task)
+		_ = a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "REMOTE_METADATA_WARNING", "recovery",
+			"Scheduler accepted task but metadata refresh failed", map[string]string{"error": err.Error()}))
 	}
 	return SubmitResult{Task: task}, nil
 }
@@ -249,24 +374,113 @@ func (a *App) ResolveTask(ctx context.Context, cwd, identifier string) (model.Ta
 	return task, p, err
 }
 
+func (a *App) List(ctx context.Context, cwd string) ([]model.Task, error) {
+	p, err := project.Discover(cwd)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.Store.BindProject(ctx, p); err != nil {
+		return nil, err
+	}
+	return a.Store.ListTasks(ctx, p.ProjectID)
+}
+
+func (a *App) Inspect(ctx context.Context, cwd, identifier string) (model.Task, error) {
+	task, _, err := a.ResolveTask(ctx, cwd, identifier)
+	return task, err
+}
+
+func (a *App) Trace(ctx context.Context, cwd, identifier string) (TraceResult, error) {
+	task, _, err := a.ResolveTask(ctx, cwd, identifier)
+	if err != nil {
+		return TraceResult{}, err
+	}
+	events, err := a.Store.Events(ctx, task.ID)
+	if err != nil {
+		return TraceResult{}, err
+	}
+	return TraceResult{Task: task, Events: events}, nil
+}
+
+func (a *App) StatusAll(ctx context.Context, cwd string) StatusAllResult {
+	tasks, err := a.List(ctx, cwd)
+	if err != nil {
+		return StatusAllResult{Failures: []StatusFailure{{Error: fault.As(err)}}}
+	}
+	result := StatusAllResult{}
+	for _, task := range tasks {
+		if !refreshableComputeState(task.ComputeState) {
+			result.Tasks = append(result.Tasks, task)
+			continue
+		}
+		updated, err := a.refreshTask(ctx, task)
+		if err != nil {
+			result.Failures = append(result.Failures, StatusFailure{
+				TaskID: task.ID, Error: fault.As(err),
+			})
+			continue
+		}
+		result.Tasks = append(result.Tasks, updated)
+	}
+	return result
+}
+
 func (a *App) Status(ctx context.Context, cwd, identifier string) (model.Task, error) {
 	task, _, err := a.ResolveTask(ctx, cwd, identifier)
 	if err != nil {
 		return task, err
 	}
-	if task.SchedulerID == "" {
-		return task, nil
-	}
+	return a.refreshTask(ctx, task)
+}
+
+func (a *App) refreshTask(ctx context.Context, task model.Task) (model.Task, error) {
 	cluster, ok := a.Config.Clusters[task.ClusterName]
 	if !ok {
-		return task, fault.New("CLUSTER_NOT_FOUND", fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false)
+		return task, fault.New("CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false).
+			WithTask("status", "restore cluster configuration, then run joyrun status "+task.ID,
+				task.ComputeState, task.PullState)
+	}
+	if task.SchedulerID == "" {
+		marker, err := remote.ReadFile(ctx, a.Runner, cluster.Host, path.Join(task.RemoteDir, "scheduler_id"))
+		if err != nil || strings.TrimSpace(string(marker)) == "" {
+			return task, nil
+		}
+		task.SchedulerID = strings.TrimSpace(string(marker))
+		task.ComputeState = model.ComputeQueued
+		task.UpdatedAt = time.Now().UTC()
+		if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "SCHEDULER_ID_RECOVERED",
+			"status", "Recovered scheduler ID from remote marker",
+			map[string]string{"scheduler_id": task.SchedulerID})); err != nil {
+			return task, err
+		}
 	}
 	state, raw, err := (scheduler.Slurm{Runner: a.Runner}).Status(ctx, cluster.Host, task.SchedulerID)
 	if err != nil {
-		return task, err
+		return task, fault.As(err).
+			WithTask("status", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 	}
-	task.State, task.SchedulerState, task.UpdatedAt = state, raw, time.Now().UTC()
-	if err := a.Store.UpdateTask(ctx, task); err != nil {
+	previousCompute := task.ComputeState
+	previousRaw := task.SchedulerState
+	if terminalComputeState(previousCompute) && !terminalComputeState(state) {
+		// A scheduler may purge old accounting records. Never erase a terminal
+		// state that JoyRun has already observed.
+		state = previousCompute
+	}
+	task.ComputeState = state
+	task.SchedulerState = raw
+	if previousCompute == task.ComputeState &&
+		previousRaw == task.SchedulerState {
+		return task, nil
+	}
+	task.UpdatedAt = time.Now().UTC()
+	event := taskEvent(task, "COMPUTE_STATE_CHANGED", "status",
+		"Scheduler state refreshed", map[string]string{
+			"previous_compute_state": previousCompute,
+			"compute_state":          task.ComputeState,
+			"scheduler_state":        task.SchedulerState,
+		})
+	if err := a.Store.UpdateTaskWithEvent(ctx, task, event); err != nil {
 		return task, err
 	}
 	_ = a.writeMetadata(ctx, cluster, task)
@@ -274,46 +488,94 @@ func (a *App) Status(ctx context.Context, cwd, identifier string) (model.Task, e
 }
 
 func (a *App) Cancel(ctx context.Context, cwd, identifier string) (model.Task, error) {
+	if !strings.HasPrefix(identifier, "jr_") {
+		return model.Task{}, fault.New("CANCEL_REQUIRES_TASK_ID",
+			"cancel requires an exact task ID; inspect the source first, then run `joyrun cancel <task-id>`", false)
+	}
 	task, _, err := a.ResolveTask(ctx, cwd, identifier)
 	if err != nil {
 		return task, err
 	}
 	if task.SchedulerID == "" {
-		return task, fault.New("CANCEL_FAILED", "task has no scheduler ID", false)
+		return task, fault.New("CANCEL_FAILED", "task has no scheduler ID", false).
+			WithTask("cancel", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 	}
-	cluster := a.Config.Clusters[task.ClusterName]
-	if err := (scheduler.Slurm{Runner: a.Runner}).Cancel(ctx, cluster.Host, task.SchedulerID); err != nil {
+	cluster, ok := a.Config.Clusters[task.ClusterName]
+	if !ok {
+		return task, fault.New("CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false)
+	}
+	if err := a.Store.AppendEvent(ctx, taskEvent(task, "CANCEL_REQUESTED", "cancel",
+		"Cancellation requested", nil)); err != nil {
 		return task, err
 	}
-	task.State, task.SchedulerState, task.UpdatedAt = model.StateCancelled, "CANCELLED", time.Now().UTC()
-	if err := a.Store.UpdateTask(ctx, task); err != nil {
+	if err := (scheduler.Slurm{Runner: a.Runner}).Cancel(ctx, cluster.Host, task.SchedulerID); err != nil {
+		return task, fault.Wrap("CANCEL_FAILED", "cannot cancel scheduler job", true, err).
+			WithTask("cancel", "joyrun status "+task.ID, task.ComputeState, task.PullState)
+	}
+	if task.Metadata == nil {
+		task.Metadata = map[string]string{}
+	}
+	task.Metadata["cancel_requested_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	task.UpdatedAt = time.Now().UTC()
+	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "CANCEL_ACCEPTED", "cancel",
+		"Scheduler accepted cancellation request; run status to observe the terminal state", nil)); err != nil {
 		return task, err
 	}
 	_ = a.writeMetadata(ctx, cluster, task)
 	return task, nil
 }
 
-func (a *App) Logs(ctx context.Context, cwd, identifier string, lines int) (string, model.Task, error) {
+func (a *App) Logs(ctx context.Context, cwd, identifier string, lines int) (LogResult, error) {
 	task, _, err := a.ResolveTask(ctx, cwd, identifier)
 	if err != nil {
-		return "", task, err
+		return LogResult{}, err
 	}
 	cluster := a.Config.Clusters[task.ClusterName]
-	logPath := ""
-	if len(task.Logs) > 0 {
-		logPath = task.Logs[0]
-	} else if task.SchedulerID != "" {
-		logPath = "slurm-" + task.SchedulerID + ".out"
+	type candidate struct {
+		path string
+		kind string
 	}
-	if logPath == "" {
-		return "", task, fault.New("LOG_NOT_AVAILABLE", "task has no configured or scheduler log", false)
+	var candidates []candidate
+	for _, logPath := range task.Logs {
+		if logPath != "" {
+			candidates = append(candidates, candidate{path: logPath, kind: "application"})
+		}
 	}
-	command := fmt.Sprintf("cd %s && tail -n %d -- %s", remote.Quote(path.Join(task.RemoteDir, "work")), lines, remote.Quote(logPath))
-	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
-	if err != nil {
-		return "", task, fault.Wrap("LOG_FAILED", message("cannot read remote log", stderr), true, err)
+	if task.SchedulerID != "" {
+		candidates = append(candidates,
+			candidate{path: scheduler.LogName(task.SchedulerID), kind: "scheduler"},
+			candidate{path: "slurm-" + task.SchedulerID + ".out", kind: "scheduler_legacy"})
 	}
-	return stdout, task, nil
+	checked := make([]string, 0, len(candidates))
+	workDir := path.Join(task.RemoteDir, "work")
+	for _, item := range candidates {
+		checked = append(checked, item.path)
+		command := fmt.Sprintf("cd %s && if test -f %s; then printf 'FOUND\\n'; tail -n %d -- %s; else printf 'MISSING\\n'; fi",
+			remote.Quote(workDir), remote.Quote(item.path), lines, remote.Quote(item.path))
+		stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
+		if err != nil {
+			return LogResult{}, fault.Wrap("LOG_FAILED",
+				message("cannot inspect remote log "+item.path, stderr), true, err).
+				WithTask("logs", "joyrun logs "+task.ID, task.ComputeState, task.PullState)
+		}
+		status, content, _ := strings.Cut(stdout, "\n")
+		if status == "FOUND" {
+			return LogResult{TaskID: task.ID, Path: item.path, Kind: item.kind, Content: content}, nil
+		}
+		if status != "MISSING" {
+			return LogResult{}, fault.New("LOG_FAILED",
+				"unexpected response while inspecting remote log "+item.path, true).
+				WithTask("logs", "joyrun logs "+task.ID, task.ComputeState, task.PullState)
+		}
+	}
+	if len(checked) == 0 {
+		return LogResult{}, fault.New("LOG_NOT_READY", "task has no application or scheduler log candidates yet", true).
+			WithTask("logs", "joyrun status "+task.ID, task.ComputeState, task.PullState)
+	}
+	return LogResult{}, fault.New("LOG_NOT_READY",
+		"none of the expected remote logs exist yet; checked: "+strings.Join(checked, ", "), true).
+		WithTask("logs", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 }
 
 func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOptions) (PullResult, error) {
@@ -326,15 +588,22 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 		if err != nil {
 			return PullResult{}, err
 		}
-		if task.State != model.StateCompleted {
-			return PullResult{}, fault.New("JOB_NOT_COMPLETED", fmt.Sprintf("task is %s; use --live to pull available files", task.State), false)
+		if !terminalComputeState(task.ComputeState) {
+			return PullResult{}, fault.New("JOB_NOT_COMPLETED",
+				fmt.Sprintf("task compute state is %s; use --live to pull available files", task.ComputeState), false).
+				WithTask("pull", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 		}
 	}
-	cluster := a.Config.Clusters[task.ClusterName]
+	cluster, ok := a.Config.Clusters[task.ClusterName]
+	if !ok {
+		return PullResult{}, fault.New("CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false)
+	}
 	workDir := path.Join(task.RemoteDir, "work")
 	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, "cd "+remote.Quote(workDir)+" && find . -type f -printf '%P\\0'", nil)
 	if err != nil {
-		return PullResult{}, fault.Wrap("PULL_FAILED", message("cannot list remote task files", stderr), true, err)
+		return PullResult{}, a.failPull(ctx, &task, "list",
+			message("cannot list remote task files", stderr), err)
 	}
 	patterns := task.PullPatterns
 	if len(options.Include) > 0 {
@@ -360,17 +629,31 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	}
 	sort.Strings(files)
 	if err := localfs.ValidatePullPaths(files); err != nil {
-		return PullResult{}, err
+		return PullResult{}, fault.As(err).
+			WithTask("pull", "joyrun inspect "+task.ID, task.ComputeState, task.PullState)
 	}
 	destination := filepath.Join(p.Root, filepath.FromSlash(task.SourceWorkDir))
-	if err := a.Transfer.Pull(ctx, cluster, workDir, destination, files); err != nil {
+	task.PullState = model.PullInProgress
+	task.UpdatedAt = time.Now().UTC()
+	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "PULL_STARTED", "pull",
+		"Selected file transfer started", map[string]string{"destination": destination})); err != nil {
 		return PullResult{}, err
+	}
+	if err := a.Transfer.Pull(ctx, cluster, workDir, destination, files); err != nil {
+		return PullResult{}, a.failPull(ctx, &task, "transfer", "cannot pull selected task files", err)
 	}
 	now := time.Now().UTC()
-	task.ResultsPulledAt, task.UpdatedAt = &now, now
-	if err := a.Store.UpdateTask(ctx, task); err != nil {
+	task.PulledAt, task.UpdatedAt = &now, now
+	if terminalComputeState(task.ComputeState) {
+		task.PullState = model.PullSucceeded
+	} else {
+		task.PullState = model.PullPartial
+	}
+	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "PULL_COMPLETED", "pull",
+		"Selected file transfer completed", map[string]string{"files": fmt.Sprintf("%d", len(files))})); err != nil {
 		return PullResult{}, err
 	}
+	_ = a.writeMetadata(ctx, cluster, task)
 	return PullResult{Task: task, Files: files, Destination: destination}, nil
 }
 
@@ -389,33 +672,124 @@ func (a *App) History(ctx context.Context, cwd, sourcePath string) ([]model.Task
 	return a.Store.History(ctx, p.ProjectID, src.RelativePath)
 }
 
-func (a *App) Doctor(ctx context.Context, targetName string) []DoctorCheck {
+func (a *App) Doctor(ctx context.Context, targetName string) DoctorResult {
 	var checks []DoctorCheck
 	target, ok := a.Config.Targets[targetName]
-	checks = append(checks, DoctorCheck{Name: "target", OK: ok, Message: targetName})
+	checks = append(checks, doctorCheck("target", ok, targetName,
+		"configure target "+targetName+" in the JoyRun config"))
 	if !ok {
-		return checks
+		return doctorResult(checks)
 	}
 	cluster, ok := a.Config.Clusters[target.Cluster]
-	checks = append(checks, DoctorCheck{Name: "cluster", OK: ok, Message: target.Cluster})
+	checks = append(checks, doctorCheck("cluster", ok, target.Cluster,
+		"configure cluster "+target.Cluster+" in the JoyRun config"))
 	if !ok {
-		return checks
+		return doctorResult(checks)
 	}
 	if err := remote.Check(ctx, a.Runner, cluster.Host); err != nil {
-		checks = append(checks, DoctorCheck{Name: "ssh", OK: false, Message: err.Error()})
-		return checks
+		checks = append(checks, DoctorCheck{
+			Name: "ssh", Status: "fail", OK: false, Blocking: true, Message: err.Error(),
+			SuggestedAction: "verify that `ssh " + cluster.Host + "` works non-interactively",
+		})
+		return doctorResult(checks)
 	}
-	checks = append(checks, DoctorCheck{Name: "ssh", OK: true, Message: cluster.Host})
-	command := "test -d " + remote.Quote(cluster.RemoteRoot) + " && test -w " + remote.Quote(cluster.RemoteRoot)
-	_, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
-	checks = append(checks, DoctorCheck{Name: "remote_root", OK: err == nil, Message: strings.TrimSpace(stderr)})
+	checks = append(checks, DoctorCheck{
+		Name: "ssh", Status: "pass", OK: true, Message: cluster.Host,
+	})
+	checks = append(checks, a.checkRemoteRoot(ctx, target.Cluster, cluster))
 	for _, executable := range []string{"sbatch", "squeue", "sacct", "scancel"} {
 		_, stderr, err := a.Runner.Exec(ctx, cluster.Host, "command -v "+executable, nil)
-		checks = append(checks, DoctorCheck{Name: executable, OK: err == nil, Message: strings.TrimSpace(stderr)})
+		detail := strings.TrimSpace(stderr)
+		if detail == "" {
+			if err == nil {
+				detail = "available"
+			} else {
+				detail = executable + " was not found on " + cluster.Host
+			}
+		}
+		checks = append(checks, doctorCheck(executable, err == nil, detail,
+			"load or install Slurm so `command -v "+executable+"` succeeds"))
 	}
 	backend, err := a.Transfer.Check(ctx, cluster)
-	checks = append(checks, DoctorCheck{Name: "transfer_" + backend, OK: err == nil, Message: errorMessage(err)})
-	return checks
+	detail := errorMessage(err)
+	if detail == "" {
+		detail = backend + " is available"
+	}
+	checks = append(checks, doctorCheck("transfer_"+backend, err == nil, detail,
+		"install/configure the selected transfer backend or use transfer: auto"))
+	return doctorResult(checks)
+}
+
+func (a *App) checkRemoteRoot(ctx context.Context, clusterName string, cluster model.Cluster) DoctorCheck {
+	command := "root=" + remote.Quote(cluster.RemoteRoot) + "; " +
+		"if [ -d \"$root\" ]; then " +
+		"if [ -w \"$root\" ]; then printf 'pass'; else printf 'not_writable'; fi; " +
+		"elif [ -e \"$root\" ]; then printf 'not_directory'; " +
+		"else ancestor=$(dirname -- \"$root\"); " +
+		"while [ ! -e \"$ancestor\" ] && [ \"$ancestor\" != / ]; do ancestor=$(dirname -- \"$ancestor\"); done; " +
+		"if [ -d \"$ancestor\" ] && [ -w \"$ancestor\" ]; then printf 'creatable:%s' \"$ancestor\"; " +
+		"else printf 'not_creatable:%s' \"$ancestor\"; fi; fi"
+	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
+	if err != nil {
+		return DoctorCheck{
+			Name: "remote_root", Status: "fail", OK: false, Blocking: true,
+			Message:         message("cannot inspect remote_root "+cluster.RemoteRoot, stderr),
+			SuggestedAction: "verify the path and permissions on " + cluster.Host,
+		}
+	}
+	result := strings.TrimSpace(stdout)
+	switch {
+	case result == "pass":
+		return DoctorCheck{
+			Name: "remote_root", Status: "pass", OK: true,
+			Message: cluster.RemoteRoot + " exists and is writable",
+		}
+	case strings.HasPrefix(result, "creatable:"):
+		ancestor := strings.TrimPrefix(result, "creatable:")
+		return DoctorCheck{
+			Name: "remote_root", Status: "warn", OK: true,
+			Message: cluster.RemoteRoot + " does not exist; JoyRun will create it on first submit (writable ancestor: " + ancestor + ")",
+		}
+	case result == "not_directory":
+		return DoctorCheck{
+			Name: "remote_root", Status: "fail", OK: false, Blocking: true,
+			Message:         cluster.RemoteRoot + " exists but is not a directory",
+			SuggestedAction: "change clusters." + clusterName + ".remote_root to a directory",
+		}
+	case result == "not_writable":
+		return DoctorCheck{
+			Name: "remote_root", Status: "fail", OK: false, Blocking: true,
+			Message:         cluster.RemoteRoot + " exists but is not writable",
+			SuggestedAction: "choose a writable remote_root or fix its permissions on " + cluster.Host,
+		}
+	default:
+		ancestor := strings.TrimPrefix(result, "not_creatable:")
+		return DoctorCheck{
+			Name: "remote_root", Status: "fail", OK: false, Blocking: true,
+			Message:         cluster.RemoteRoot + " does not exist and cannot be created from " + ancestor,
+			SuggestedAction: "choose a writable remote_root or run `ssh " + cluster.Host + " 'mkdir -p " + cluster.RemoteRoot + "'`",
+		}
+	}
+}
+
+func doctorCheck(name string, ok bool, message, action string) DoctorCheck {
+	if ok {
+		return DoctorCheck{Name: name, Status: "pass", OK: true, Message: message}
+	}
+	return DoctorCheck{
+		Name: name, Status: "fail", OK: false, Blocking: true,
+		Message: message, SuggestedAction: action,
+	}
+}
+
+func doctorResult(checks []DoctorCheck) DoctorResult {
+	ready := true
+	for _, check := range checks {
+		if check.Blocking && check.Status == "fail" {
+			ready = false
+		}
+	}
+	return DoctorResult{Ready: ready, Checks: checks}
 }
 
 func (a *App) Recover(ctx context.Context, cwd, taskID, targetName string) (model.Task, error) {
@@ -442,19 +816,26 @@ func (a *App) Recover(ctx context.Context, cwd, taskID, targetName string) (mode
 	if task.ID != taskID || task.ProjectID != p.ProjectID {
 		return task, fault.New("RECOVERY_FAILED", "remote metadata does not match task or current project", false)
 	}
+	if task.ComputeState == "" {
+		task.ComputeState = model.ComputeCreated
+	}
+	if task.PullState == "" {
+		task.PullState = model.PullNotPulled
+	}
 	if task.SchedulerID == "" {
 		marker, markerErr := remote.ReadFile(ctx, a.Runner, cluster.Host, path.Join(cluster.RemoteRoot, taskID, "scheduler_id"))
 		if markerErr == nil {
 			task.SchedulerID = strings.TrimSpace(string(marker))
-			if task.SchedulerID != "" && (task.State == model.StateCreated || task.State == model.StateUploading) {
-				task.State = model.StateQueued
+			if task.SchedulerID != "" &&
+				(task.ComputeState == model.ComputeCreated || task.ComputeState == model.ComputeSubmissionFailed) {
+				task.ComputeState = model.ComputeQueued
 			}
 		}
 	}
 	if err := a.Store.ImportTask(ctx, task); err != nil {
 		return task, err
 	}
-	return task, nil
+	return a.refreshTask(ctx, task)
 }
 
 func (a *App) writeMetadata(ctx context.Context, cluster model.Cluster, task model.Task) error {
@@ -465,16 +846,66 @@ func (a *App) writeMetadata(ctx context.Context, cluster model.Cluster, task mod
 	return remote.WriteFile(ctx, a.Runner, cluster.Host, path.Join(task.RemoteDir, "metadata.json"), append(data, '\n'), "600")
 }
 
-func (a *App) failTask(ctx context.Context, task *model.Task, code, msg string, retryable bool, cause error) error {
-	task.State = model.StateFailed
+func (a *App) failSubmission(
+	ctx context.Context,
+	task *model.Task,
+	code, stage, msg string,
+	retryable bool,
+	cause error,
+) error {
+	task.ComputeState = model.ComputeSubmissionFailed
 	task.UpdatedAt = time.Now().UTC()
 	if task.Metadata == nil {
 		task.Metadata = map[string]string{}
 	}
 	task.Metadata["error_code"] = code
 	task.Metadata["error"] = cause.Error()
-	_ = a.Store.UpdateTask(ctx, *task)
-	return fault.Wrap(code, msg, retryable, cause)
+	task.Metadata["error_stage"] = stage
+	_ = a.Store.UpdateTaskWithEvent(ctx, *task, taskEvent(*task, "SUBMISSION_FAILED", stage,
+		msg, map[string]string{"code": code, "error": cause.Error()}))
+	return fault.Wrap(code, msg, retryable, cause).
+		WithTask(stage, "joyrun status "+task.ID, task.ComputeState, task.PullState)
+}
+
+func (a *App) failPull(
+	ctx context.Context,
+	task *model.Task,
+	stage, msg string,
+	cause error,
+) error {
+	task.PullState = model.PullFailed
+	task.UpdatedAt = time.Now().UTC()
+	if task.Metadata == nil {
+		task.Metadata = map[string]string{}
+	}
+	task.Metadata["error_code"] = "PULL_FAILED"
+	task.Metadata["error"] = cause.Error()
+	task.Metadata["error_stage"] = stage
+	_ = a.Store.UpdateTaskWithEvent(ctx, *task, taskEvent(*task, "PULL_FAILED", "pull",
+		msg, map[string]string{"stage": stage, "error": cause.Error()}))
+	return fault.Wrap("PULL_FAILED", msg, true, cause).
+		WithTask("pull", "joyrun pull "+task.ID, task.ComputeState, task.PullState)
+}
+
+func taskEvent(task model.Task, eventType, stage, msg string, data map[string]string) model.TaskEvent {
+	return model.TaskEvent{
+		TaskID: task.ID, Type: eventType, Stage: stage, Message: msg,
+		Data: data, CreatedAt: time.Now().UTC(),
+	}
+}
+
+func terminalComputeState(state string) bool {
+	return state == model.ComputeCompleted ||
+		state == model.ComputeFailed ||
+		state == model.ComputeCancelled
+}
+
+func refreshableComputeState(state string) bool {
+	return state == model.ComputeCreated ||
+		state == model.ComputeSubmissionFailed ||
+		state == model.ComputeQueued ||
+		state == model.ComputeRunning ||
+		state == model.ComputeUnknown
 }
 
 func message(prefix, detail string) string {
@@ -500,7 +931,9 @@ func resolveFrom(cwd, value string) string {
 }
 
 func WriteHumanTask(writer io.Writer, task model.Task) {
-	fmt.Fprintf(writer, "%s  %s  %s  %s", task.ID, strings.ToUpper(task.State), task.TargetName, task.SourcePath)
+	fmt.Fprintf(writer, "%s  compute:%s  pull:%s  %s  %s",
+		task.ID, strings.ToUpper(task.ComputeState), strings.ToUpper(task.PullState),
+		task.TargetName, task.SourcePath)
 	if task.SchedulerID != "" {
 		fmt.Fprintf(writer, "  slurm:%s", task.SchedulerID)
 	}

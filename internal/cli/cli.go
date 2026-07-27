@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/wxia529/joyrun/internal/app"
 	"github.com/wxia529/joyrun/internal/config"
@@ -21,12 +22,13 @@ import (
 )
 
 type command struct {
-	ctx     context.Context
-	version string
-	stdout  io.Writer
-	stderr  io.Writer
-	json    bool
-	config  string
+	ctx      context.Context
+	version  string
+	stdout   io.Writer
+	stderr   io.Writer
+	json     bool
+	config   string
+	exitCode int
 }
 
 func Run(ctx context.Context, args []string, version string) int {
@@ -44,7 +46,7 @@ func Run(ctx context.Context, args []string, version string) int {
 		c.writeError(err)
 		return 1
 	}
-	return 0
+	return c.exitCode
 }
 
 func (c *command) extractGlobals(args []string) []string {
@@ -90,22 +92,22 @@ func (c *command) execute(name string, args []string) error {
 		Transfer: transfer.Manager{Stderr: c.stderr, Runner: runner},
 	}
 	switch name {
-	case "targets":
-		return c.targets(application, args)
 	case "target":
 		return c.target(application, args)
 	case "submit":
 		return c.submit(application, args)
 	case "status":
 		return c.status(application, args)
+	case "list":
+		return c.list(application, args)
+	case "inspect":
+		return c.inspect(application, args)
 	case "logs":
 		return c.logs(application, args)
 	case "cancel":
 		return c.cancel(application, args)
 	case "pull":
 		return c.pull(application, args)
-	case "history":
-		return c.history(application, args)
 	case "doctor":
 		return c.doctor(application, args)
 	case "recover":
@@ -138,34 +140,29 @@ func (c *command) init(db *store.Store, args []string) error {
 	return nil
 }
 
-func (c *command) targets(application *app.App, args []string) error {
-	if len(args) != 0 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun targets", false)
-	}
-	names := config.TargetNames(application.Config)
-	if c.json {
-		c.write(map[string]any{"targets": names}, "")
+func (c *command) target(application *app.App, args []string) error {
+	if len(args) == 1 && args[0] == "list" {
+		names := config.TargetNames(application.Config)
+		if c.json {
+			c.write(map[string]any{"targets": names}, "")
+			return nil
+		}
+		for _, name := range names {
+			fmt.Fprintf(c.stdout, "%-28s %s\n", name, application.Config.Targets[name].Cluster)
+		}
 		return nil
 	}
-	for _, name := range names {
-		fmt.Fprintf(c.stdout, "%-28s %s\n", name, application.Config.Targets[name].Cluster)
-	}
-	return nil
-}
-
-func (c *command) target(application *app.App, args []string) error {
-	if len(args) != 2 || (args[0] != "show" && args[0] != "params") {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun target <show|params> <target>", false)
+	if len(args) != 2 || args[0] != "show" {
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun target <list|show TARGET>", false)
 	}
 	target, ok := application.Config.Targets[args[1]]
 	if !ok {
 		return fault.New("TARGET_NOT_FOUND", fmt.Sprintf("target %q not found", args[1]), false)
 	}
-	if args[0] == "show" {
-		c.write(map[string]any{"name": args[1], "target": target}, fmt.Sprintf("Target: %s\nCluster: %s\nPull: %s\n", args[1], target.Cluster, strings.Join(target.Pull.Default, ", ")))
-		return nil
-	}
-	c.write(map[string]any{"target": args[1], "params": target.Params}, formatParams(target))
+	c.write(map[string]any{"name": args[1], "target": target},
+		fmt.Sprintf("Target: %s\nCluster: %s\nSource: %s\nPull: %s\n\nParameters:\n%s",
+			args[1], target.Cluster, target.Source.Kind,
+			strings.Join(target.Pull.Default, ", "), formatParams(target)))
 	return nil
 }
 
@@ -204,15 +201,111 @@ func (c *command) submit(application *app.App, args []string) error {
 }
 
 func (c *command) status(application *app.App, args []string) error {
-	if len(args) != 1 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun status <source|task-id>", false)
+	flags := newFlags("status", c.stderr)
+	var all bool
+	flags.BoolVar(&all, "all", false, "refresh all non-terminal tasks")
+	if err := flags.Parse(interspersed(args, map[string]bool{}, map[string]bool{"--all": true})); err != nil {
+		return fault.Wrap("INVALID_ARGUMENT", "invalid status arguments", false, err)
 	}
 	cwd, _ := os.Getwd()
-	task, err := application.Status(c.ctx, cwd, args[0])
+	if all {
+		if flags.NArg() != 0 {
+			return fault.New("INVALID_ARGUMENT", "usage: joyrun status --all", false)
+		}
+		result := application.StatusAll(c.ctx, cwd)
+		if c.json {
+			failures := result.Failures
+			if failures == nil {
+				failures = []app.StatusFailure{}
+			}
+			c.write(map[string]any{
+				"tasks":    summarizeTasks(result.Tasks),
+				"failures": failures,
+			}, "")
+		} else {
+			for _, task := range result.Tasks {
+				fmt.Fprint(c.stdout, formatTask(task))
+			}
+			for _, failure := range result.Failures {
+				fmt.Fprintf(c.stderr, "Error [%s] %s: %s\n",
+					failure.Error.Code, failure.TaskID, failure.Error.Error())
+			}
+		}
+		if len(result.Failures) > 0 {
+			c.exitCode = 1
+		}
+		return nil
+	}
+	if flags.NArg() != 1 {
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun status <source|task-id> | joyrun status --all", false)
+	}
+	task, err := application.Status(c.ctx, cwd, flags.Arg(0))
 	if err != nil {
 		return err
 	}
-	c.write(task, formatTask(task))
+	c.write(model.SummarizeTask(task), formatTask(task))
+	return nil
+}
+
+func (c *command) list(application *app.App, args []string) error {
+	if len(args) > 1 {
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun list [source]", false)
+	}
+	cwd, _ := os.Getwd()
+	var tasks []model.Task
+	var err error
+	if len(args) == 1 {
+		tasks, err = application.History(c.ctx, cwd, args[0])
+	} else {
+		tasks, err = application.List(c.ctx, cwd)
+	}
+	if err != nil {
+		return err
+	}
+	if c.json {
+		c.write(map[string]any{"tasks": summarizeTasks(tasks)}, "")
+		return nil
+	}
+	for _, task := range tasks {
+		fmt.Fprint(c.stdout, formatTask(task))
+	}
+	return nil
+}
+
+func (c *command) inspect(application *app.App, args []string) error {
+	flags := newFlags("inspect", c.stderr)
+	var events bool
+	flags.BoolVar(&events, "events", false, "include append-only task events")
+	if err := flags.Parse(interspersed(args, map[string]bool{}, map[string]bool{"--events": true})); err != nil {
+		return fault.Wrap("INVALID_ARGUMENT", "invalid inspect arguments", false, err)
+	}
+	if flags.NArg() != 1 {
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun inspect <source|task-id> [--events]", false)
+	}
+	cwd, _ := os.Getwd()
+	if events {
+		result, err := application.Trace(c.ctx, cwd, flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		if c.json {
+			c.write(result, "")
+			return nil
+		}
+		fmt.Fprint(c.stdout, formatInspect(result.Task))
+		fmt.Fprintln(c.stdout, "\nEvents:")
+		for _, event := range result.Events {
+			fmt.Fprintf(c.stdout, "%s  %-24s %-10s %s\n",
+				event.CreatedAt.Local().Format("2006-01-02 15:04:05"),
+				event.Type, event.Stage, event.Message)
+		}
+		return nil
+	}
+	task, err := application.Inspect(c.ctx, cwd, flags.Arg(0))
+	if err != nil {
+		return err
+	}
+	c.write(task, formatInspect(task))
 	return nil
 }
 
@@ -228,17 +321,17 @@ func (c *command) logs(application *app.App, args []string) error {
 		return fault.New("INVALID_ARGUMENT", "usage: joyrun logs <source|task-id> [--lines N]", false)
 	}
 	cwd, _ := os.Getwd()
-	content, task, err := application.Logs(c.ctx, cwd, flags.Arg(0), lines)
+	result, err := application.Logs(c.ctx, cwd, flags.Arg(0), lines)
 	if err != nil {
 		return err
 	}
-	c.write(map[string]any{"task_id": task.ID, "content": content}, content)
+	c.write(result, result.Content)
 	return nil
 }
 
 func (c *command) cancel(application *app.App, args []string) error {
 	if len(args) != 1 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun cancel <source|task-id>", false)
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun cancel <task-id>", false)
 	}
 	cwd, _ := os.Getwd()
 	task, err := application.Cancel(c.ctx, cwd, args[0])
@@ -278,49 +371,26 @@ func (c *command) pull(application *app.App, args []string) error {
 	return nil
 }
 
-func (c *command) history(application *app.App, args []string) error {
-	if len(args) != 1 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun history <source>", false)
-	}
-	cwd, _ := os.Getwd()
-	tasks, err := application.History(c.ctx, cwd, args[0])
-	if err != nil {
-		return err
-	}
-	if c.json {
-		c.write(map[string]any{"tasks": tasks}, "")
-		return nil
-	}
-	for _, task := range tasks {
-		fmt.Fprint(c.stdout, formatTask(task))
-	}
-	return nil
-}
-
 func (c *command) doctor(application *app.App, args []string) error {
 	if len(args) != 1 {
 		return fault.New("INVALID_ARGUMENT", "usage: joyrun doctor <target>", false)
 	}
-	checks := application.Doctor(c.ctx, args[0])
-	ok := true
-	for _, check := range checks {
-		ok = ok && check.OK
-	}
+	result := application.Doctor(c.ctx, args[0])
 	if c.json {
-		c.write(map[string]any{"ok": ok, "checks": checks}, "")
+		c.write(result, "")
 	} else {
-		for _, check := range checks {
-			mark := "✓"
-			if !check.OK {
-				mark = "✗"
+		for _, check := range result.Checks {
+			fmt.Fprintf(c.stdout, "%-5s %-16s %s\n",
+				strings.ToUpper(check.Status), check.Name, check.Message)
+			if check.SuggestedAction != "" {
+				fmt.Fprintf(c.stdout, "      %-16s %s\n", "Suggested action:", check.SuggestedAction)
 			}
-			fmt.Fprintf(c.stdout, "%s %-16s %s\n", mark, check.Name, check.Message)
 		}
 	}
-	if !ok {
-		// Doctor reports check results as data; a failed check is not a failure
-		// to execute the command and therefore must not emit a second JSON value.
-		return nil
+	if !result.Ready {
+		// The report has already been emitted, including in JSON mode. Use a
+		// process exit status instead of returning an error and emitting twice.
+		c.exitCode = 1
 	}
 	return nil
 }
@@ -372,12 +442,15 @@ Usage:
   joyrun init [directory]
   joyrun submit <source> -t <target> [--set key=value] [--dry-run]
   joyrun status <source|task-id>
+  joyrun status --all
+  joyrun list [source]
+  joyrun inspect <source|task-id>
+  joyrun inspect <source|task-id> --events
   joyrun logs <source|task-id> [--lines N]
   joyrun pull <source|task-id> [--all|--include glob] [--live]
-  joyrun cancel <source|task-id>
-  joyrun history <source>
-  joyrun targets
-  joyrun target <show|params> <target>
+  joyrun cancel <task-id>
+  joyrun target list
+  joyrun target show <target>
   joyrun doctor <target>
   joyrun recover <task-id> -t <target>
 
@@ -406,7 +479,32 @@ func formatTask(task model.Task) string {
 	if task.SchedulerID != "" {
 		scheduler = " slurm:" + task.SchedulerID
 	}
-	return fmt.Sprintf("%s  %-10s %s  %s%s\n", task.ID, strings.ToUpper(task.State), task.TargetName, task.SourcePath, scheduler)
+	return fmt.Sprintf("%s  compute:%-17s pull:%-15s %s  %s%s\n",
+		task.ID, strings.ToUpper(task.ComputeState), strings.ToUpper(task.PullState),
+		task.TargetName, task.SourcePath, scheduler)
+}
+
+func formatInspect(task model.Task) string {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "Task:          %s\nProject:       %s\nSource:        %s\nTarget:        %s\nCluster:       %s\n",
+		task.ID, task.ProjectID, task.SourcePath, task.TargetName, task.ClusterName)
+	fmt.Fprintf(&builder, "Compute state: %s\nPull state:    %s\nScheduler:     %s\nRemote:        %s\n",
+		task.ComputeState, task.PullState, task.SchedulerID, task.RemoteDir)
+	fmt.Fprintf(&builder, "Created:       %s\nUpdated:       %s\n\nRendered script:\n%s",
+		task.CreatedAt.Local().Format(time.RFC3339), task.UpdatedAt.Local().Format(time.RFC3339),
+		task.RenderedScript)
+	if !strings.HasSuffix(task.RenderedScript, "\n") {
+		builder.WriteByte('\n')
+	}
+	return builder.String()
+}
+
+func summarizeTasks(tasks []model.Task) []model.TaskSummary {
+	result := make([]model.TaskSummary, 0, len(tasks))
+	for _, task := range tasks {
+		result = append(result, model.SummarizeTask(task))
+	}
+	return result
 }
 
 func formatParams(target model.Target) string {
@@ -432,8 +530,16 @@ func formatParams(target model.Target) string {
 
 func formatPreview(preview app.Preview) string {
 	var builder strings.Builder
-	fmt.Fprintf(&builder, "Task: %s\nSource: %s\nTarget: %s\nCluster: %s\nRemote: %s\n\nParameters:\n",
-		preview.TaskID, preview.Source.RelativePath, preview.Target, preview.Cluster, preview.RemoteDir)
+	entry := "<none>"
+	if preview.Source.Entry != nil {
+		entry = *preview.Source.Entry
+	}
+	fmt.Fprintf(&builder, "Task: %s\nTarget: %s\nCluster: %s\nRemote: %s\nScheduler log: %s\n\nSource:\n  Path:     %s\n  Kind:     %s\n  WorkDir:  %s\n  Entry:    %s\n\nTemplate values:\n  Input:    %s\n  Stem:     %s\n  Name:     %s\n  WorkDir:  %s\n\nParameters:\n",
+		preview.TaskID, preview.Target, preview.Cluster, preview.RemoteDir,
+		preview.SchedulerLog,
+		preview.Source.RelativePath, preview.Source.Kind, preview.Source.WorkDir, entry,
+		displayEmpty(preview.TemplateValues.Input), displayEmpty(preview.TemplateValues.Stem),
+		displayEmpty(preview.TemplateValues.Name), displayEmpty(preview.TemplateValues.WorkDir))
 	names := make([]string, 0, len(preview.Params))
 	for name := range preview.Params {
 		names = append(names, name)
@@ -442,7 +548,7 @@ func formatPreview(preview app.Preview) string {
 	for _, name := range names {
 		fmt.Fprintf(&builder, "  %-20s %v (%s)\n", name, preview.Params[name], preview.ParamSources[name])
 	}
-	builder.WriteString("\nFiles:\n")
+	builder.WriteString("\nUpload snapshot:\n")
 	for _, file := range preview.Files {
 		builder.WriteString("  " + file + "\n")
 	}
@@ -452,6 +558,13 @@ func formatPreview(preview app.Preview) string {
 		builder.WriteByte('\n')
 	}
 	return builder.String()
+}
+
+func displayEmpty(value string) string {
+	if value == "" {
+		return "<empty>"
+	}
+	return value
 }
 
 func sortStrings(values []string) {

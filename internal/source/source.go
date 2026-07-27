@@ -29,10 +29,12 @@ func Resolve(project model.Project, path string) (model.Source, string, error) {
 	relative = filepath.ToSlash(filepath.Clean(relative))
 	var workDir string
 	var entry *string
+	kind := "directory"
 	workDirAbsolute := absolute
 	if info.IsDir() {
 		workDir = relative
 	} else {
+		kind = "file"
 		workDir = filepath.ToSlash(filepath.Dir(relative))
 		workDirAbsolute = filepath.Dir(absolute)
 		name := filepath.Base(relative)
@@ -46,5 +48,6 @@ func Resolve(project model.Project, path string) (model.Source, string, error) {
 		RelativePath: relative,
 		WorkDir:      workDir,
 		Entry:        entry,
+		Kind:         kind,
 	}, workDirAbsolute, nil
 }

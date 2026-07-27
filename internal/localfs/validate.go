@@ -20,7 +20,7 @@ func validatePullPaths(files []string, goos string) error {
 		cleaned := path.Clean(file)
 		if file == "" || !utf8.ValidString(file) || strings.ContainsRune(file, '\x00') || path.IsAbs(file) ||
 			cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || cleaned != file {
-			return fault.New("LOCAL_PATH_UNSUPPORTED", fmt.Sprintf("remote result path %q is not a safe relative path", file), false)
+			return fault.New("LOCAL_PATH_UNSUPPORTED", fmt.Sprintf("remote file path %q is not a safe relative path", file), false)
 		}
 		key := cleaned
 		if goos == "windows" {
@@ -30,7 +30,7 @@ func validatePullPaths(files []string, goos string) error {
 			key = strings.ToLower(cleaned)
 		}
 		if previous, ok := seen[key]; ok && previous != cleaned {
-			return fault.New("LOCAL_PATH_COLLISION", fmt.Sprintf("remote results %q and %q map to the same local path", previous, cleaned), false)
+			return fault.New("LOCAL_PATH_COLLISION", fmt.Sprintf("remote files %q and %q map to the same local path", previous, cleaned), false)
 		}
 		seen[key] = cleaned
 	}
@@ -40,19 +40,19 @@ func validatePullPaths(files []string, goos string) error {
 func validateWindowsPath(value string) error {
 	for _, component := range strings.Split(value, "/") {
 		if component == "" || strings.HasSuffix(component, ".") || strings.HasSuffix(component, " ") {
-			return fmt.Errorf("remote result path %q cannot be represented safely on Windows", value)
+			return fmt.Errorf("remote file path %q cannot be represented safely on Windows", value)
 		}
 		original := component
 		for len(component) > 0 {
 			r, size := utf8.DecodeRuneInString(component)
 			if r < 32 || strings.ContainsRune(`<>:"\|?*`, r) {
-				return fmt.Errorf("remote result path %q contains a character unsupported by Windows", value)
+				return fmt.Errorf("remote file path %q contains a character unsupported by Windows", value)
 			}
 			component = component[size:]
 		}
 		name := strings.ToUpper(strings.SplitN(original, ".", 2)[0])
 		if windowsReservedName(name) {
-			return fmt.Errorf("remote result path %q uses a reserved Windows filename", value)
+			return fmt.Errorf("remote file path %q uses a reserved Windows filename", value)
 		}
 	}
 	return nil

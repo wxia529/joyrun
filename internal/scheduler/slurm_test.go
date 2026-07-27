@@ -9,11 +9,32 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 type localShellRunner struct {
 	path string
+}
+
+type recordingRunner struct {
+	command string
+}
+
+func (r *recordingRunner) Exec(_ context.Context, _, command string, _ io.Reader) (string, string, error) {
+	r.command = command
+	return "12345\n", "", nil
+}
+
+func TestSubmitForcesJoyRunSchedulerLog(t *testing.T) {
+	runner := &recordingRunner{}
+	id, err := (Slurm{Runner: runner}).Submit(context.Background(), "unused", "/remote/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "12345" || !strings.Contains(runner.command, "--output=joyrun-slurm-%j.log") {
+		t.Fatalf("unexpected submit command: %q", runner.command)
+	}
 }
 
 func (r localShellRunner) Exec(ctx context.Context, _, command string, stdin io.Reader) (string, string, error) {

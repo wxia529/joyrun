@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/wxia529/joyrun/internal/fault"
 	"github.com/wxia529/joyrun/internal/model"
 	"github.com/wxia529/joyrun/internal/project"
 	"github.com/wxia529/joyrun/internal/store"
@@ -22,6 +24,8 @@ type fakeRunner struct {
 	metadataWriteCount int
 	failMetadataWrite  int
 	schedulerID        string
+	missingLogs        []string
+	rootResult         string
 }
 
 func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader) (string, string, error) {
@@ -34,7 +38,14 @@ func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader)
 	case strings.Contains(command, "find . -type f"):
 		return "eg.inp\x00eg.out\x00eg.gbw\x00scratch.tmp\x00joyrun-job.sh\x00", "", nil
 	case strings.Contains(command, "tail -n"):
-		return "calculation output\n", "", nil
+		for _, name := range f.missingLogs {
+			if strings.Contains(command, name) {
+				return "MISSING\n", "", nil
+			}
+		}
+		return "FOUND\ncalculation output\n", "", nil
+	case strings.Contains(command, "root=") && strings.Contains(command, "creatable:"):
+		return f.rootResult, "", nil
 	case strings.Contains(command, "cat >") && strings.Contains(command, "metadata.json"):
 		f.metadataWriteCount++
 		if f.metadataWriteCount == f.failMetadataWrite {
@@ -57,12 +68,61 @@ func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader)
 	}
 }
 
+func TestDoctorTreatsCreatableRemoteRootAsWarning(t *testing.T) {
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{"mindu": {
+				Host: "mindu", Scheduler: "slurm", RemoteRoot: "/home/user/joyrun",
+			}},
+			Targets: map[string]model.Target{"mindu/run": {Cluster: "mindu", Script: "run"}},
+		},
+		Runner:   &fakeRunner{rootResult: "creatable:/home/user"},
+		Transfer: &fakeTransfer{},
+	}
+	result := application.Doctor(context.Background(), "mindu/run")
+	if !result.Ready {
+		t.Fatalf("creatable remote root should not block readiness: %#v", result)
+	}
+	var root DoctorCheck
+	for _, check := range result.Checks {
+		if check.Name == "remote_root" {
+			root = check
+		}
+	}
+	if root.Status != "warn" || !root.OK || root.Blocking {
+		t.Fatalf("unexpected remote root warning: %#v", root)
+	}
+}
+
+func TestDoctorBlocksUnwritableRemoteRoot(t *testing.T) {
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{"mindu": {
+				Host: "mindu", Scheduler: "slurm", RemoteRoot: "/shared/joyrun",
+			}},
+			Targets: map[string]model.Target{"mindu/run": {Cluster: "mindu", Script: "run"}},
+		},
+		Runner:   &fakeRunner{rootResult: "not_writable"},
+		Transfer: &fakeTransfer{},
+	}
+	result := application.Doctor(context.Background(), "mindu/run")
+	if result.Ready {
+		t.Fatalf("unwritable remote root should block readiness: %#v", result)
+	}
+	for _, check := range result.Checks {
+		if check.Name == "remote_root" && (check.Status != "fail" || check.SuggestedAction == "") {
+			t.Fatalf("unexpected remote root failure: %#v", check)
+		}
+	}
+}
+
 type fakeTransfer struct {
 	pushed     bool
 	pushedFrom string
 	pushedData []byte
 	beforePush func()
 	pulled     []string
+	pullErr    error
 }
 
 func (f *fakeTransfer) Push(_ context.Context, _ model.Cluster, localDir, _ string, _ []string) error {
@@ -77,7 +137,7 @@ func (f *fakeTransfer) Push(_ context.Context, _ model.Cluster, localDir, _ stri
 
 func (f *fakeTransfer) Pull(_ context.Context, _ model.Cluster, _, _ string, files []string) error {
 	f.pulled = append([]string{}, files...)
-	return nil
+	return f.pullErr
 }
 
 func (f *fakeTransfer) Check(_ context.Context, _ model.Cluster) (string, error) {
@@ -136,7 +196,7 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !xfer.pushed || result.Task.SchedulerID != "12345" || result.Task.State != model.StateQueued {
+	if !xfer.pushed || result.Task.SchedulerID != "12345" || result.Task.ComputeState != model.ComputeQueued {
 		t.Fatalf("unexpected submit result: %#v", result)
 	}
 	movedRoot := filepath.Join(base, "new-location")
@@ -147,7 +207,7 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.State != model.StateCompleted || status.SchedulerState != "COMPLETED" {
+	if status.ComputeState != model.ComputeCompleted || status.PullState != model.PullNotPulled || status.SchedulerState != "COMPLETED" {
 		t.Fatalf("unexpected status: %#v", status)
 	}
 	pulled, err := application.Pull(ctx, movedRoot, result.Task.ID, PullOptions{})
@@ -160,9 +220,28 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 	if strings.Join(xfer.pulled, ",") != "eg.gbw,eg.out" {
 		t.Fatalf("unexpected transfer files: %#v", xfer.pulled)
 	}
-	log, _, err := application.Logs(ctx, movedRoot, result.Task.ID, 10)
-	if err != nil || log != "calculation output\n" {
-		t.Fatalf("unexpected logs: %q, %v", log, err)
+	if pulled.Task.ComputeState != model.ComputeCompleted || pulled.Task.PullState != model.PullSucceeded {
+		t.Fatalf("pull collapsed compute and result state: %#v", pulled.Task)
+	}
+	trace, err := application.Trace(ctx, movedRoot, result.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventTypes := make([]string, 0, len(trace.Events))
+	for _, event := range trace.Events {
+		eventTypes = append(eventTypes, event.Type)
+	}
+	for _, expected := range []string{
+		"TASK_CREATED", "UPLOAD_STARTED", "UPLOAD_COMPLETED", "SUBMIT_STARTED",
+		"SCHEDULER_ACCEPTED", "COMPUTE_STATE_CHANGED", "PULL_STARTED", "PULL_COMPLETED",
+	} {
+		if !contains(eventTypes, expected) {
+			t.Fatalf("missing event %s in %#v", expected, eventTypes)
+		}
+	}
+	log, err := application.Logs(ctx, movedRoot, result.Task.ID, 10)
+	if err != nil || log.Content != "calculation output\n" || log.Kind != "application" {
+		t.Fatalf("unexpected logs: %#v, %v", log, err)
 	}
 
 	recoveryStore, err := store.Open(filepath.Join(t.TempDir(), "recovered.db"))
@@ -177,8 +256,249 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered.ID != result.Task.ID || recovered.State != model.StateCompleted {
+	if recovered.ID != result.Task.ID || recovered.ComputeState != model.ComputeCompleted {
 		t.Fatalf("unexpected recovered task: %#v", recovered)
+	}
+}
+
+func TestPullFailurePreservesCompletedComputeState(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	entry := "job.inp"
+	now := time.Now().UTC()
+	task := model.Task{
+		ID: "jr_pull_failure", ProjectID: p.ProjectID, SourcePath: "job.inp",
+		SourceEntry: &entry, TargetName: "c/run", ClusterName: "c",
+		RemoteDir: "/tmp/joyrun/jr_pull_failure", SchedulerID: "12345",
+		ComputeState: model.ComputeCompleted, PullState: model.PullNotPulled,
+		ResolvedParams: map[string]any{}, CreatedAt: now, UpdatedAt: now,
+		PullPatterns: []string{"*.out"},
+	}
+	if err := s.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	xfer := &fakeTransfer{pullErr: errors.New("connection reset")}
+	application := &App{
+		Config: model.Config{Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		}},
+		Store: s, Runner: &fakeRunner{state: "COMPLETED"}, Transfer: xfer,
+	}
+	_, pullErr := application.Pull(ctx, root, task.ID, PullOptions{})
+	if fault.As(pullErr).Code != "PULL_FAILED" {
+		t.Fatalf("unexpected pull error: %v", pullErr)
+	}
+	stored, err := s.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ComputeState != model.ComputeCompleted || stored.PullState != model.PullFailed {
+		t.Fatalf("pull failure corrupted task states: %#v", stored)
+	}
+	if fault.As(pullErr).SuggestedAction != "joyrun pull "+task.ID {
+		t.Fatalf("missing retry action: %#v", fault.As(pullErr))
+	}
+	application.Runner = &fakeRunner{}
+	refreshed, err := application.Status(ctx, root, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.ComputeState != model.ComputeCompleted ||
+		refreshed.PullState != model.PullFailed {
+		t.Fatalf("status regressed durable terminal/result state: %#v", refreshed)
+	}
+}
+
+func TestCancelRequiresExactTaskID(t *testing.T) {
+	application := &App{}
+	_, err := application.Cancel(context.Background(), t.TempDir(), "task01/eg.inp")
+	if fault.As(err).Code != "CANCEL_REQUIRES_TASK_ID" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func contains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func TestPreviewRejectsDirectoryForFileTarget(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	taskDir := filepath.Join(root, "benzene")
+	if err := os.Mkdir(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(taskDir, "benzene_opt.gjf"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{"mindu": {Host: "mindu", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
+			Targets: map[string]model.Target{"mindu/gaussian": {
+				Cluster: "mindu",
+				Source:  model.SourcePolicy{Kind: "file", Patterns: []string{"*.gjf"}},
+				Script:  "g16 < {{ .Input }} > {{ .Stem }}.log",
+			}},
+		},
+		Store: s,
+	}
+	_, _, _, err = application.Preview(ctx, root, "benzene", "mindu/gaussian", nil)
+	if fault.As(err).Code != "SOURCE_KIND_MISMATCH" {
+		t.Fatalf("expected source kind mismatch, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "benzene/benzene_opt.gjf") {
+		t.Fatalf("expected actionable candidate in error, got %v", err)
+	}
+}
+
+func TestSourceContractRejectsWrongKindAndPattern(t *testing.T) {
+	entry := "job.txt"
+	tests := []struct {
+		name   string
+		source model.Source
+		target model.Target
+		code   string
+	}{
+		{
+			name:   "file passed to directory target",
+			source: model.Source{RelativePath: "job.txt", Entry: &entry, Kind: "file"},
+			target: model.Target{Source: model.SourcePolicy{Kind: "directory"}},
+			code:   "SOURCE_KIND_MISMATCH",
+		},
+		{
+			name:   "entry does not match target patterns",
+			source: model.Source{RelativePath: "job.txt", Entry: &entry, Kind: "file"},
+			target: model.Target{Source: model.SourcePolicy{Kind: "file", Patterns: []string{"*.inp"}}},
+			code:   "SOURCE_PATTERN_MISMATCH",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateSourceContract(test.source, t.TempDir(), "c/run", test.target)
+			if fault.As(err).Code != test.code {
+				t.Fatalf("expected %s, got %v", test.code, err)
+			}
+		})
+	}
+}
+
+func TestLogsFallBackToJoyRunSchedulerLog(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	entry := "job.inp"
+	now := time.Now().UTC()
+	task := model.Task{
+		ID: "jr_logs", ProjectID: p.ProjectID, SourcePath: "job.inp", SourceEntry: &entry,
+		TargetName: "c/run", ClusterName: "c", RemoteDir: "/tmp/joyrun/jr_logs",
+		SchedulerID: "12345", ComputeState: model.ComputeFailed, PullState: model.PullNotPulled,
+		Logs:           []string{"job.log"},
+		ResolvedParams: map[string]any{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{missingLogs: []string{"job.log"}}
+	application := &App{
+		Config: model.Config{Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		}},
+		Store: s, Runner: runner,
+	}
+	result, err := application.Logs(ctx, root, task.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Kind != "scheduler" || result.Path != "joyrun-slurm-12345.log" {
+		t.Fatalf("unexpected fallback: %#v", result)
+	}
+}
+
+func TestLogsSupportLegacySchedulerOutput(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	entry := "job.inp"
+	now := time.Now().UTC()
+	task := model.Task{
+		ID: "jr_legacy_logs", ProjectID: p.ProjectID, SourcePath: "job.inp", SourceEntry: &entry,
+		TargetName: "c/run", ClusterName: "c", RemoteDir: "/tmp/joyrun/jr_legacy_logs",
+		SchedulerID: "9876", ComputeState: model.ComputeFailed, PullState: model.PullNotPulled,
+		Logs:           []string{".log"},
+		ResolvedParams: map[string]any{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{missingLogs: []string{".log", "joyrun-slurm-9876.log"}}
+	application := &App{
+		Config: model.Config{Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		}},
+		Store: s, Runner: runner,
+	}
+	result, err := application.Logs(ctx, root, task.ID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Kind != "scheduler_legacy" || result.Path != "slurm-9876.out" {
+		t.Fatalf("unexpected legacy fallback: %#v", result)
 	}
 }
 
@@ -230,7 +550,7 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	runner := &fakeRunner{failMetadataWrite: 2}
+	runner := &fakeRunner{failMetadataWrite: 2, state: "PENDING"}
 	application := &App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
@@ -246,7 +566,7 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.SchedulerID != "12345" || stored.State != model.StateQueued {
+	if stored.SchedulerID != "12345" || stored.ComputeState != model.ComputeQueued {
 		t.Fatalf("scheduler identity was not persisted: %#v", stored)
 	}
 	if stored.Metadata["remote_metadata_error"] == "" {
@@ -264,7 +584,7 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered.SchedulerID != "12345" || recovered.State != model.StateQueued {
+	if recovered.SchedulerID != "12345" || recovered.ComputeState != model.ComputeQueued {
 		t.Fatalf("scheduler marker did not restore submitted task: %#v", recovered)
 	}
 }

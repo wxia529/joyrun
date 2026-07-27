@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -80,6 +81,39 @@ func Load(path string) (model.Config, error) {
 				return model.Config{}, fault.Wrap("CONFIG_INVALID", fmt.Sprintf("target %q has an invalid log template", name), false, err)
 			}
 		}
+		usesEntry := jtemplate.UsesEntry(target.Script)
+		for _, logPath := range target.Logs {
+			usesEntry = usesEntry || jtemplate.UsesEntry(logPath)
+		}
+		if target.Source.Kind == "" {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q requires an explicit source.kind (file, directory, or either)", name), false)
+		}
+		switch target.Source.Kind {
+		case "file", "directory", "either":
+		default:
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q source.kind must be file, directory, or either", name), false)
+		}
+		if usesEntry && target.Source.Kind != "file" {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q uses .Input or .Stem and therefore requires source.kind file", name), false)
+		}
+		if target.Source.Kind == "directory" && len(target.Source.Patterns) > 0 {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q cannot use source.patterns with source.kind directory", name), false)
+		}
+		for _, pattern := range target.Source.Patterns {
+			if pattern == "" {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("target %q has an empty source pattern", name), false)
+			}
+			if _, err := pathpkg.Match(pattern, "entry"); err != nil {
+				return model.Config{}, fault.Wrap("CONFIG_INVALID",
+					fmt.Sprintf("target %q has invalid source pattern %q", name, pattern), false, err)
+			}
+		}
+		cfg.Targets[name] = target
 	}
 	return cfg, nil
 }

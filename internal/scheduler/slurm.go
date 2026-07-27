@@ -16,7 +16,7 @@ type Slurm struct {
 
 func (s Slurm) Submit(ctx context.Context, host, workDir string) (string, error) {
 	command := "cd " + remote.Quote(workDir) +
-		" && jobid=$(sbatch --parsable joyrun-job.sh) && jobid=${jobid%%;*}" +
+		" && jobid=$(sbatch --parsable --output=joyrun-slurm-%j.log joyrun-job.sh) && jobid=${jobid%%;*}" +
 		" && printf '%s\\n' \"$jobid\" > ../scheduler_id.tmp" +
 		" && mv ../scheduler_id.tmp ../scheduler_id && printf '%s\\n' \"$jobid\""
 	stdout, stderr, err := s.Runner.Exec(ctx, host, command, nil)
@@ -34,6 +34,10 @@ func (s Slurm) Submit(ctx context.Context, host, workDir string) (string, error)
 		return "", fault.Wrap("SUBMIT_FAILED", fmt.Sprintf("unexpected sbatch output %q", id), false, err)
 	}
 	return id, nil
+}
+
+func LogName(jobID string) string {
+	return "joyrun-slurm-" + jobID + ".log"
 }
 
 func (s Slurm) Status(ctx context.Context, host, id string) (string, string, error) {

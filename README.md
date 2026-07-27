@@ -19,6 +19,26 @@ joyrun pull task01/eg.inp
 JoyRun does not know what ORCA, VASP, or another scientific program means.
 Targets are complete user-owned job-script templates.
 
+## Scope and responsibilities
+
+JoyRun is an execution and transport layer. It is responsible for:
+
+- snapshotting a local source into an isolated remote task;
+- transferring files, submitting Slurm jobs, and querying scheduler state;
+- recording task state, submission provenance, and lifecycle events;
+- safely pulling user-selected results back to the source directory.
+
+The user or calling agent is responsible for:
+
+- choosing the target, resources, software environment, and artifact policy;
+- providing a correct job script;
+- interpreting scientific output;
+- deciding whether and how to modify, restart, or resubmit a calculation.
+
+JoyRun does not interpret results, modify inputs, restart failed calculations,
+build workflow DAGs, or expose a general-purpose remote shell. It has no
+required daemon: remote actions occur only when a JoyRun command is run.
+
 ## Build
 
 JoyRun requires Go 1.24 or later at build time and the OpenSSH `ssh` command
@@ -82,6 +102,9 @@ A target describes one way to run software on a cluster:
 targets:
   gibbs/orca:
     cluster: gibbs
+    source:
+      kind: file
+      patterns: ["*.inp"]
     params:
       cpus:
         type: int
@@ -98,9 +121,21 @@ targets:
     logs: ["{{ .Stem }}.out"]
 ```
 
+`source.kind` is the target's input contract:
+
+- `file` — submission must name one concrete entry file
+- `directory` — submission must name a directory
+- `either` — both forms are accepted
+
+Optional `source.patterns` validates file entry names. JoyRun rejects a
+directory submitted to a file target before rendering or creating a task, with
+an actionable command that names the sole matching candidate when possible.
+Every target must declare `source.kind` explicitly. JoyRun does not infer an
+input contract from the script.
+
 Public template values are:
 
-- `{{ .Input }}` — entry filename, empty for a directory source
+- `{{ .Input }}` — entry filename for a `file` source
 - `{{ .Stem }}` — entry filename without its final extension
 - `{{ .Name }}` — source working-directory name
 - `{{ .TaskID }}` — JoyRun task ID
@@ -141,25 +176,41 @@ record:
 joyrun submit task01/eg.inp -t gibbs/orca --dry-run
 ```
 
-It shows resolved parameters, files, the planned remote directory, and the
-rendered script.
+It shows source kind, work directory, entry file, resolved template values and
+parameters, the upload snapshot, planned remote directory, and rendered
+script. A source-contract mismatch is a hard preview error rather than a
+script containing empty `.Input` or `.Stem` values.
 
 ## Commands
 
 ```bash
 joyrun init [directory]
-joyrun targets
+joyrun target list
 joyrun target show gibbs/orca
-joyrun target params gibbs/orca
 joyrun doctor gibbs/orca
 
 joyrun submit task01/eg.inp -t gibbs/orca
 joyrun status task01/eg.inp
+joyrun status --all
+joyrun list [task01/eg.inp]
+joyrun inspect jr_TASK_ID
+joyrun inspect jr_TASK_ID --events
 joyrun logs task01/eg.inp --lines 200
 joyrun pull task01/eg.inp
-joyrun cancel task01/eg.inp
-joyrun history task01/eg.inp
+joyrun cancel jr_TASK_ID
 ```
+
+JoyRun reserves `joyrun-slurm-<jobid>.log` for scheduler diagnostics. `logs`
+first reads the first configured application log that exists, then falls back
+to this scheduler log. For tasks created by older JoyRun versions it also
+checks `slurm-<jobid>.out`. If no candidate exists yet, the retryable
+`LOG_NOT_READY` error lists every checked path.
+
+`doctor` reports checks as `PASS`, `WARN`, or `FAIL`. A missing `remote_root`
+whose nearest existing ancestor is writable is a non-blocking warning because
+the first submission will create it. An existing but unwritable root, or a
+root that cannot be created, is blocking, includes a suggested action, and
+causes a nonzero process exit status.
 
 A source path addresses its newest task. A `jr_...` task ID addresses one exact
 historical run:
@@ -168,6 +219,31 @@ historical run:
 joyrun status jr_TASK_ID
 joyrun pull jr_TASK_ID
 ```
+
+Use source paths for convenient lookup and exact Task IDs for mutations such
+as cancellation. `cancel` rejects source paths so a later submission cannot be
+cancelled accidentally.
+
+JoyRun records compute state and pull progress independently:
+
+- `compute_state`: `created`, `submission_failed`, `queued`, `running`,
+  `completed`, `failed`, `cancelled`, or `unknown`
+- `pull_state`: `not_pulled`, `pulling`, `pulled`, `partial`, or `failed`
+
+For example, a completed calculation whose download failed remains
+`compute_state=completed` and becomes `pull_state=failed`. Retry
+`pull`; do not recompute it.
+
+`pull_state` describes only the latest requested pull operation. It does not
+claim that every remote file still exists or that every scientifically
+important file has been downloaded.
+
+`list` restores the project's task view across sessions; an optional source
+shows its submission history. `inspect` returns the immutable submission
+snapshot, including parameters, manifest, and rendered script.
+`inspect --events` includes the append-only lifecycle events. `status --all`
+queries Slurm for all non-terminal tasks and records observed transitions
+without creating a new calculation.
 
 For a file source, JoyRun uploads the file's entire containing directory.
 For a directory source, it uploads the directory contents. `.joyrunignore`,
@@ -198,7 +274,7 @@ joyrun status task01/eg.inp --json
 Success:
 
 ```json
-{"ok":true,"result":{"id":"jr_...","state":"running"}}
+{"ok":true,"result":{"id":"jr_...","compute_state":"running","pull_state":"not_pulled"}}
 ```
 
 Failure:
@@ -209,7 +285,11 @@ Failure:
   "error": {
     "code": "SSH_FAILED",
     "message": "cannot connect to gibbs",
-    "retryable": true
+    "retryable": true,
+    "stage": "upload",
+    "suggested_action": "joyrun status jr_...",
+    "compute_state": "submission_failed",
+    "pull_state": "not_pulled"
   }
 }
 ```
@@ -226,6 +306,10 @@ $XDG_DATA_HOME/joyrun/joyrun.db
 
 or `~/.local/share/joyrun/joyrun.db` when `XDG_DATA_HOME` is unset.
 `JOYRUN_DB` can override it.
+
+The current database format is explicitly development-only. Its metadata is
+marked `release_channel=development` and `schema_label=dev-1`. JoyRun rejects
+older or differently marked databases instead of migrating them.
 
 On Windows the defaults are:
 

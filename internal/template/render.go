@@ -38,6 +38,28 @@ func Validate(value string, params map[string]model.ParamSpec) error {
 	return nil
 }
 
+func UsesEntry(value string) bool {
+	tmpl, err := texttemplate.New("inspect").Parse(value)
+	if err != nil || tmpl.Tree == nil || tmpl.Tree.Root == nil {
+		return false
+	}
+	for _, node := range tmpl.Tree.Root.Nodes {
+		action, ok := node.(*parse.ActionNode)
+		if !ok || action.Pipe == nil || len(action.Pipe.Cmds) != 1 {
+			continue
+		}
+		command := action.Pipe.Cmds[0]
+		if len(command.Args) != 1 {
+			continue
+		}
+		field, ok := command.Args[0].(*parse.FieldNode)
+		if ok && len(field.Ident) == 1 && (field.Ident[0] == "Input" || field.Ident[0] == "Stem") {
+			return true
+		}
+	}
+	return false
+}
+
 func validateAction(action *parse.ActionNode, params map[string]model.ParamSpec) error {
 	if action.Pipe == nil || len(action.Pipe.Decl) != 0 || len(action.Pipe.Cmds) != 1 {
 		return fault.New("TARGET_INVALID", "template pipelines and declarations are not allowed", false)
