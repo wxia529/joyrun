@@ -251,7 +251,7 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 		Store: s, Runner: runner, Transfer: xfer,
 	}
 	result, err := application.Submit(
-		ctx, root, "task01/eg.inp", "gibbs/orca", []string{"cpus=64"}, false,
+		ctx, root, "task01/eg.inp", "gibbs/orca", []string{"cpus=64"}, nil, false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -464,7 +464,7 @@ func TestPreviewRejectsDirectoryForFileTarget(t *testing.T) {
 		},
 		Store: s,
 	}
-	_, _, _, err = application.Preview(ctx, root, "benzene", "mindu/gaussian", nil, false)
+	_, _, _, err = application.Preview(ctx, root, "benzene", "mindu/gaussian", nil, nil, false)
 	if fault.As(err).Code != "SOURCE_KIND_MISMATCH" {
 		t.Fatalf("expected source kind mismatch, got %v", err)
 	}
@@ -525,16 +525,101 @@ func TestPreviewRejectsProjectRootWithoutExplicitOverride(t *testing.T) {
 		},
 	}}
 	if _, _, _, err := application.Preview(
-		ctx, root, "job.inp", "c/run", nil, false,
+		ctx, root, "job.inp", "c/run", nil, nil, false,
 	); fault.As(err).Code != "PROJECT_ROOT_UPLOAD_FORBIDDEN" {
 		t.Fatalf("expected project-root upload rejection, got %v", err)
 	}
-	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, true)
+	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(preview.InputManifest) != 1 || preview.InputManifest[0].Path != "job.inp" {
 		t.Fatalf("unexpected explicitly allowed snapshot: %#v", preview.InputManifest)
+	}
+}
+
+func TestPreviewAddsOnlyExplicitEntryDependencies(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Join(root, "task")
+	if err := os.Mkdir(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"job.inp":      "input",
+		"coords.xyz":   "coordinates",
+		"shared.basis": "basis",
+		"restart.gbw":  "restart",
+		"other.inp":    "other input",
+	} {
+		if err := os.WriteFile(filepath.Join(workDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	application := &App{Config: model.Config{
+		Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		},
+		Targets: map[string]model.Target{
+			"c/run": {
+				Cluster: "c", Source: model.SourcePolicy{Kind: "file", Patterns: []string{"*.inp"}},
+				Push:   model.PushPolicy{Mode: "entry", Include: []string{"shared.basis"}},
+				Script: "run {{ .Input }}",
+			},
+			"c/workdir": {
+				Cluster: "c", Source: model.SourcePolicy{Kind: "directory"},
+				Push: model.PushPolicy{Mode: "workdir"}, Script: "run",
+			},
+			"c/excluding": {
+				Cluster: "c", Source: model.SourcePolicy{Kind: "file"},
+				Push:   model.PushPolicy{Mode: "entry", Exclude: []string{"*.gbw"}},
+				Script: "run {{ .Input }}",
+			},
+		},
+	}}
+
+	preview, _, _, err := application.Preview(
+		ctx, root, "task/job.inp", "c/run", nil, []string{"coords.xyz"}, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]bool)
+	for _, entry := range preview.InputManifest {
+		got[entry.Path] = true
+	}
+	if !got["job.inp"] || !got["shared.basis"] || !got["coords.xyz"] ||
+		got["restart.gbw"] || got["other.inp"] {
+		t.Fatalf("unexpected explicit dependency selection: %#v", preview.InputManifest)
+	}
+	if len(preview.Push.Include) != 2 ||
+		preview.Push.Include[0] != "shared.basis" ||
+		preview.Push.Include[1] != "coords.xyz" {
+		t.Fatalf("preview did not expose resolved includes: %#v", preview.Push.Include)
+	}
+
+	if _, _, _, err := application.Preview(
+		ctx, root, "task/job.inp", "c/run", nil, []string{"missing.gbw"}, false,
+	); fault.As(err).Code != "SOURCE_DEPENDENCY_NOT_FOUND" {
+		t.Fatalf("expected missing dependency rejection, got %v", err)
+	}
+	if _, _, _, err := application.Preview(
+		ctx, root, "task/job.inp", "c/excluding", nil, []string{"restart.gbw"}, false,
+	); fault.As(err).Code != "SOURCE_DEPENDENCY_NOT_FOUND" {
+		t.Fatalf("expected excluded dependency rejection, got %v", err)
+	}
+	if _, _, _, err := application.Preview(
+		ctx, root, "task/job.inp", "c/run", nil, []string{"["}, false,
+	); fault.As(err).Code != "INVALID_ARGUMENT" {
+		t.Fatalf("expected invalid include rejection, got %v", err)
+	}
+	if _, _, _, err := application.Preview(
+		ctx, root, "task", "c/workdir", nil, []string{"coords.xyz"}, false,
+	); fault.As(err).Code != "INVALID_ARGUMENT" {
+		t.Fatalf("expected workdir include rejection, got %v", err)
 	}
 }
 
@@ -654,7 +739,7 @@ func TestDryRunMakesNoTaskRecord(t *testing.T) {
 		},
 		Store: s,
 	}
-	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, true)
+	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +775,7 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 		},
 		Store: s, Runner: runner, Transfer: &fakeTransfer{},
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, true)
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, true)
 	if err != nil {
 		t.Fatalf("submission should remain successful after metadata refresh failure: %v", err)
 	}
@@ -751,7 +836,7 @@ func TestSubmitReconcilesAcceptedJobAfterSSHDisconnect(t *testing.T) {
 		},
 		Store: s, Runner: runner, Transfer: &fakeTransfer{},
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, true)
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -768,6 +853,9 @@ func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 	}
 	inputPath := filepath.Join(root, "job.inp")
 	if err := os.WriteFile(inputPath, []byte("version one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "restart.gbw"), []byte("restart"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
@@ -789,7 +877,9 @@ func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 		},
 		Store: s, Runner: &fakeRunner{}, Transfer: xfer,
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, true)
+	result, err := application.Submit(
+		ctx, root, "job.inp", "c/run", nil, []string{"restart.gbw"}, true,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -800,6 +890,13 @@ func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 	sum := sha256.Sum256(uploaded)
 	if got := result.Task.InputManifest[0].SHA256; got != hex.EncodeToString(sum[:]) {
 		t.Fatalf("manifest %s does not describe uploaded bytes", got)
+	}
+	if len(result.Task.InputManifest) != 2 ||
+		result.Task.InputManifest[1].Path != "restart.gbw" {
+		t.Fatalf("explicit dependency was not frozen in the task: %#v", result.Task.InputManifest)
+	}
+	if result.Task.Metadata["submit_includes"] != `["restart.gbw"]` {
+		t.Fatalf("explicit dependency intent was not recorded: %#v", result.Task.Metadata)
 	}
 }
 

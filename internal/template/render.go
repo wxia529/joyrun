@@ -38,6 +38,28 @@ func Validate(value string, params map[string]model.ParamSpec) error {
 	return nil
 }
 
+func ValidateParamsOnly(value string, params map[string]model.ParamSpec) error {
+	if err := Validate(value, params); err != nil {
+		return err
+	}
+	tmpl, err := texttemplate.New("params-only").Parse(value)
+	if err != nil || tmpl.Tree == nil || tmpl.Tree.Root == nil {
+		return err
+	}
+	for _, node := range tmpl.Tree.Root.Nodes {
+		action, ok := node.(*parse.ActionNode)
+		if !ok {
+			continue
+		}
+		field, ok := action.Pipe.Cmds[0].Args[0].(*parse.FieldNode)
+		if !ok || len(field.Ident) != 2 || field.Ident[0] != "Params" {
+			return fault.New("TARGET_INVALID",
+				"this template only supports .Params substitutions", false)
+		}
+	}
+	return nil
+}
+
 func UsesEntry(value string) bool {
 	tmpl, err := texttemplate.New("inspect").Parse(value)
 	if err != nil || tmpl.Tree == nil || tmpl.Tree.Root == nil {

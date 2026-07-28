@@ -37,6 +37,9 @@ targets:
           - community
           - highio
 
+    status:
+      partition: "{{ .Params.partition }}"
+
     script: |
       #!/bin/bash
       #SBATCH --cpus-per-task={{ .Params.cpus }}
@@ -48,14 +51,11 @@ targets:
 
     push:
       mode: entry
-      include:
-        - "*.xyz"
       limits:
         max_files: 20
         max_total_size: 2GiB
       exclude:
         - "*.out"
-        - "*.gbw"
         - "*.tmp"
 
     pull:
@@ -74,6 +74,13 @@ targets:
       kind: directory
 
     params:
+      partition:
+        type: string
+        default: community
+        choices:
+          - community
+          - highio
+
       executable:
         type: string
         default: std
@@ -82,10 +89,14 @@ targets:
           - gam
           - ncl
 
+    status:
+      partition: "{{ .Params.partition }}"
+
     script: |
       #!/bin/bash
       #SBATCH --nodes=4
       #SBATCH --ntasks=96
+      #SBATCH --partition={{ .Params.partition }}
       #SBATCH --job-name={{ .Name }}
 
       module load vasp

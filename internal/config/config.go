@@ -43,10 +43,11 @@ const starter = `# JoyRun user configuration.
 #       patterns: ["*.inp"]
 #     push:
 #       mode: entry
-#       include: ["*.xyz"]
 #       limits:
 #         max_files: 20
 #         max_total_size: 2GiB
+#     status:
+#       partition: community
 #     script: |
 #       #!/bin/bash
 #       #SBATCH --job-name={{ .Stem }}
@@ -146,6 +147,16 @@ func Load(path string) (model.Config, error) {
 		}
 		if err := jtemplate.Validate(target.Script, target.Params); err != nil {
 			return model.Config{}, fault.Wrap("CONFIG_INVALID", fmt.Sprintf("target %q has an invalid script", name), false, err)
+		}
+		if target.Status.Partition != "" {
+			if strings.TrimSpace(target.Status.Partition) == "" {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("target %q status.partition cannot be blank", name), false)
+			}
+			if err := jtemplate.ValidateParamsOnly(target.Status.Partition, target.Params); err != nil {
+				return model.Config{}, fault.Wrap("CONFIG_INVALID",
+					fmt.Sprintf("target %q has an invalid status.partition template", name), false, err)
+			}
 		}
 		for _, logPath := range target.Logs {
 			if err := jtemplate.Validate(logPath, target.Params); err != nil {

@@ -213,18 +213,24 @@ targets:
       cpus:
         type: int
         default: 32
+      partition:
+        type: string
+        default: community
+        choices: [community, highio]
+    status:
+      partition: "{{ .Params.partition }}"
     script: |
       #!/bin/bash
       #SBATCH --cpus-per-task={{ .Params.cpus }}
+      #SBATCH --partition={{ .Params.partition }}
       #SBATCH --job-name={{ .Stem }}
       orca {{ .Input }} > {{ .Stem }}.out
     push:
       mode: entry
-      include: ["*.xyz"]
       limits:
         max_files: 20
         max_total_size: 2GiB
-      exclude: ["*.out", "*.gbw"]
+      exclude: ["*.out", "*.tmp"]
     pull:
       default: ["*.out", "*.xyz", "*.gbw"]
     logs: ["{{ .Stem }}.out"]
@@ -244,8 +250,10 @@ input contract from the script.
 
 Every target must also declare an upload boundary:
 
-- `push.mode: entry` uploads only the selected source file plus files matching
-  `push.include`; it is restricted to `source.kind: file` targets.
+- `push.mode: entry` uploads only the selected source file, target-level
+  `push.include` dependencies, and dependencies explicitly selected for this
+  submission with repeatable `--include` flags. It is restricted to
+  `source.kind: file` targets.
 - `push.mode: workdir` uploads the complete source working directory after
   exclusions.
 
@@ -253,6 +261,21 @@ Every target must also declare an upload boundary:
 `.git/` rules take precedence over inclusion. Optional
 `push.limits.max_files` and `push.limits.max_total_size` reject unexpectedly
 large snapshots locally. Size values accept units such as `2GB` and `2GiB`.
+Reserve target-level `push.include` for dependencies required by every run.
+Select optional coordinates or restart files by exact name for one task:
+
+```bash
+joyrun submit task01/eg.inp -t gibbs/orca \
+  --include structure.xyz \
+  --include eg.gbw
+```
+
+Each requested pattern must match an uploaded file, or JoyRun rejects the
+submission locally. Prefer exact filenames over broad globs such as `*.gbw`
+when selecting restart data. In particular, generic ORCA targets should not
+default to `*.gbw`/`*.hess`, and generic Gaussian targets should not default to
+`*.chk`/`*.fchk`; those files are inputs only for workflows that explicitly
+reference them.
 
 JoyRun rejects any source whose working directory is the project root. This
 protects agents from accidentally uploading the entire project. Use
@@ -317,6 +340,9 @@ joyrun config init
 joyrun config validate
 joyrun target list
 joyrun target show gibbs/orca
+joyrun target params gibbs/orca
+joyrun target nodes gibbs/orca
+joyrun target nodes gibbs/orca --set partition=highio
 joyrun doctor gibbs/orca
 
 joyrun submit task01/eg.inp -t gibbs/orca
@@ -332,6 +358,13 @@ joyrun pull task01/eg.inp
 joyrun pull jr_TASK_ID --dry-run
 joyrun cancel jr_TASK_ID
 ```
+
+`status.partition` declares the Slurm partition associated with a computation
+Target. It may be fixed text or a direct `.Params.*` substitution. `target
+nodes` resolves the same defaults, choices, and `--set` overrides used by
+submission, then queries only that partition. It reports a timestamped
+observation; idle nodes do not guarantee that Slurm will start a job
+immediately.
 
 JoyRun reserves `joyrun-slurm-<jobid>.log` for scheduler diagnostics. `logs`
 first reads the first configured application log that exists, then falls back

@@ -18,11 +18,11 @@ import (
 
 func TestInterspersedCanonicalSubmitSyntax(t *testing.T) {
 	got := interspersed(
-		[]string{"task01/eg.inp", "-t", "gibbs/orca", "--set", "cpus=64", "--dry-run"},
-		map[string]bool{"--target": true, "-t": true, "--set": true},
+		[]string{"task01/eg.inp", "-t", "gibbs/orca", "--set", "cpus=64", "--include", "coords.xyz", "--dry-run"},
+		map[string]bool{"--target": true, "-t": true, "--set": true, "--include": true},
 		map[string]bool{"--dry-run": true},
 	)
-	want := []string{"-t", "gibbs/orca", "--set", "cpus=64", "--dry-run", "task01/eg.inp"}
+	want := []string{"-t", "gibbs/orca", "--set", "cpus=64", "--include", "coords.xyz", "--dry-run", "task01/eg.inp"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
@@ -105,6 +105,58 @@ func (doctorRunner) Exec(_ context.Context, _, command string, _ io.Reader) (str
 	return "", "", nil
 }
 
+type cliNodesRunner struct{}
+
+func (cliNodesRunner) Exec(_ context.Context, _, _ string, _ io.Reader) (string, string, error) {
+	return "community|node01|idle|32|256000|(null)\n", "", nil
+}
+
+func TestTargetParamsAndNodesCommands(t *testing.T) {
+	application := &app.App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{
+				"c": {Host: "c", Scheduler: "slurm"},
+			},
+			Targets: map[string]model.Target{
+				"c/run": {
+					Cluster: "c",
+					Params: map[string]model.ParamSpec{
+						"partition": {
+							Type: "string", Default: "small",
+							Choices: []any{"small", "community"},
+						},
+					},
+					Status: model.TargetStatus{Partition: "{{ .Params.partition }}"},
+				},
+			},
+		},
+		Runner: cliNodesRunner{},
+	}
+	var stdout, stderr bytes.Buffer
+	c := &command{
+		ctx: context.Background(), stdout: &stdout, stderr: &stderr,
+	}
+	if err := c.target(application, []string{"params", "c/run"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "partition") {
+		t.Fatalf("parameter output is incomplete: %q", stdout.String())
+	}
+
+	stdout.Reset()
+	c.json = true
+	if err := c.target(application, []string{
+		"nodes", "c/run", "--set", "partition=community",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{`"partition":"community"`, `"idle":1`, `"node01"`} {
+		if !strings.Contains(stdout.String(), expected) {
+			t.Fatalf("node JSON is missing %q: %s", expected, stdout.String())
+		}
+	}
+}
+
 type doctorTransfer struct{}
 
 func (doctorTransfer) Push(context.Context, model.Cluster, string, string, []string) error {
@@ -176,6 +228,9 @@ func TestDryRunDoesNotRequireTaskDatabase(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "input.dat"), []byte("input"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "dependency.dat"), []byte("dependency"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(configPath, []byte(`
 version: 1
@@ -210,8 +265,11 @@ targets:
 		stdout: &stdout, stderr: &stderr,
 	}
 	if err := c.execute("submit", []string{
-		"input.dat", "-t", "c/run", "--dry-run", "--allow-project-root",
+		"input.dat", "-t", "c/run", "--include", "dependency.dat", "--dry-run", "--allow-project-root",
 	}); err != nil {
 		t.Fatalf("dry-run unexpectedly required the task database: %v", err)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("dependency.dat")) {
+		t.Fatalf("dry-run omitted explicit dependency: %q", stdout.String())
 	}
 }

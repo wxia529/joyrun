@@ -53,6 +53,12 @@ targets:
         type: string
         default: std
         choices: [std, gam]
+      partition:
+        type: string
+        default: community
+        choices: [community, highio]
+    status:
+      partition: "{{ .Params.partition }}"
     script: |
       #SBATCH -c {{ .Params.cpus }}
       orca_{{ .Params.executable }} {{ .Input }}
@@ -70,6 +76,9 @@ targets:
 	if cfg.Targets["gibbs/orca"].Source.Kind != "file" {
 		t.Fatalf("unexpected source policy: %#v", cfg.Targets["gibbs/orca"].Source)
 	}
+	if cfg.Targets["gibbs/orca"].Status.Partition != "{{ .Params.partition }}" {
+		t.Fatalf("unexpected target status: %#v", cfg.Targets["gibbs/orca"].Status)
+	}
 	values, sources, err := ResolveParams(cfg.Targets["gibbs/orca"], []string{"cpus=64"})
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +88,27 @@ targets:
 	}
 	if sources["cpus"] != "cli" || sources["executable"] != "target_default" {
 		t.Fatalf("unexpected sources: %#v", sources)
+	}
+}
+
+func TestLoadRejectsRuntimeValuesInStatusPartition(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `version: 1
+clusters:
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+targets:
+  c/run:
+    cluster: c
+    source: {kind: file}
+    push: {mode: entry}
+    status: {partition: "{{ .Input }}"}
+    script: "run {{ .Input }}"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected status.partition runtime value to be rejected")
 	}
 }
 

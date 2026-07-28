@@ -12,10 +12,20 @@ targets can constrain entry names with glob patterns. Targets that use
 rendering and before task persistence.
 
 Each target also declares `push.mode`. `entry` is valid only for a file target
-and snapshots the selected entry plus explicit `push.include` dependencies.
+and snapshots the selected entry plus target-level `push.include` dependencies
+and per-submission `--include` dependencies. Target-level includes are for
+files required by every run; optional coordinates and restart files should be
+selected explicitly for one submission. Every requested `--include` pattern
+must match an uploaded file.
 `workdir` snapshots the whole source working directory. Exclusions always win,
 including built-in `.joyrun/` and `.git/` rules. Optional file-count and
 total-size limits reject unexpectedly broad snapshots before SSH is used.
+
+Targets may declare `status.partition` as fixed text or a params-only template.
+This is explicit scheduler-observation metadata, not a resource DSL. JoyRun
+does not parse rendered SBATCH scripts to infer it. `target nodes` resolves
+the Target's normal parameter defaults and choices, queries only that Slurm
+partition, and never changes task state or selects a partition automatically.
 
 The project root is not a valid upload working directory by default, including
 when a file source lives directly beneath it. `--allow-project-root` is an

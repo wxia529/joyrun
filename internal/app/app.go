@@ -155,15 +155,17 @@ func (a *App) Preview(
 	ctx context.Context,
 	cwd, sourcePath, targetName string,
 	sets []string,
+	includes []string,
 	allowProjectRoot bool,
 ) (Preview, model.Task, string, error) {
-	return a.prepare(ctx, cwd, sourcePath, targetName, sets, true, allowProjectRoot)
+	return a.prepare(ctx, cwd, sourcePath, targetName, sets, includes, true, allowProjectRoot)
 }
 
 func (a *App) prepare(
 	ctx context.Context,
 	cwd, sourcePath, targetName string,
 	sets []string,
+	includes []string,
 	scanManifest bool,
 	allowProjectRoot bool,
 ) (Preview, model.Task, string, error) {
@@ -205,13 +207,16 @@ func (a *App) prepare(
 	}
 	var inputManifest []model.ManifestEntry
 	var ignored []string
-	selection, err := uploadSelection(p.Root, localWorkDir, src, target)
+	selection, err := uploadSelection(p.Root, localWorkDir, src, target, includes)
 	if err != nil {
 		return Preview{}, model.Task{}, "", err
 	}
 	if scanManifest {
 		inputManifest, ignored, err = manifest.Build(localWorkDir, selection)
 		if err != nil {
+			return Preview{}, model.Task{}, "", err
+		}
+		if err := validateRequestedIncludes(includes, inputManifest); err != nil {
 			return Preview{}, model.Task{}, "", err
 		}
 	}
@@ -228,6 +233,11 @@ func (a *App) prepare(
 		logs = append(logs, rendered)
 	}
 	now := time.Now().UTC()
+	metadata := map[string]string{"recovery_format": "1"}
+	if len(includes) > 0 {
+		encoded, _ := json.Marshal(includes)
+		metadata["submit_includes"] = string(encoded)
+	}
 	task := model.Task{
 		ID: taskID, ProjectID: p.ProjectID, SourcePath: src.RelativePath, SourceWorkDir: src.WorkDir,
 		SourceEntry: src.Entry, TargetName: targetName, ClusterName: target.Cluster,
@@ -236,11 +246,13 @@ func (a *App) prepare(
 		RenderedScript: script, TargetHash: jtemplate.TargetHash(target), InputManifest: inputManifest,
 		PullPatterns: append([]string{}, target.Pull.Default...),
 		PushExcludes: selection.Exclude,
-		Logs:         logs, Metadata: map[string]string{"recovery_format": "1"},
+		Logs:         logs, Metadata: metadata,
 		CreatedAt: now, UpdatedAt: now,
 	}
+	resolvedPush := target.Push
+	resolvedPush.Include = append([]string{}, selection.Include...)
 	preview := Preview{
-		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster, Push: target.Push,
+		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster, Push: resolvedPush,
 		RemoteDir: remoteDir, Params: params, ParamSources: paramSources, Files: files,
 		Ignored: ignored, RenderedScript: script, InputManifest: inputManifest,
 		TemplateValues: TemplateValues{
@@ -266,6 +278,7 @@ func uploadSelection(
 	projectRoot, localWorkDir string,
 	src model.Source,
 	target model.Target,
+	requestedIncludes []string,
 ) (manifest.Selection, error) {
 	var maxTotalBytes int64
 	var err error
@@ -280,12 +293,74 @@ func uploadSelection(
 	if src.Entry != nil {
 		entry = *src.Entry
 	}
+	includes, err := resolveSubmitIncludes(target, requestedIncludes)
+	if err != nil {
+		return manifest.Selection{}, err
+	}
 	return manifest.Selection{
 		Mode: target.Push.Mode, Entry: entry,
-		Include:  append([]string{}, target.Push.Include...),
+		Include:  includes,
 		Exclude:  manifest.ExcludePatterns(projectRoot, localWorkDir, target.Push.Exclude),
 		MaxFiles: target.Push.Limits.MaxFiles, MaxTotalBytes: maxTotalBytes,
 	}, nil
+}
+
+func resolveSubmitIncludes(target model.Target, requested []string) ([]string, error) {
+	if len(requested) > 0 && target.Push.Mode != "entry" {
+		return nil, fault.New("INVALID_ARGUMENT",
+			"--include is only valid for targets with push.mode: entry", false).
+			WithAction("remove --include or submit through an entry-mode target")
+	}
+	result := make([]string, 0, len(target.Push.Include)+len(requested))
+	seen := make(map[string]struct{}, cap(result))
+	for _, pattern := range append(append([]string{}, target.Push.Include...), requested...) {
+		pattern = filepath.ToSlash(strings.TrimSpace(pattern))
+		if pattern == "" {
+			return nil, fault.New("INVALID_ARGUMENT", "--include pattern cannot be empty", false)
+		}
+		if strings.HasPrefix(pattern, "/") || filepath.IsAbs(pattern) {
+			return nil, fault.New("INVALID_ARGUMENT",
+				fmt.Sprintf("--include pattern %q must be relative to the source work directory", pattern), false)
+		}
+		for _, segment := range strings.Split(pattern, "/") {
+			if segment == ".." {
+				return nil, fault.New("INVALID_ARGUMENT",
+					fmt.Sprintf("--include pattern %q cannot traverse outside the source work directory", pattern), false)
+			}
+		}
+		matchPattern := strings.TrimSuffix(pattern, "/")
+		if matchPattern == "" {
+			return nil, fault.New("INVALID_ARGUMENT", "--include pattern cannot select the work directory root", false)
+		}
+		if _, err := path.Match(matchPattern, "candidate"); err != nil {
+			return nil, fault.Wrap("INVALID_ARGUMENT",
+				fmt.Sprintf("invalid --include pattern %q", pattern), false, err)
+		}
+		if _, ok := seen[pattern]; ok {
+			continue
+		}
+		seen[pattern] = struct{}{}
+		result = append(result, pattern)
+	}
+	return result, nil
+}
+
+func validateRequestedIncludes(requested []string, entries []model.ManifestEntry) error {
+	for _, pattern := range requested {
+		matched := false
+		for _, entry := range entries {
+			if manifest.Match(entry.Path, []string{pattern}) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fault.New("SOURCE_DEPENDENCY_NOT_FOUND",
+				fmt.Sprintf("--include pattern %q matched no uploaded file", pattern), false).
+				WithAction("check the filename and the target push.exclude and .joyrunignore rules")
+		}
+	}
+	return nil
 }
 
 func validateSourceContract(src model.Source, localWorkDir, targetName string, target model.Target) error {
@@ -351,10 +426,11 @@ func (a *App) Submit(
 	ctx context.Context,
 	cwd, sourcePath, targetName string,
 	sets []string,
+	includes []string,
 	allowProjectRoot bool,
 ) (SubmitResult, error) {
 	_, task, localWorkDir, err := a.prepare(
-		ctx, cwd, sourcePath, targetName, sets, false, allowProjectRoot,
+		ctx, cwd, sourcePath, targetName, sets, includes, false, allowProjectRoot,
 	)
 	if err != nil {
 		return SubmitResult{}, err
@@ -367,7 +443,7 @@ func (a *App) Submit(
 		return SubmitResult{}, err
 	}
 	target := a.Config.Targets[task.TargetName]
-	selection, err := uploadSelection(p.Root, localWorkDir, model.Source{Entry: task.SourceEntry}, target)
+	selection, err := uploadSelection(p.Root, localWorkDir, model.Source{Entry: task.SourceEntry}, target, includes)
 	if err != nil {
 		return SubmitResult{}, err
 	}
@@ -376,6 +452,9 @@ func (a *App) Submit(
 		return SubmitResult{}, err
 	}
 	defer cleanup()
+	if err := validateRequestedIncludes(includes, inputManifest); err != nil {
+		return SubmitResult{}, err
+	}
 	task.InputManifest = inputManifest
 	if err := a.Store.CreateTask(ctx, &task); err != nil {
 		return SubmitResult{}, err

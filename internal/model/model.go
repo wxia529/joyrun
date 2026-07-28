@@ -45,10 +45,15 @@ type SourcePolicy struct {
 	Patterns []string `yaml:"patterns,omitempty" json:"patterns,omitempty"`
 }
 
+type TargetStatus struct {
+	Partition string `yaml:"partition,omitempty" json:"partition,omitempty"`
+}
+
 type Target struct {
 	Cluster string               `yaml:"cluster" json:"cluster"`
 	Source  SourcePolicy         `yaml:"source,omitempty" json:"source"`
 	Params  map[string]ParamSpec `yaml:"params,omitempty" json:"params,omitempty"`
+	Status  TargetStatus         `yaml:"status,omitempty" json:"status,omitempty"`
 	Script  string               `yaml:"script" json:"script"`
 	Push    PushPolicy           `yaml:"push" json:"push"`
 	Pull    FilePolicy           `yaml:"pull,omitempty" json:"pull,omitempty"`

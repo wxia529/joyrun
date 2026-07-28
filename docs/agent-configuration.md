@@ -80,7 +80,8 @@ Directory sources cannot declare patterns. Any target using `{{ .Input }}` or
 `{{ .Stem }}` must use `source.kind: file`.
 
 For `push.mode: entry`, JoyRun uploads the selected entry plus explicit
-`push.include` matches. Declare every required sibling dependency:
+dependencies. Declare `push.include` only for sibling files required by every
+run:
 
 ```yaml
 source:
@@ -88,12 +89,27 @@ source:
   patterns: ["*.inp"]
 push:
   mode: entry
-  include: ["*.xyz", "*.basis"]
-  exclude: ["*.out", "*.gbw", "*.tmp"]
+  include: ["shared.basis"]
+  exclude: ["*.out", "*.tmp"]
   limits:
     max_files: 30
     max_total_size: 2GiB
 ```
+
+Do not make optional coordinates, wavefunctions, checkpoints, or restart files
+target defaults. Select them for the individual task, preferably by exact
+filename:
+
+```bash
+joyrun submit molecule.inp -t cluster/orca \
+  --include molecule.xyz \
+  --include molecule.gbw \
+  --dry-run --json
+```
+
+`--include` is repeatable and valid only for `push.mode: entry`. Every
+requested pattern must match an uploaded file; exclusions and upload limits
+still take precedence.
 
 For `push.mode: workdir`, every non-excluded file in the work directory is an
 input snapshot. Inspect it carefully and set realistic limits:
@@ -141,7 +157,10 @@ targets:
       partition:
         type: string
         default: normal
+        choices: [normal, highio]
         description: Slurm partition used for Gaussian jobs.
+    status:
+      partition: "{{ .Params.partition }}"
     script: |
       #!/bin/bash
       #SBATCH --partition={{ .Params.partition }}
@@ -151,7 +170,7 @@ targets:
       g16 < {{ .Input }} > {{ .Stem }}.log
     push:
       mode: entry
-      exclude: ["*.log", "*.chk", "*.fchk"]
+      exclude: ["*.log"]
       limits:
         max_files: 10
         max_total_size: 1GiB
@@ -159,6 +178,17 @@ targets:
       default: ["*.log", "*.chk", "*.fchk"]
     logs: ["{{ .Stem }}.log"]
 ```
+
+Declare `status.partition` when the Target has a known Slurm partition. Use
+the same constrained parameter as the script when the software supports
+several approved partitions, or a fixed value when it supports only one:
+
+```yaml
+status:
+  partition: amd_256
+```
+
+JoyRun never parses `#SBATCH` directives to infer this value.
 
 Submit this target with a concrete file, not its containing directory:
 
@@ -196,6 +226,16 @@ joyrun target params TARGET --json
 joyrun doctor TARGET --json
 joyrun submit SOURCE -t TARGET --dry-run --json
 ```
+
+When the user asks about current capacity, query the Target without submitting
+a job:
+
+```bash
+joyrun target nodes TARGET --set partition=APPROVED_PARTITION --json
+```
+
+Only use declared parameter choices. Treat the result as a timestamped Slurm
+observation, not a prediction that a job will start immediately.
 
 `doctor` performs connectivity and capability checks but does not submit a
 job. Treat failed checks as blocking; report actionable warnings without

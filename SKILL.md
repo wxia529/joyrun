@@ -83,6 +83,7 @@ Treat stdout as the JSON interface and stderr as diagnostics.
    ```bash
    joyrun target list --json
    joyrun target show TARGET --json
+   joyrun target params TARGET --json
    ```
 
 4. If multiple targets are plausible and the user's intent does not determine
@@ -101,6 +102,17 @@ truth. Do not guess cluster-specific values, overwrite unrelated configuration,
 store credentials, or submit a real job while configuring JoyRun. Finish with
 `config validate`, `target show`, `target params`, `doctor`, and a representative
 `submit --dry-run`. A real submission requires a separate explicit request.
+
+When the user asks about available nodes or current capacity, use:
+
+```bash
+joyrun target nodes TARGET --json
+```
+
+If the Target declares an approved partition parameter, a declared choice may
+be selected with `--set partition=VALUE`. Never invent a partition, parse the
+SBATCH script to bypass Target policy, automatically change a submission, or
+promise that idle nodes guarantee immediate scheduling.
 
 ## Check and upgrade JoyRun
 
@@ -163,8 +175,22 @@ errors; do not work around them by submitting a containing directory to a file
 target.
 
 For `push.mode: entry`, confirm that only the selected input and intentional
-`push.include` dependencies are present. For `push.mode: workdir`, inspect the
-whole manifest because every non-excluded file is part of the task. Never add
+dependencies are present. Treat target `push.include` as dependencies required
+by every run. Add optional coordinates or restart data for this task with
+repeatable, preferably exact `--include` values:
+
+```bash
+joyrun submit SOURCE -t TARGET \
+  --include structure.xyz \
+  --include previous.gbw \
+  --dry-run --json
+```
+
+Never include a checkpoint, wavefunction, or restart file merely because one
+exists beside the input; first establish that the requested calculation uses
+it. JoyRun rejects missing requested dependencies locally. For
+`push.mode: workdir`, inspect the whole manifest because every non-excluded
+file is part of the task. Never add
 `--allow-project-root` merely to bypass `PROJECT_ROOT_UPLOAD_FORBIDDEN`; use it
 only when the user explicitly intends to upload from the complete project
 root.
@@ -195,14 +221,23 @@ joyrun submit SOURCE -t TARGET \
   --json
 ```
 
+Supply optional input dependencies with repeatable `--include` flags:
+
+```bash
+joyrun submit SOURCE -t TARGET \
+  --include structure.xyz \
+  --json
+```
+
 Record the returned `result.task.id`, which has the form `jr_...`. Use this
 exact task ID for all subsequent operations. A source path resolves to its
 newest task and can silently select a later submission.
 
 The target controls upload scope. `push.mode: entry` snapshots only the
-selected file and explicit `push.include` dependencies. `push.mode: workdir`
-snapshots the directory. Respect upload limits, `.joyrunignore`, and target
-`push.exclude`; do not work around them without user intent. Treat
+selected file, always-required target dependencies, and explicit
+per-submission `--include` dependencies. `push.mode: workdir` snapshots the
+directory. Respect upload limits, `.joyrunignore`, and target `push.exclude`;
+do not work around them without user intent. Treat
 `UPLOAD_POLICY_EXCEEDED`, `SOURCE_ENTRY_EXCLUDED`, and
 `PROJECT_ROOT_UPLOAD_FORBIDDEN` as safety failures requiring review, not flags
 to bypass automatically.

@@ -20,8 +20,12 @@ test project and run `joyrun doctor TARGET` before the scenarios below.
 
 - Preview reports the correct entry, rendered script, included/ignored files,
   push mode, file count, and total bytes.
-- An `entry` target uploads its selected input and declared dependencies but
-  not sibling input/output files.
+- An `entry` target uploads its selected input and always-required target
+  dependencies but not unrelated sibling input/output or restart files.
+- Repeated `--include exact-name` flags add only the requested optional
+  dependencies. A missing, excluded, or invalid dependency fails locally.
+- `target nodes` queries the Target's resolved partition, honors parameter
+  choices, and classifies idle, mixed, allocated, and unavailable nodes.
 - Project-root submission fails without `--allow-project-root`; upload file
   count and total-size limits fail locally before SSH.
 - Submit returns immediately with a `jr_...` ID; status reaches queued,

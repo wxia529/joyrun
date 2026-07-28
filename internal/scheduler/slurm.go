@@ -25,6 +25,28 @@ type JobStatus struct {
 	End      string
 }
 
+type NodeInfo struct {
+	Name      string `json:"name"`
+	State     string `json:"state"`
+	CPUs      int    `json:"cpus"`
+	MemoryMB  int64  `json:"memory_mb"`
+	GRES      string `json:"gres,omitempty"`
+	Partition string `json:"partition"`
+}
+
+type NodeSummary struct {
+	Total       int `json:"total"`
+	Idle        int `json:"idle"`
+	Mixed       int `json:"mixed"`
+	Allocated   int `json:"allocated"`
+	Unavailable int `json:"unavailable"`
+}
+
+type NodesResult struct {
+	Summary NodeSummary `json:"summary"`
+	Nodes   []NodeInfo  `json:"nodes"`
+}
+
 func (s Slurm) Submit(ctx context.Context, host, workDir, taskID string) (string, error) {
 	command := "cd " + remote.Quote(workDir) +
 		" && jobid=$(sbatch --parsable --comment=" + remote.Quote("joyrun:"+taskID) +
@@ -142,6 +164,92 @@ func (s Slurm) Cancel(ctx context.Context, host, id string) error {
 		return fault.Wrap("CANCEL_FAILED", message("cannot cancel Slurm job", stderr), true, err)
 	}
 	return nil
+}
+
+func (s Slurm) Nodes(ctx context.Context, host, partition string) (NodesResult, error) {
+	partition = strings.TrimSpace(partition)
+	if partition == "" {
+		return NodesResult{}, fault.New("TARGET_STATUS_INVALID", "resolved partition is empty", false)
+	}
+	command := "LC_ALL=C sinfo -N -h -p " + remote.Quote(partition) +
+		" -o '%P|%N|%T|%c|%m|%G'"
+	stdout, stderr, err := s.Runner.Exec(ctx, host, command, nil)
+	if err != nil {
+		return NodesResult{}, fault.Wrap("NODES_QUERY_FAILED",
+			message("cannot query Slurm nodes for partition "+partition, stderr), true, err)
+	}
+	return parseNodes(stdout)
+}
+
+func parseNodes(output string) (NodesResult, error) {
+	result := NodesResult{Nodes: []NodeInfo{}}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.SplitN(line, "|", 6)
+		if len(fields) != 6 {
+			return NodesResult{}, fault.New("NODES_QUERY_FAILED",
+				fmt.Sprintf("unexpected sinfo row %q", line), false)
+		}
+		name := strings.TrimSpace(fields[1])
+		if name == "" {
+			return NodesResult{}, fault.New("NODES_QUERY_FAILED",
+				fmt.Sprintf("sinfo returned an empty node name in row %q", line), false)
+		}
+		if seen[name] {
+			continue
+		}
+		cpus, err := strconv.Atoi(strings.TrimSpace(fields[3]))
+		if err != nil {
+			return NodesResult{}, fault.Wrap("NODES_QUERY_FAILED",
+				fmt.Sprintf("invalid CPU count for node %s", name), false, err)
+		}
+		memory, err := strconv.ParseInt(strings.TrimSpace(fields[4]), 10, 64)
+		if err != nil {
+			return NodesResult{}, fault.Wrap("NODES_QUERY_FAILED",
+				fmt.Sprintf("invalid memory for node %s", name), false, err)
+		}
+		state := normalizeNodeState(fields[2])
+		node := NodeInfo{
+			Name: name, State: state, CPUs: cpus, MemoryMB: memory,
+			GRES:      strings.TrimSpace(fields[5]),
+			Partition: strings.TrimSuffix(strings.TrimSpace(fields[0]), "*"),
+		}
+		seen[name] = true
+		result.Nodes = append(result.Nodes, node)
+		result.Summary.Total++
+		switch nodeStateCategory(state) {
+		case "idle":
+			result.Summary.Idle++
+		case "mixed":
+			result.Summary.Mixed++
+		case "allocated":
+			result.Summary.Allocated++
+		default:
+			result.Summary.Unavailable++
+		}
+	}
+	return result, nil
+}
+
+func normalizeNodeState(raw string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(raw), "*~#@%$!^"))
+}
+
+func nodeStateCategory(state string) string {
+	switch state {
+	case "idle":
+		return "idle"
+	case "mixed", "mix":
+		return "mixed"
+	case "allocated", "alloc", "completing", "comp":
+		return "allocated"
+	default:
+		return "unavailable"
+	}
 }
 
 func normalize(raw string) string {
