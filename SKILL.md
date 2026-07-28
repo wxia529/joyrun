@@ -5,6 +5,10 @@ description: Install, configure, update, and operate JoyRun as an agent-friendly
 
 # Use JoyRun
 
+This Skill is released for JoyRun `__JOYRUN_VERSION__`. If the installed
+binary reports another stable version, install the matching Skill before
+operating it.
+
 Use JoyRun as an execution layer. Prepare and analyze files locally; let JoyRun
 perform transport, Slurm submission, state tracking, and result retrieval.
 
@@ -95,7 +99,7 @@ Treat stdout as the JSON interface and stderr as diagnostics.
 When asked to create a cluster or target, read and follow the complete
 configuration guide before editing:
 
-https://raw.githubusercontent.com/wxia529/joyrun/main/docs/agent-configuration.md
+https://github.com/wxia529/joyrun/releases/download/__JOYRUN_VERSION__/agent-configuration.md
 
 Treat an existing Slurm script and cluster documentation as the source of
 truth. Do not guess cluster-specific values, overwrite unrelated configuration,
@@ -138,12 +142,12 @@ running the same official installer without `--check`/`-Check`. Use an exact
 version when the user requests reproducibility:
 
 ```bash
-sh install.sh --version v0.1.0
+sh install.sh --version vX.Y.Z
 ```
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\install.ps1 -Version v0.1.0
+  -File .\install.ps1 -Version vX.Y.Z
 ```
 
 The default installer channel is the latest stable release and never selects a

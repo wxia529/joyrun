@@ -1,0 +1,40 @@
+# Replace the host alias, remote root, and partition name with verified values.
+version: 1
+
+clusters:
+  cluster:
+    host: cluster
+    scheduler: slurm
+    remote_root: /scratch/your-user/joyrun
+    transfer: auto
+    partitions:
+      compute: {}
+
+targets:
+  cluster/smoke:
+    cluster: cluster
+    software: {name: shell}
+    placement:
+      default_partition: compute
+      allowed_partitions: [compute]
+    source:
+      kind: file
+      patterns: ["*.txt"]
+    push:
+      mode: entry
+      limits:
+        max_files: 1
+        max_total_size: 1MiB
+    script: |
+      #!/bin/bash
+      #SBATCH --partition={{ .Partition.Name }}
+      #SBATCH --ntasks=1
+      #SBATCH --time=00:02:00
+
+      set -eu
+      cd {{ .WorkDir }}
+      sleep 10
+      cp {{ .Input }} result.txt
+    pull:
+      default: [result.txt, "joyrun-slurm-*.log"]
+

@@ -6,9 +6,9 @@ JoyRun is a local-first remote task runner for HPC:
 local project -> OpenSSH -> offline HPC -> Slurm -> rsync/SFTP results back
 ```
 
-Give it a local source and a user-defined target. JoyRun snapshots the source
-directory into an isolated remote task, submits it without blocking, tracks the
-Slurm state, and pulls selected results back beside the original input.
+Give JoyRun a bounded local source and a user-defined Target. It creates an
+isolated remote task, submits it without blocking, tracks Slurm state, and
+pulls selected results back beside the original input.
 
 ```bash
 joyrun submit task01/eg.inp -t gibbs/orca
@@ -16,52 +16,27 @@ joyrun status task01/eg.inp
 joyrun pull task01/eg.inp
 ```
 
-JoyRun does not know what ORCA, VASP, or another scientific program means.
-Targets are complete user-owned job-script templates.
+## Scope
 
-## Scope and responsibilities
+JoyRun is an execution, transport, and provenance layer. It:
 
-JoyRun is an execution and transport layer. It is responsible for:
+- snapshots explicit inputs into one isolated directory per submission;
+- transfers files, submits Slurm jobs, and queries scheduler state;
+- records task state, resolved configuration, and lifecycle events;
+- safely pulls user-selected results back to the source directory.
 
-- snapshotting a local source into an isolated remote task;
-- transferring files, submitting Slurm jobs, and querying scheduler state;
-- recording task state, submission provenance, and lifecycle events;
-- safely pulling user-selected results back to the source directory.
+JoyRun deliberately does not interpret scientific results, modify inputs,
+choose resources, restart calculations, build workflow DAGs, or expose a
+general-purpose remote shell. The user or calling Agent remains responsible
+for scientific input, resource consistency, and decisions to resubmit.
 
-The user or calling agent is responsible for:
+Targets are complete user-owned job-script templates. JoyRun does not contain
+ORCA, Gaussian, VASP, or other application parsers.
 
-- comparing the scientific input with the selected software, partition facts,
-  rendered resource requests, and artifact policy;
-- providing a correct job script;
-- interpreting scientific output;
-- deciding whether and how to modify, restart, or resubmit a calculation.
+## Install
 
-JoyRun does not interpret results, modify inputs, restart failed calculations,
-build workflow DAGs, or expose a general-purpose remote shell. It has no
-required daemon: remote actions occur only when a JoyRun command is run.
-
-## Install with an AI agent
-
-Copy and send this prompt to your coding agent:
-
-```text
-Install https://raw.githubusercontent.com/wxia529/joyrun/main/SKILL.md as a global user-level JoyRun skill so it is available in all projects, then follow it to install the latest stable JoyRun release for this machine.
-```
-
-The prompt explicitly requests a global user-level skill rather than a
-project-local instruction. The skill tells the agent how to detect the
-platform, install without guessing an archive name, and stop for authorization
-or compatibility problems. It does not authorize silent installation or
-upgrades during normal JoyRun task operations. You can also
-[review the skill on GitHub](https://github.com/wxia529/joyrun/blob/main/SKILL.md)
-before using it.
-
-## Install and build
-
-The official installers detect the operating system and CPU architecture,
-download the matching archive from the latest stable
-[GitHub release](https://github.com/wxia529/joyrun/releases), verify it against
-`SHA256SUMS`, and install it without `sudo`.
+Official installers select the matching release archive, verify
+`SHA256SUMS`, and install without elevated privileges.
 
 Linux or macOS:
 
@@ -81,101 +56,82 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\install.ps1 -AddToPath
 ```
 
-Download the installer as a file and inspect it when required by local
-security policy; do not pipe a remote script directly into a shell.
-`ExecutionPolicy Bypass` above applies only to the child PowerShell process
-running this downloaded file; it does not change the user or machine policy.
-By default, JoyRun is installed in `~/.local/bin` on Linux/macOS and
-`%LOCALAPPDATA%\Programs\JoyRun` on Windows.
+The defaults are `~/.local/bin` and
+`%LOCALAPPDATA%\Programs\JoyRun`. Re-running the installer performs a verified
+upgrade and preserves the previous binary. See
+[Installation and Upgrades](docs/install.md) for update checks, exact-version
+pins, rollback behavior, and platform details.
 
-Re-running the same installer performs a verified upgrade. Check first without
-changing files, or pin an exact release:
-
-```bash
-sh install.sh --check
-sh install.sh --version v0.1.0
-```
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\install.ps1 -Check
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\install.ps1 -Version v0.1.0
-```
-
-The default always resolves GitHub's latest stable release; it never selects a
-prerelease automatically. Installation keeps the immediately previous binary
-as `joyrun.previous` (or `joyrun.previous.exe`) for manual rollback. The
-installer does not modify PATH on Linux/macOS, and Windows PATH changes require
-the explicit `-AddToPath` option. See the
-[installation and upgrade guide](docs/install.md) for platform details and
-agent-safety rules.
-
-Alternatively, install from source with Go 1.24 or later:
+Install from source with Go 1.24 or later:
 
 ```bash
 go install github.com/wxia529/joyrun/cmd/joyrun@latest
 ```
 
-JoyRun requires the OpenSSH `ssh` command at runtime. On Linux and macOS,
-`rsync` is preferred when it is available on both the local and remote
-systems. Native Windows uses SFTP over the bundled OpenSSH client and does not
-require WSL, Cygwin, MSYS2, or rsync.
-
-To build or install a checkout:
+Or build a checkout without `sudo`:
 
 ```bash
-git clone git@github.com:wxia529/joyrun.git
-cd joyrun
 make build
-./bin/joyrun version
-sudo make install
+make install PREFIX="$HOME/.local"
 ```
 
-Cross-compile a native Windows binary from Linux or macOS with:
+JoyRun uses the system OpenSSH client and never stores credentials. Linux and
+macOS prefer rsync when available on both ends and fall back to SFTP. Native
+Windows uses OpenSSH SFTP without requiring WSL, Cygwin, MSYS2, or rsync.
 
-```bash
-GOOS=windows GOARCH=amd64 go build -trimpath -o joyrun.exe ./cmd/joyrun
+## Install with an AI Agent
+
+Copy this prompt to a coding Agent:
+
+```text
+Install https://github.com/wxia529/joyrun/releases/latest/download/SKILL.md as a global user-level JoyRun skill so it is available in all projects, then follow it to install the latest stable JoyRun release for this machine.
 ```
 
-## Configure
+The Skill and configuration guide are published with each release so their
+commands match the stable binary. For a pinned binary, install the matching:
 
-Find or create the user configuration without manually locating a
-platform-specific directory:
+```text
+https://github.com/wxia529/joyrun/releases/download/vX.Y.Z/SKILL.md
+```
+
+## First run
+
+JoyRun needs one user configuration and one Project identity.
 
 ```bash
-joyrun config path
 joyrun config init
 joyrun config validate
+cd my-project
+joyrun init
 ```
 
-`config init` refuses to overwrite an existing file. It creates a commented,
-valid starter at the path printed by `config path`.
+`config init` creates a commented starter without overwriting an existing
+file. `init` creates `.joyrun/project.yaml`; the global SQLite index uses its
+Project ID plus source-relative paths, so moving the project does not break
+task lookup.
 
-Alternatively, copy [the complete example configuration](examples/config.yaml)
-to:
+List and inspect configured Targets:
 
-```text
-~/.config/joyrun/config.yaml
+```bash
+joyrun target list
+joyrun target show gibbs/orca
+joyrun target params gibbs/orca
+joyrun doctor gibbs/orca
 ```
 
-`$XDG_CONFIG_HOME` is honored. `JOYRUN_CONFIG` or the global `--config` option
-can select another file.
+Always preview a new source/Target combination:
 
-### Configure with an AI agent
-
-Copy this prompt to your coding agent and replace the placeholders:
-
-```text
-Follow https://raw.githubusercontent.com/wxia529/joyrun/main/SKILL.md to create a JoyRun target from my existing Slurm script at <SCRIPT_PATH> for inputs under <SOURCE_PATH>. Do not guess cluster-specific values, submit a real job, or overwrite unrelated configuration. Validate the configuration, run doctor, and finish with a dry-run.
+```bash
+joyrun submit task01/eg.inp -t gibbs/orca --dry-run
 ```
 
-The Skill routes configuration work to the detailed
-[Agent configuration guide](docs/agent-configuration.md). The agent should ask
-only for values that cannot be established from the existing script or cluster
-documentation.
+Preview performs no SSH operation and creates no database task. Check the
+source contract, software identity, partition facts, parameters, exact upload
+manifest, remote directory, and rendered script before submitting.
 
-A cluster describes connectivity and scheduling:
+## Configuration model
+
+A Cluster records connectivity and verified partition facts:
 
 ```yaml
 clusters:
@@ -187,386 +143,135 @@ clusters:
     partitions:
       community:
         cores_per_node: 64
-        memory_per_node: 256GiB
-      highio:
-        cores_per_node: 64
+        memory_per_node: 240G
 ```
 
-`host` is an OpenSSH alias, so existing keys, `ssh-agent`, `ProxyJump`,
-`known_hosts`, ports, and usernames continue to work. JoyRun never stores
-credentials.
+`host` is an OpenSSH alias. Keep usernames, ports, keys, `ProxyJump`, and
+authentication in OpenSSH configuration. Omit unknown hardware facts instead
+of estimating them.
 
-`transfer` accepts:
-
-- `auto` — Windows uses SFTP; Linux/macOS use rsync when both ends provide it,
-  otherwise SFTP
-- `rsync` — require rsync explicitly
-- `sftp` — use the OpenSSH SFTP subsystem explicitly
-
-SFTP uploads use temporary remote files followed by rename. Downloads use a
-temporary file in the destination directory followed by an atomic replacement.
-The rsync backend remains available with its native partial-transfer support.
-
-A target describes one way to run software on a cluster:
+A Target identifies software, constrains placement, defines its input
+boundary, and owns the full job script:
 
 ```yaml
 targets:
   gibbs/orca:
     cluster: gibbs
-    software:
-      name: orca
-      version: "6.1.1"
+    software: {name: orca, version: "6.1.1"}
     placement:
       default_partition: community
-      allowed_partitions: [community, highio]
+      allowed_partitions: [community]
     source:
       kind: file
       patterns: ["*.inp"]
     params:
-      cpus:
-        type: int
-        default: 32
+      cpus: {type: int, default: 32}
+    push:
+      mode: entry
+      limits: {max_files: 20, max_total_size: 2GiB}
+      exclude: ["*.out", "*.tmp"]
     script: |
       #!/bin/bash
       #SBATCH --cpus-per-task={{ .Params.cpus }}
       #SBATCH --partition={{ .Partition.Name }}
       #SBATCH --job-name={{ .Stem }}
       orca {{ .Input }} > {{ .Stem }}.out
-    push:
-      mode: entry
-      limits:
-        max_files: 20
-        max_total_size: 2GiB
-      exclude: ["*.out", "*.tmp"]
     pull:
       default: ["*.out", "*.xyz", "*.gbw"]
     logs: ["{{ .Stem }}.out"]
 ```
 
-`source.kind` is the target's input contract:
+`source.kind` is `file`, `directory`, or `either`. `push.mode: entry` uploads
+the selected file plus declared or explicit `--include` dependencies;
+`workdir` uploads the bounded working directory after exclusions. The project
+root is rejected unless `--allow-project-root` is explicitly supplied.
 
-- `file` — submission must name one concrete entry file
-- `directory` — submission must name a directory
-- `either` — both forms are accepted
+The partition is selected through `placement` and optional `--partition`.
+JoyRun passes it directly to `sbatch --partition`. It exposes partition facts
+but does not decide whether application-level cores or memory are appropriate.
 
-Optional `source.patterns` validates file entry names. JoyRun rejects a
-directory submitted to a file target before rendering or creating a task, with
-an actionable command that names the sole matching candidate when possible.
-Every target must declare `source.kind` explicitly. JoyRun does not infer an
-input contract from the script.
+See the [minimal smoke configuration](examples/smoke-config.yaml), the
+[complete application example](examples/config.yaml), and
+[Agent Configuration Guide](docs/agent-configuration.md) for template
+variables, typed parameters, upload limits, output policies, and validation.
 
-`clusters.*.partitions` records verified hardware facts. Omit unknown values
-rather than estimating them. `software` is descriptive identity, while
-`placement` is policy: submission may select only an allowed partition and
-uses the default when `--partition` is absent. Templates can read
-`.Partition.Name`, `.Partition.CoresPerNode`, and
-`.Partition.MemoryPerNode`. JoyRun also passes the resolved name directly to
-`sbatch --partition`, so the placement policy remains authoritative even if a
-script omits the optional template value. JoyRun exposes these facts but does
-not decide whether a scientific input's requested cores or memory are
-appropriate.
+To ask an Agent to adapt an existing Slurm script:
 
-Every target must also declare an upload boundary:
-
-- `push.mode: entry` uploads only the selected source file, target-level
-  `push.include` dependencies, and dependencies explicitly selected for this
-  submission with repeatable `--include` flags. It is restricted to
-  `source.kind: file` targets.
-- `push.mode: workdir` uploads the complete source working directory after
-  exclusions.
-
-`push.exclude`, the project `.joyrunignore`, and built-in `.joyrun/` and
-`.git/` rules take precedence over inclusion. Optional
-`push.limits.max_files` and `push.limits.max_total_size` reject unexpectedly
-large snapshots locally. Size values accept units such as `2GB` and `2GiB`.
-HPC-style binary suffixes such as `180G` are also accepted.
-Reserve target-level `push.include` for dependencies required by every run.
-Select optional coordinates or restart files by exact name for one task:
-
-```bash
-joyrun submit task01/eg.inp -t gibbs/orca \
-  --include structure.xyz \
-  --include eg.gbw
+```text
+Follow https://github.com/wxia529/joyrun/releases/latest/download/SKILL.md to create a JoyRun target from my existing Slurm script at <SCRIPT_PATH> for inputs under <SOURCE_PATH>. Do not guess cluster-specific values, submit a real job, or overwrite unrelated configuration. Validate the configuration, run doctor, and finish with a dry-run.
 ```
 
-Each requested pattern must match an uploaded file, or JoyRun rejects the
-submission locally. Prefer exact filenames over broad globs such as `*.gbw`
-when selecting restart data. In particular, generic ORCA targets should not
-default to `*.gbw`/`*.hess`, and generic Gaussian targets should not default to
-`*.chk`/`*.fchk`; those files are inputs only for workflows that explicitly
-reference them.
+## Task workflow
 
-JoyRun rejects any source whose working directory is the project root. This
-protects agents from accidentally uploading the entire project. Use
-`--allow-project-root` only when that scope is deliberate.
-
-Public template values are:
-
-- `{{ .Input }}` — entry filename for a `file` source
-- `{{ .Stem }}` — entry filename without its final extension
-- `{{ .Name }}` — source working-directory name
-- `{{ .TaskID }}` — JoyRun task ID
-- `{{ .WorkDir }}` — absolute remote working directory
-- `{{ .Partition.Name }}` — resolved allowed Slurm partition
-- `{{ .Partition.CoresPerNode }}` — configured cores per node, or `0`
-- `{{ .Partition.MemoryPerNode }}` — configured memory per node, or empty
-- `{{ .Params.name }}` — resolved target parameter
-
-Script substitutions are POSIX-shell quoted automatically. Templates
-intentionally allow only these direct substitutions. Pipelines,
-functions, conditionals, loops, and declarations are rejected while loading
-the configuration.
-
-Parameters support `string`, `int`, `float`, and `bool`, plus `default`,
-`required`, `choices`, and `description`. Override declared parameters with a
-repeatable `--set`:
+Submit asynchronously and record the returned `jr_...` Task ID:
 
 ```bash
-joyrun submit task01/eg.inp -t gibbs/orca \
-  --set cpus=64
+joyrun submit task01/eg.inp -t gibbs/orca --json
+joyrun status jr_TASK_ID --json
+joyrun logs jr_TASK_ID --lines 200 --json
 ```
 
-## Initialize and preview
+A source path resolves to its newest task. Use an exact Task ID for
+cancellation, recovery, and other mutations.
 
-Initialize a project once:
-
-```bash
-cd my-project
-joyrun init
-```
-
-This creates `.joyrun/project.yaml` with a stable Project ID and a
-`.joyrun/.gitignore` that keeps the machine-local identity out of Git. The
-global SQLite database uses that ID plus source-relative paths, so moving the
-entire project does not break task lookup while a fresh Git clone receives a
-new identity when initialized.
-
-Preview performs local validation and makes no SSH connection or database task
-record:
+Inspect remote files and preview a pull:
 
 ```bash
-joyrun submit task01/eg.inp -t gibbs/orca --dry-run
-```
-
-It shows source kind, software identity, selected partition and known hardware
-facts, work directory, entry file, resolved template values and parameters,
-the upload snapshot, planned remote directory, and rendered script. A
-source-contract mismatch is a hard preview error rather than a script
-containing empty `.Input` or `.Stem` values.
-
-JoyRun deliberately does not parse ORCA, Gaussian, VASP, or other application
-inputs. Before submission, a user or agent should compare explicit
-application-level core and memory directives with the dry-run's rendered
-allocation and partition facts. A known conflict is blocking; a missing
-hardware fact is unknown, not invalid. The supplied [JoyRun skill](SKILL.md)
-defines this Agent review workflow without moving scientific policy into the
-runner.
-
-## Commands
-
-```bash
-joyrun init [directory]
-joyrun config path
-joyrun config init
-joyrun config validate
-joyrun target list
-joyrun target show gibbs/orca
-joyrun target params gibbs/orca
-joyrun target nodes gibbs/orca
-joyrun target nodes gibbs/orca --partition highio
-joyrun doctor gibbs/orca
-
-joyrun submit task01/eg.inp -t gibbs/orca
-joyrun submit task01/eg.inp -t gibbs/orca --partition highio
-joyrun status task01/eg.inp
-joyrun status --all
-joyrun list [task01/eg.inp]
-joyrun inspect jr_TASK_ID
-joyrun inspect jr_TASK_ID --events
-joyrun logs task01/eg.inp --lines 200
-joyrun logs jr_TASK_ID --file alternate.log
 joyrun files jr_TASK_ID
-joyrun pull task01/eg.inp
 joyrun pull jr_TASK_ID --dry-run
-joyrun cancel jr_TASK_ID
-```
-
-`target nodes` queries the Target's default partition, or an explicitly
-selected allowed partition. It reports configured hardware facts together
-with a timestamped Slurm observation; idle nodes do not guarantee that Slurm
-will start a job immediately. JoyRun never chooses a partition from current
-load and never validates application-specific resource directives.
-
-JoyRun reserves `joyrun-slurm-<jobid>.log` for scheduler diagnostics. `logs`
-first reads the first configured application log that exists, then falls back
-to this scheduler log. For tasks created by older JoyRun versions it also
-checks `slurm-<jobid>.out`. If no candidate exists yet, the retryable
-`LOG_NOT_READY` error lists every checked path.
-Use `--file PATH` to select a specific log relative to the remote task work
-directory.
-
-`doctor` reports checks as `PASS`, `WARN`, or `FAIL`. A missing `remote_root`
-whose nearest existing ancestor is writable is a non-blocking warning because
-the first submission will create it. An existing but unwritable root, or a
-root that cannot be created, is blocking, includes a suggested action, and
-causes a nonzero process exit status.
-
-A source path addresses its newest task. A `jr_...` task ID addresses one exact
-historical run:
-
-```bash
-joyrun status jr_TASK_ID
 joyrun pull jr_TASK_ID
 ```
 
-Use source paths for convenient lookup and exact Task IDs for mutations such
-as cancellation. `cancel` rejects source paths so a later submission cannot be
-cancelled accidentally.
+Default pull patterns are frozen at submission. Submitted inputs remain
+protected even with `--all`; replacing them requires
+`--overwrite-inputs`. A transfer failure does not imply computation failure:
+retry `pull`, not the calculation.
 
-JoyRun records compute state and pull progress independently:
+JoyRun tracks computation and pull progress independently:
 
-- `compute_state`: `created`, `submission_failed`, `queued`, `running`,
-  `completed`, `failed`, `cancelled`, or `unknown`
-- `pull_state`: `not_pulled`, `pulling`, `pulled`, `partial`, or `failed`
-
-For example, a completed calculation whose download failed remains
-`compute_state=completed` and becomes `pull_state=failed`. Retry
-`pull`; do not recompute it.
-
-Status also records the raw Slurm state, elapsed time, start/end timestamps,
-pending/failure reason, and exit code when Slurm provides them. Human output
-exposes these fields directly; JSON includes `scheduler_state`,
-`scheduler_reason`, `elapsed`, `exit_code`, `scheduler_start`, and
-`scheduler_end`.
-
-`pull_state` describes only the latest requested pull operation. It does not
-claim that every remote file still exists or that every scientifically
-important file has been downloaded.
-
-`list` restores the project's task view across sessions; an optional source
-shows its submission history. `inspect` returns the immutable submission
-snapshot, including parameters, manifest, and rendered script.
-`inspect --events` includes the append-only lifecycle events. `status --all`
-queries Slurm for all non-terminal tasks and records observed transitions
-without creating a new calculation.
-
-The target's `push.mode` determines whether JoyRun uploads only the selected
-file and explicit dependencies or the directory contents. The resulting input
-manifest is frozen in the Task. Preview the exact bounded snapshot before
-submission:
-
-```bash
-joyrun submit task01/eg.inp -t gibbs/orca --dry-run
+```text
+compute_state: created -> queued -> running -> completed|failed|cancelled
+pull_state:    not_pulled -> pulling -> pulled|partial|failed
 ```
 
-Default pull patterns come from the task's target snapshot:
+`status --all` refreshes non-terminal tasks without resubmitting.
+`inspect --events` returns the immutable submission snapshot and append-only
+lifecycle events. If the local index is lost, remote `metadata.json` can be
+discovered with `recover --scan` and imported one task at a time.
 
-```bash
-joyrun files jr_TASK_ID
-joyrun pull jr_TASK_ID --dry-run
-joyrun pull task01/eg.inp
-joyrun pull task01/eg.inp --include "*.out" --include "*.xyz"
-joyrun pull task01/eg.inp --all
-```
+## Agent and JSON contract
 
-`files` lists remote paths, sizes, and which paths were submitted inputs.
-`pull --dry-run` applies the real pull policy and input protection, validates
-the local destination, and reports the exact files and total bytes without
-transferring them or changing `pull_state`.
-
-If no remote files match, JoyRun returns `NO_FILES_MATCHED` instead of
-recording an empty pull as successful.
-
-Files present in the submitted input manifest are protected even with `--all`.
-Use `--overwrite-inputs` explicitly to replace them. Output files may be
-updated normally. `--live` permits pulling currently available output before
-the task completes.
-
-## Agent/JSON interface
-
-All operational commands are non-interactive. Add `--json` anywhere in a
-command to receive one JSON document on stdout:
-
-```bash
-joyrun status task01/eg.inp --json
-```
-
-Success:
+All operational commands are non-interactive. Under `--json`, stdout contains
+exactly one document; progress and diagnostics use stderr.
 
 ```json
 {"ok":true,"result":{"id":"jr_...","compute_state":"running","pull_state":"not_pulled"}}
 ```
 
-Failure:
+Errors include a stable code, retryability, and recovery context when
+available. Agents must not blindly repeat `submit`, because Slurm may already
+have accepted the job.
 
-```json
-{
-  "ok": false,
-  "error": {
-    "code": "SSH_FAILED",
-    "message": "cannot connect to gibbs",
-    "retryable": true,
-    "stage": "upload",
-    "suggested_action": "joyrun status jr_...",
-    "compute_state": "submission_failed",
-    "pull_state": "not_pulled"
-  }
-}
-```
+The [JoyRun Skill](SKILL.md) defines safe Agent operation, including bounded
+uploads, resource review, monitoring, pull selection, cancellation, and
+recovery.
 
-Progress and diagnostics use stderr and never contaminate JSON stdout.
-Snapshot preparation and transfers report their current phase there. rsync
-uses aggregate byte progress; SFTP reports each file and its size.
+## Documentation
 
-## Data and recovery
+- [Command Guide](docs/commands.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Installation and Upgrades](docs/install.md)
+- [Agent Configuration Guide](docs/agent-configuration.md)
+- [Design and state model](docs/design.md)
+- [Real HPC Acceptance Checklist](docs/acceptance.md)
+- [Changelog](CHANGELOG.md)
 
-The primary task database is:
-
-```text
-$XDG_DATA_HOME/joyrun/joyrun.db
-```
-
-or `~/.local/share/joyrun/joyrun.db` when `XDG_DATA_HOME` is unset.
-`JOYRUN_DB` can override it.
-
-The first public database format is independently versioned as
-`release_channel=stable`, `schema_version=1`, and `schema_label=stable-1`.
-JoyRun rejects the pre-release `development/dev-3` database instead of
-migrating it. Start with a new database for v0.1.0; remote task metadata can
-recover tasks that must be retained. Future stable schema changes require an
-explicit migration.
-
-On Windows the defaults are:
-
-```text
-%APPDATA%\joyrun\config.yaml
-%LOCALAPPDATA%\joyrun\joyrun.db
-```
-
-Windows pulls reject reserved filenames, unsupported characters, and
-case-insensitive collisions such as `A.out` and `a.out` rather than silently
-overwriting data.
-
-Every remote task contains a `metadata.json` recovery snapshot. If the local
-database is lost, discover matching remote metadata for the current Project ID
-and Target, then recover a selected task:
-
-```bash
-joyrun recover --scan -t gibbs/orca
-joyrun recover jr_TASK_ID -t gibbs/orca
-```
-
-Recovery scanning does not require a usable local task database and never
-imports tasks automatically.
-
-See [the v0.1 design notes](docs/design.md) for the state and recovery model.
-Maintainers should complete the
-[real HPC acceptance checklist](docs/acceptance.md) before publishing a
-release.
+The first public SQLite schema is independently versioned as
+`stable/stable-1`. See the Changelog before upgrading across configuration or
+database compatibility boundaries.
 
 ## License
 
 Copyright 2026 Wanting Xia.
 
-JoyRun is licensed under the
-[Apache License 2.0](LICENSE).
+JoyRun is licensed under the [Apache License 2.0](LICENSE).

@@ -5,8 +5,9 @@ replace validation against a real OpenSSH server and Slurm installation.
 
 ## Prepare a smoke target
 
-Create a file target whose script requests the cluster's smallest practical
-allocation and performs only:
+Adapt [`examples/smoke-config.yaml`](../examples/smoke-config.yaml) with the
+real host alias, remote root, smallest practical partition, and any required
+account directive. Its script performs only:
 
 ```bash
 sleep 10
@@ -24,8 +25,9 @@ test project and run `joyrun doctor TARGET` before the scenarios below.
   dependencies but not unrelated sibling input/output or restart files.
 - Repeated `--include exact-name` flags add only the requested optional
   dependencies. A missing, excluded, or invalid dependency fails locally.
-- `target nodes` queries the Target's resolved partition, honors parameter
-  choices, and classifies idle, mixed, allocated, and unavailable nodes.
+- `target nodes` queries the Target's resolved partition, enforces
+  `placement.allowed_partitions`, and classifies idle, mixed, allocated, and
+  unavailable nodes.
 - Project-root submission fails without `--allow-project-root`; upload file
   count and total-size limits fail locally before SSH.
 - Submit returns immediately with a `jr_...` ID; status reaches queued,
@@ -64,3 +66,5 @@ Before publishing, exercise `scripts/install.sh` on Linux and macOS and
 - the installed binary reports the release tag;
 - unsupported architectures fail before creating the installation directory;
 - PATH is changed only with the explicit Windows `-AddToPath` option.
+- the release contains `SKILL.md` and `agent-configuration.md`, and both
+  describe the tagged command and configuration contract.

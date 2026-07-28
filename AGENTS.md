@@ -9,9 +9,9 @@ command parsing/output lives in `internal/cli`. Domain types are in
 `config`, `store`, `scheduler`, `remote`, `transfer`, `template`, and
 `manifest`. Tests sit beside implementation files as `*_test.go`.
 
-User-facing examples belong in `examples/`, architecture notes in `docs/`, and
-operational behavior for coding agents in `SKILL.md`. Do not treat
-`user-temp/` as production source.
+User-facing examples belong in `examples/`, architecture and operational
+guides in `docs/`, release changes in `CHANGELOG.md`, and coding-agent behavior
+in `SKILL.md`. Do not treat `user-temp/` as production source.
 
 ## Build, Test, and Development Commands
 
@@ -56,6 +56,8 @@ Pull requests should explain the user-visible behavior, design tradeoffs, and
 verification commands. Link relevant issues and include representative CLI or
 JSON output when interfaces change. Update `README.md`, `docs/design.md`,
 examples, and `SKILL.md` when their contracts are affected.
+Release assets must ship a version-matched `SKILL.md` and Agent configuration
+guide.
 
 ## Security & Compatibility
 

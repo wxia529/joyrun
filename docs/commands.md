@@ -1,0 +1,75 @@
+# Command Guide
+
+JoyRun commands are non-interactive. Add `--json` for one machine-readable
+document on stdout; progress and diagnostics remain on stderr.
+
+## Project and configuration
+
+```bash
+joyrun init [directory]
+joyrun config path
+joyrun config init
+joyrun config validate
+joyrun doctor TARGET
+```
+
+`init` creates the machine-local Project ID used for path-independent task
+lookup. `config init` refuses to overwrite an existing configuration. `doctor`
+checks SSH, the remote root, Slurm commands, and the selected transfer backend
+without submitting a job.
+
+## Targets and capacity
+
+```bash
+joyrun target list
+joyrun target show TARGET
+joyrun target params TARGET
+joyrun target nodes TARGET [--partition ALLOWED_NAME]
+```
+
+`target nodes` is a timestamped Slurm observation, not a start-time
+prediction. An override must appear in `placement.allowed_partitions`.
+
+## Submit and monitor
+
+```bash
+joyrun submit SOURCE -t TARGET [--partition NAME] [--set KEY=VALUE]
+joyrun submit SOURCE -t TARGET [--include GLOB] --dry-run
+joyrun status SOURCE_OR_TASK
+joyrun status --all
+joyrun list [SOURCE]
+joyrun inspect SOURCE_OR_TASK [--events]
+joyrun logs SOURCE_OR_TASK [--file PATH] [--lines N]
+joyrun cancel TASK_ID
+```
+
+Always preview a new source/target combination. A source path resolves to its
+newest task; use the exact `jr_...` ID for cancellation and other mutations.
+Submission is asynchronous and returns after Slurm acceptance is recorded.
+
+## Inspect and pull files
+
+```bash
+joyrun files SOURCE_OR_TASK
+joyrun pull SOURCE_OR_TASK --dry-run
+joyrun pull SOURCE_OR_TASK
+joyrun pull SOURCE_OR_TASK --include GLOB
+joyrun pull SOURCE_OR_TASK --all
+joyrun pull SOURCE_OR_TASK --live --include GLOB
+```
+
+Default patterns are frozen in the Task at submission. Submitted inputs are
+protected even with `--all`; `--overwrite-inputs` is required to replace them.
+Use `--live` only for deliberate diagnostics before computation completes.
+
+## Recovery
+
+```bash
+joyrun recover --scan -t TARGET
+joyrun recover TASK_ID -t TARGET
+```
+
+Scanning finds remote metadata matching the current Project ID and never
+imports automatically. Recover imports one selected task into the global
+SQLite index; it does not resubmit computation.
+

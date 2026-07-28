@@ -78,7 +78,12 @@ jobs:
           if [ "${GOOS}" = windows ]; then binary="joyrun.exe"; fi
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o "dist/${package}/${binary}" ./cmd/joyrun
-          cp LICENSE NOTICE README.md "dist/${package}/"
+          cp LICENSE NOTICE README.md SKILL.md CHANGELOG.md "dist/${package}/"
+          cp -R docs examples "dist/${package}/"
+          sed -i "s/__JOYRUN_VERSION__/${VERSION}/g" \
+            "dist/${package}/SKILL.md"
+          ! grep -q '__JOYRUN_VERSION__' "dist/${package}/SKILL.md"
+          grep -q "${VERSION}" "dist/${package}/SKILL.md"
           if [ "${GOOS}" = windows ]; then
             (cd dist && zip -r "${package}.zip" "${package}")
           else
@@ -103,20 +108,34 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Add standalone installers
-        run: cp scripts/install.sh scripts/install.ps1 dist/
+      - name: Add standalone documentation and installers
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          cp scripts/install.sh scripts/install.ps1 dist/
+          cp SKILL.md docs/agent-configuration.md dist/
+          sed -i "s/__JOYRUN_VERSION__/${VERSION}/g" dist/SKILL.md
       - name: Verify archive contents
         shell: bash
         run: |
           set -euo pipefail
           sh -n dist/install.sh
           test -s dist/install.ps1
+          test -s dist/SKILL.md
+          test -s dist/agent-configuration.md
+          ! grep -q '__JOYRUN_VERSION__' dist/SKILL.md
           for archive in dist/*.tar.gz; do
             listing=$(tar -tzf "${archive}")
             grep -q '/joyrun$' <<<"${listing}"
             grep -q '/LICENSE$' <<<"${listing}"
             grep -q '/NOTICE$' <<<"${listing}"
             grep -q '/README.md$' <<<"${listing}"
+            grep -q '/SKILL.md$' <<<"${listing}"
+            grep -q '/CHANGELOG.md$' <<<"${listing}"
+            grep -q '/docs/agent-configuration.md$' <<<"${listing}"
+            grep -q '/docs/commands.md$' <<<"${listing}"
+            grep -q '/docs/troubleshooting.md$' <<<"${listing}"
+            grep -q '/examples/smoke-config.yaml$' <<<"${listing}"
           done
           for archive in dist/*.zip; do
             listing=$(unzip -Z1 "${archive}")
@@ -124,6 +143,12 @@ jobs:
             grep -q '/LICENSE$' <<<"${listing}"
             grep -q '/NOTICE$' <<<"${listing}"
             grep -q '/README.md$' <<<"${listing}"
+            grep -q '/SKILL.md$' <<<"${listing}"
+            grep -q '/CHANGELOG.md$' <<<"${listing}"
+            grep -q '/docs/agent-configuration.md$' <<<"${listing}"
+            grep -q '/docs/commands.md$' <<<"${listing}"
+            grep -q '/docs/troubleshooting.md$' <<<"${listing}"
+            grep -q '/examples/smoke-config.yaml$' <<<"${listing}"
           done
       - name: Create checksums
         shell: bash
@@ -131,6 +156,7 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum joyrun-*.tar.gz joyrun-*.zip install.sh install.ps1 \
+            SKILL.md agent-configuration.md \
             > SHA256SUMS
       - name: Publish GitHub release
         shell: bash
@@ -144,6 +170,8 @@ jobs:
             dist/joyrun-*.zip
             dist/install.sh
             dist/install.ps1
+            dist/SKILL.md
+            dist/agent-configuration.md
             dist/SHA256SUMS
           )
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then

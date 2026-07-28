@@ -58,14 +58,14 @@ verified before replacement, and the preceding binary is retained as
 
 ```bash
 sh install.sh --check
-sh install.sh --version v0.1.0
+sh install.sh --version vX.Y.Z
 ```
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\install.ps1 -Check
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\install.ps1 -Version v0.1.0
+  -File .\install.ps1 -Version vX.Y.Z
 ```
 
 `--check`/`-Check` performs no filesystem writes. An omitted version means the
@@ -101,3 +101,22 @@ they should not reimplement release selection. Agents must:
 
 JoyRun never updates itself during `submit`, `status`, `pull`, or any other
 task operation.
+
+## Version-matched Agent documentation
+
+Every release publishes `SKILL.md` and `agent-configuration.md` beside the
+binary archives. Install the Skill from the same release as the binary:
+
+```text
+https://github.com/wxia529/joyrun/releases/download/vX.Y.Z/SKILL.md
+```
+
+For the latest stable pair:
+
+```text
+https://github.com/wxia529/joyrun/releases/latest/download/SKILL.md
+https://github.com/wxia529/joyrun/releases/latest/download/agent-configuration.md
+```
+
+Do not combine documentation from the `main` branch with an older stable
+binary; command and configuration contracts may have changed.
