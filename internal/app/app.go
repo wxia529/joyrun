@@ -960,11 +960,10 @@ func (a *App) Doctor(ctx context.Context, targetName string) DoctorResult {
 	checks = append(checks, a.checkRemoteRoot(ctx, target.Cluster, cluster))
 	for _, executable := range []string{"sbatch", "squeue", "sacct", "scancel"} {
 		_, stderr, err := a.Runner.Exec(ctx, cluster.Host, "command -v "+executable, nil)
-		detail := strings.TrimSpace(stderr)
-		if detail == "" {
-			if err == nil {
-				detail = "available"
-			} else {
+		detail := "available"
+		if err != nil {
+			detail = strings.TrimSpace(stderr)
+			if detail == "" {
 				detail = executable + " was not found on " + cluster.Host
 			}
 		}

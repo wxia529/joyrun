@@ -33,6 +33,7 @@ type fakeRunner struct {
 	markerMissing      bool
 	findOutput         *string
 	recoveryScanOutput string
+	commandWarning     string
 }
 
 func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader) (string, string, error) {
@@ -77,6 +78,8 @@ func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader)
 		return "FOUND\ncalculation output\n", "", nil
 	case strings.Contains(command, "root=") && strings.Contains(command, "creatable:"):
 		return f.rootResult, "", nil
+	case strings.HasPrefix(command, "command -v "):
+		return "/usr/bin/tool\n", f.commandWarning, nil
 	case strings.Contains(command, "cat >") && strings.Contains(command, "metadata.json"):
 		f.metadataWriteCount++
 		if f.metadataWriteCount == f.failMetadataWrite {
@@ -143,6 +146,30 @@ func TestDoctorBlocksUnwritableRemoteRoot(t *testing.T) {
 	for _, check := range result.Checks {
 		if check.Name == "remote_root" && (check.Status != "fail" || check.SuggestedAction == "") {
 			t.Fatalf("unexpected remote root failure: %#v", check)
+		}
+	}
+}
+
+func TestDoctorDoesNotTreatSuccessfulCommandWarningAsFailureDetail(t *testing.T) {
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{"c": {
+				Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun",
+			}},
+			Targets: map[string]model.Target{"c/run": {Cluster: "c", Script: "run"}},
+		},
+		Runner: &fakeRunner{
+			rootResult: "pass", commandWarning: "setlocale: warning",
+		},
+		Transfer: &fakeTransfer{},
+	}
+	result := application.Doctor(context.Background(), "c/run")
+	if !result.Ready {
+		t.Fatalf("successful scheduler checks should remain ready: %#v", result)
+	}
+	for _, check := range result.Checks {
+		if check.Name == "sbatch" && check.Message != "available" {
+			t.Fatalf("successful command warning leaked into result: %#v", check)
 		}
 	}
 }
