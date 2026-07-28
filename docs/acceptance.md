@@ -46,3 +46,17 @@ Run the full checklist on Linux with `transfer: rsync`. Run preview, submit,
 status, files, pull, and recovery on native Windows with `transfer: sftp`.
 Record JoyRun, OpenSSH, rsync, Slurm, and operating-system versions with the
 release notes.
+
+## Installer checks
+
+Before publishing, exercise `scripts/install.sh` on Linux and macOS and
+`scripts/install.ps1` on Windows:
+
+- default installation selects the release platform and architecture;
+- `--check`/`-Check` reports versions without changing files;
+- an exact version installs the requested release;
+- a modified archive is rejected by checksum verification;
+- an upgrade retains the previous binary and reports both versions;
+- the installed binary reports the release tag;
+- unsupported architectures fail before creating the installation directory;
+- PATH is changed only with the explicit Windows `-AddToPath` option.

@@ -41,9 +41,75 @@ required daemon: remote actions occur only when a JoyRun command is run.
 
 ## Install and build
 
-Download a platform archive and `SHA256SUMS` from the
-[GitHub releases page](https://github.com/wxia529/joyrun/releases), or install
-from source with Go 1.24 or later:
+The official installers detect the operating system and CPU architecture,
+download the matching archive from the latest stable
+[GitHub release](https://github.com/wxia529/joyrun/releases), verify it against
+`SHA256SUMS`, and install it without `sudo`.
+
+Linux or macOS:
+
+```bash
+curl -fsSLO \
+  https://github.com/wxia529/joyrun/releases/latest/download/install.sh
+sh install.sh
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest `
+  https://github.com/wxia529/joyrun/releases/latest/download/install.ps1 `
+  -OutFile install.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\install.ps1 -AddToPath
+```
+
+Download the installer as a file and inspect it when required by local
+security policy; do not pipe a remote script directly into a shell.
+`ExecutionPolicy Bypass` above applies only to the child PowerShell process
+running this downloaded file; it does not change the user or machine policy.
+By default, JoyRun is installed in `~/.local/bin` on Linux/macOS and
+`%LOCALAPPDATA%\Programs\JoyRun` on Windows.
+
+Re-running the same installer performs a verified upgrade. Check first without
+changing files, or pin an exact release:
+
+```bash
+sh install.sh --check
+sh install.sh --version v0.1.0
+```
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\install.ps1 -Check
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\install.ps1 -Version v0.1.0
+```
+
+The default always resolves GitHub's latest stable release; it never selects a
+prerelease automatically. Installation keeps the immediately previous binary
+as `joyrun.previous` (or `joyrun.previous.exe`) for manual rollback. The
+installer does not modify PATH on Linux/macOS, and Windows PATH changes require
+the explicit `-AddToPath` option. See the
+[installation and upgrade guide](docs/install.md) for platform details and
+agent-safety rules.
+
+### Install with an AI agent
+
+Copy and send this prompt to your coding agent:
+
+```text
+Follow https://raw.githubusercontent.com/wxia529/joyrun/main/SKILL.md to install the latest stable JoyRun release for this machine.
+```
+
+The skill tells the agent how to detect the platform, install without guessing
+an archive name, and stop for authorization or compatibility problems. It
+does not authorize silent installation or upgrades during normal JoyRun task
+operations. You can also
+[review the skill on GitHub](https://github.com/wxia529/joyrun/blob/main/SKILL.md)
+before using it.
+
+Alternatively, install from source with Go 1.24 or later:
 
 ```bash
 go install github.com/wxia529/joyrun/cmd/joyrun@latest

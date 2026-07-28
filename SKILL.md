@@ -1,6 +1,6 @@
 ---
 name: joyrun
-description: Operate JoyRun as an agent-friendly remote HPC execution backend over SSH and Slurm. Use when Codex needs to initialize a JoyRun project, inspect configured execution targets, preview or submit a local file/directory to an HPC cluster, check a remote task, read logs, pull selected results, cancel an explicitly identified task, inspect task history, diagnose JoyRun connectivity, or recover a task from remote metadata. Prefer this skill for computational work that should run asynchronously on a configured remote cluster instead of consuming the local machine.
+description: Install, update, and operate JoyRun as an agent-friendly remote HPC execution backend over SSH and Slurm. Use when Codex needs to install or check a JoyRun release, initialize a JoyRun project, inspect configured execution targets, preview or submit a local file/directory to an HPC cluster, check a remote task, read logs, pull selected results, cancel an explicitly identified task, inspect task history, diagnose JoyRun connectivity, or recover a task from remote metadata. Prefer this skill for computational work that should run asynchronously on a configured remote cluster instead of consuming the local machine.
 ---
 
 # Use JoyRun
@@ -18,6 +18,49 @@ Treat stdout as the JSON interface and stderr as diagnostics.
 
    ```bash
    joyrun version --json
+   ```
+
+   If it is unavailable, do not guess an archive name or silently install it.
+   When the user explicitly requested installation, download the official
+   standalone installer as a file, then invoke it so platform detection and
+   SHA-256 verification remain centralized:
+
+   Linux/macOS:
+
+   ```bash
+   curl -fsSLO \
+     https://github.com/wxia529/joyrun/releases/latest/download/install.sh
+   sh install.sh
+   ```
+
+   Windows PowerShell:
+
+   ```powershell
+   Invoke-WebRequest `
+     https://github.com/wxia529/joyrun/releases/latest/download/install.ps1 `
+     -OutFile install.ps1
+   powershell.exe -NoProfile -ExecutionPolicy Bypass `
+     -File .\install.ps1
+   ```
+
+   If the user asked to use JoyRun but did not authorize installing software,
+   explain that JoyRun is missing and request approval before downloading or
+   changing files outside the project. Never pipe a remote script into a
+   shell, use `sudo`, bypass checksum verification, or install from a
+   non-official repository. Do not add a directory to PATH without explicit
+   authorization; invoke the installed absolute path when necessary.
+
+   The Windows execution-policy setting applies only to that child process; do
+   not modify the persisted user or machine policy. After installation, verify
+   by name when available or by the reported absolute installation path:
+
+   ```bash
+   joyrun version --json
+   "$HOME/.local/bin/joyrun" version --json
+   ```
+
+   ```powershell
+   & "$env:LOCALAPPDATA\Programs\JoyRun\joyrun.exe" version --json
    ```
 
    If configuration is missing, locate or create it explicitly:
@@ -45,6 +88,40 @@ Treat stdout as the JSON interface and stderr as diagnostics.
 4. If multiple targets are plausible and the user's intent does not determine
    one, ask the user to choose. Never infer an expensive target from a filename
    extension alone.
+
+## Check and upgrade JoyRun
+
+Do not check for updates during normal task operations. Check only when the
+user requests version or update information:
+
+```bash
+sh install.sh --check
+```
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\install.ps1 -Check
+```
+
+The check is read-only. Upgrade only when the user explicitly requests it by
+running the same official installer without `--check`/`-Check`. Use an exact
+version when the user requests reproducibility:
+
+```bash
+sh install.sh --version v0.1.0
+```
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\install.ps1 -Version v0.1.0
+```
+
+The default installer channel is the latest stable release and never selects a
+prerelease. Before upgrading across a documented database compatibility
+boundary, stop and report the compatibility requirement; never delete,
+reinitialize, or silently migrate the user's database. After upgrading, run
+`joyrun version --json`. A checksum, platform, or version-verification failure
+is blocking and must not be bypassed.
 
 ## Validate before submission
 
