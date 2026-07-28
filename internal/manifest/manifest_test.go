@@ -111,3 +111,37 @@ func TestSnapshotRejectsSymlinkOutsideWorkdir(t *testing.T) {
 		t.Fatal("expected external symbolic link to be rejected")
 	}
 }
+
+func TestSnapshotAcceptsInternalSymlinkThroughAliasedRoot(t *testing.T) {
+	parent := t.TempDir()
+	realRoot := filepath.Join(parent, "real")
+	if err := os.Mkdir(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realRoot, "input.dat"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("input.dat", filepath.Join(realRoot, "alias.dat")); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	aliasedParent := filepath.Join(filepath.Dir(parent), filepath.Base(parent)+"-alias")
+	if err := os.Symlink(parent, aliasedParent); err != nil {
+		t.Skipf("directory symbolic links unavailable: %v", err)
+	}
+	defer os.Remove(aliasedParent)
+	aliasedRoot := filepath.Join(aliasedParent, "real")
+	staging, entries, _, cleanup, err := Snapshot(
+		aliasedRoot, Selection{Mode: "workdir"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if len(entries) != 2 {
+		t.Fatalf("unexpected aliased-root snapshot: %#v", entries)
+	}
+	if data, err := os.ReadFile(filepath.Join(staging, "alias.dat")); err != nil ||
+		string(data) != "content" {
+		t.Fatalf("unexpected dereferenced alias: %q, %v", data, err)
+	}
+}

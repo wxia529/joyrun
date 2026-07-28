@@ -35,6 +35,10 @@ func Build(root string, selection Selection) ([]model.ManifestEntry, []string, e
 	if err != nil {
 		return nil, nil, fault.Wrap("SOURCE_SCAN_FAILED", "cannot resolve manifest root", false, err)
 	}
+	rootAbsolute, err = filepath.EvalSymlinks(rootAbsolute)
+	if err != nil {
+		return nil, nil, fault.Wrap("SOURCE_SCAN_FAILED", "cannot resolve manifest root links", false, err)
+	}
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -116,6 +120,11 @@ func Snapshot(root string, selection Selection) (string, []model.ManifestEntry, 
 	if err != nil {
 		cleanup()
 		return "", nil, nil, func() {}, fault.Wrap("SOURCE_SNAPSHOT_FAILED", "cannot resolve snapshot root", false, err)
+	}
+	rootAbsolute, err = filepath.EvalSymlinks(rootAbsolute)
+	if err != nil {
+		cleanup()
+		return "", nil, nil, func() {}, fault.Wrap("SOURCE_SNAPSHOT_FAILED", "cannot resolve snapshot root links", false, err)
 	}
 	err = filepath.WalkDir(root, func(sourcePath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {

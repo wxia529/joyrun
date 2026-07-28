@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/wxia529/joyrun/internal/fault"
@@ -20,7 +21,8 @@ func TestInitCreatesValidStarterAndRefusesOverwrite(t *testing.T) {
 	if len(cfg.Clusters) != 0 || len(cfg.Targets) != 0 {
 		t.Fatalf("starter configuration is not empty: %#v", cfg)
 	}
-	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(path); err != nil ||
+		(runtime.GOOS != "windows" && info.Mode().Perm() != 0o600) {
 		t.Fatalf("unexpected starter permissions: info=%v err=%v", info, err)
 	}
 	if err := Init(path); fault.As(err).Code != "CONFIG_EXISTS" {
