@@ -87,7 +87,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: joyrun-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*.*
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
 
   publish:
     needs: build
@@ -123,7 +126,12 @@ jobs:
             grep -q '/README.md$' <<<"${listing}"
           done
       - name: Create checksums
-        run: cd dist && sha256sum * > SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum joyrun-*.tar.gz joyrun-*.zip install.sh install.ps1 \
+            > SHA256SUMS
       - name: Publish GitHub release
         shell: bash
         env:
@@ -131,7 +139,14 @@ jobs:
         run: |
           set -euo pipefail
           args=(--verify-tag --generate-notes)
+          assets=(
+            dist/joyrun-*.tar.gz
+            dist/joyrun-*.zip
+            dist/install.sh
+            dist/install.ps1
+            dist/SHA256SUMS
+          )
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             args+=(--prerelease)
           fi
-          gh release create "${GITHUB_REF_NAME}" dist/* "${args[@]}"
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" "${args[@]}"
