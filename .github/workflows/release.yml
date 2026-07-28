@@ -6,10 +6,44 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - run: go mod verify
+      - run: go test ./...
+      - if: runner.os == 'Linux'
+        run: go test -race ./...
+      - run: go vet ./...
+      - name: Verify release version
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: ${VERSION}" >&2
+            exit 1
+          fi
+          binary="${RUNNER_TEMP}/joyrun"
+          if [ "${RUNNER_OS}" = Windows ]; then binary="${binary}.exe"; fi
+          go build -trimpath -ldflags "-X main.version=${VERSION}" \
+            -o "${binary}" ./cmd/joyrun
+          test "$("${binary}" version)" = "joyrun ${VERSION}"
+
   build:
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,6 +78,7 @@ jobs:
           if [ "${GOOS}" = windows ]; then binary="joyrun.exe"; fi
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
             -o "dist/${package}/${binary}" ./cmd/joyrun
+          cp LICENSE NOTICE README.md "dist/${package}/"
           if [ "${GOOS}" = windows ]; then
             (cd dist && zip -r "${package}.zip" "${package}")
           else
@@ -57,14 +92,41 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Verify archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz; do
+            listing=$(tar -tzf "${archive}")
+            grep -q '/joyrun$' <<<"${listing}"
+            grep -q '/LICENSE$' <<<"${listing}"
+            grep -q '/NOTICE$' <<<"${listing}"
+            grep -q '/README.md$' <<<"${listing}"
+          done
+          for archive in dist/*.zip; do
+            listing=$(unzip -Z1 "${archive}")
+            grep -q '/joyrun.exe$' <<<"${listing}"
+            grep -q '/LICENSE$' <<<"${listing}"
+            grep -q '/NOTICE$' <<<"${listing}"
+            grep -q '/README.md$' <<<"${listing}"
+          done
       - name: Create checksums
         run: cd dist && sha256sum * > SHA256SUMS
       - name: Publish GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes
+        run: |
+          set -euo pipefail
+          args=(--verify-tag --generate-notes)
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" dist/* "${args[@]}"
