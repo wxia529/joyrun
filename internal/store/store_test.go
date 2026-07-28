@@ -86,7 +86,7 @@ func TestProjectRebindAndTaskRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFreshDatabaseIsMarkedDevelopment(t *testing.T) {
+func TestFreshDatabaseIsMarkedStable(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "joyrun.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -198,8 +198,8 @@ func TestTaskRevisionRejectsStaleUpdate(t *testing.T) {
 	}
 }
 
-func TestRejectsOldDatabaseSchema(t *testing.T) {
-	for _, version := range []int{1, 2, 4} {
+func TestRejectsUnsupportedDatabaseSchema(t *testing.T) {
+	for _, version := range []int{2, 3, 4} {
 		t.Run("version_"+strconv.Itoa(version), func(t *testing.T) {
 			database := filepath.Join(t.TempDir(), "joyrun.db")
 			legacy, err := sql.Open("sqlite", database)
@@ -227,7 +227,7 @@ func TestRejectsUnmarkedDatabaseUsingCurrentVersionNumber(t *testing.T) {
 	}
 	if _, err := legacy.Exec(`
 CREATE TABLE tasks (id TEXT PRIMARY KEY);
-PRAGMA user_version=3;
+PRAGMA user_version=1;
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -236,18 +236,18 @@ PRAGMA user_version=3;
 	}
 
 	if _, err := Open(database); fault.As(err).Code != "DATABASE_UNSUPPORTED" {
-		t.Fatalf("expected unmarked version 3 database to be rejected, got %v", err)
+		t.Fatalf("expected unmarked version 1 database to be rejected, got %v", err)
 	}
 }
 
-func TestRejectsNonDevelopmentDatabaseMarker(t *testing.T) {
+func TestRejectsNonStableDatabaseMarker(t *testing.T) {
 	database := filepath.Join(t.TempDir(), "joyrun.db")
 	s, err := Open(database)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(
-		"UPDATE joyrun_meta SET value='stable' WHERE key='release_channel'"); err != nil {
+		"UPDATE joyrun_meta SET value='development' WHERE key='release_channel'"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -255,6 +255,6 @@ func TestRejectsNonDevelopmentDatabaseMarker(t *testing.T) {
 	}
 
 	if _, err := Open(database); fault.As(err).Code != "DATABASE_UNSUPPORTED" {
-		t.Fatalf("expected non-development database to be rejected, got %v", err)
+		t.Fatalf("expected non-stable database to be rejected, got %v", err)
 	}
 }

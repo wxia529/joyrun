@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	schemaVersion = 3
-	schemaChannel = "development"
-	schemaLabel   = "dev-3"
+	schemaVersion = 1
+	schemaChannel = "stable"
+	schemaLabel   = "stable-1"
 )
 
 type Store struct {
@@ -85,7 +85,7 @@ WHERE type='table' AND name IN ('joyrun_meta','projects','tasks','task_events')`
 			return fault.New("DATABASE_UNSUPPORTED",
 				"unversioned JoyRun database is not supported; remove it or set JOYRUN_DB to a new path", false)
 		}
-		_, err = conn.ExecContext(ctx, developmentSchema)
+		_, err = conn.ExecContext(ctx, stableSchema)
 	case schemaVersion:
 		var metadataTable int
 		if err = conn.QueryRowContext(ctx, `
@@ -95,7 +95,7 @@ WHERE type='table' AND name='joyrun_meta'`).Scan(&metadataTable); err != nil {
 		}
 		if metadataTable == 0 {
 			return fault.New("DATABASE_UNSUPPORTED",
-				"database schema is not marked as a JoyRun development database; remove it or set JOYRUN_DB to a new path", false)
+				"database schema is not marked as a supported JoyRun database; remove it or set JOYRUN_DB to a new path", false)
 		}
 	default:
 		return fault.New("DATABASE_UNSUPPORTED",
@@ -135,14 +135,14 @@ WHERE type='table' AND name='joyrun_meta'`).Scan(&metadataTable); err != nil {
 	return nil
 }
 
-const developmentSchema = `
+const stableSchema = `
 CREATE TABLE IF NOT EXISTS joyrun_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 INSERT OR IGNORE INTO joyrun_meta(key,value) VALUES
-  ('release_channel','development'),
-  ('schema_label','dev-3');
+  ('release_channel','stable'),
+  ('schema_label','stable-1');
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   last_path TEXT NOT NULL,

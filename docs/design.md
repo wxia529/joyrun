@@ -29,9 +29,11 @@ addressed by the ID in `.joyrun/project.yaml`, not by its absolute path. Each
 command rebinds that ID to the current path, so a project can be moved without
 losing source-path lookup.
 
-The current database is a development format identified by
-`release_channel=development` and `schema_label=dev-3`. Unsupported versions
-and other release channels are rejected; development schemas are not migrated.
+The first public database format is independently versioned as
+`release_channel=stable`, `schema_version=1`, and `schema_label=stable-1`.
+Pre-release `development/dev-3` databases are rejected rather than migrated;
+remote metadata remains available for deliberate recovery. Future stable
+schema changes require explicit, tested migrations.
 
 Every remote task directory also contains `metadata.json`. It is updated after
 submission and status changes. If the local database is lost, a known task can

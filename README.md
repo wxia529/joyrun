@@ -385,9 +385,12 @@ $XDG_DATA_HOME/joyrun/joyrun.db
 or `~/.local/share/joyrun/joyrun.db` when `XDG_DATA_HOME` is unset.
 `JOYRUN_DB` can override it.
 
-The current database format is explicitly development-only. Its metadata is
-marked `release_channel=development` and `schema_label=dev-3`. JoyRun rejects
-older or differently marked databases instead of migrating them.
+The first public database format is independently versioned as
+`release_channel=stable`, `schema_version=1`, and `schema_label=stable-1`.
+JoyRun rejects the pre-release `development/dev-3` database instead of
+migrating it. Start with a new database for v0.1.0; remote task metadata can
+recover tasks that must be retained. Future stable schema changes require an
+explicit migration.
 
 On Windows the defaults are:
 

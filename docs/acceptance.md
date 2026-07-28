@@ -37,8 +37,8 @@ test project and run `joyrun doctor TARGET` before the scenarios below.
   the remote marker or `joyrun:<task-id>` comment.
 - Submit the same source twice and confirm isolated remote directories.
 - Move the local project and confirm source lookup still works.
-- Delete or redirect the development SQLite database, run `recover --scan`,
-  recover one candidate, and refresh its status.
+- Delete or redirect the SQLite database, run `recover --scan`, recover one
+  candidate, and refresh its status.
 
 ## Platform matrix
 

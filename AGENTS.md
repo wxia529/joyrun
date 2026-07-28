@@ -60,6 +60,6 @@ examples, and `SKILL.md` when their contracts are affected.
 ## Security & Compatibility
 
 Never store SSH credentials; rely on OpenSSH configuration and host-key
-verification. Preserve unrelated working-tree changes. The SQLite schema is
-currently `development/dev-3`: reject incompatible databases and do not add
-silent migrations during this development phase.
+verification. Preserve unrelated working-tree changes. The first public
+SQLite schema is `stable/stable-1`. Future stable schema changes require an
+explicit, tested migration; never add silent or destructive migrations.
