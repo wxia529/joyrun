@@ -1,6 +1,6 @@
 ---
 name: joyrun
-description: Install, update, and operate JoyRun as an agent-friendly remote HPC execution backend over SSH and Slurm. Use when Codex needs to install or check a JoyRun release, initialize a JoyRun project, inspect configured execution targets, preview or submit a local file/directory to an HPC cluster, check a remote task, read logs, pull selected results, cancel an explicitly identified task, inspect task history, diagnose JoyRun connectivity, or recover a task from remote metadata. Prefer this skill for computational work that should run asynchronously on a configured remote cluster instead of consuming the local machine.
+description: Install, configure, update, and operate JoyRun as an agent-friendly remote HPC execution backend over SSH and Slurm. Use when Codex needs to install or check a JoyRun release, create or modify cluster and target configuration from an existing HPC submission workflow, initialize a JoyRun project, inspect configured execution targets, preview or submit a local file/directory to an HPC cluster, check a remote task, read logs, pull selected results, cancel an explicitly identified task, inspect task history, diagnose JoyRun connectivity, or recover a task from remote metadata. Prefer this skill for computational work that should run asynchronously on a configured remote cluster instead of consuming the local machine.
 ---
 
 # Use JoyRun
@@ -88,6 +88,19 @@ Treat stdout as the JSON interface and stderr as diagnostics.
 4. If multiple targets are plausible and the user's intent does not determine
    one, ask the user to choose. Never infer an expensive target from a filename
    extension alone.
+
+## Create or modify configuration
+
+When asked to create a cluster or target, read and follow the complete
+configuration guide before editing:
+
+https://raw.githubusercontent.com/wxia529/joyrun/main/docs/agent-configuration.md
+
+Treat an existing Slurm script and cluster documentation as the source of
+truth. Do not guess cluster-specific values, overwrite unrelated configuration,
+store credentials, or submit a real job while configuring JoyRun. Finish with
+`config validate`, `target show`, `target params`, `doctor`, and a representative
+`submit --dry-run`. A real submission requires a separate explicit request.
 
 ## Check and upgrade JoyRun
 

@@ -39,6 +39,22 @@ JoyRun does not interpret results, modify inputs, restart failed calculations,
 build workflow DAGs, or expose a general-purpose remote shell. It has no
 required daemon: remote actions occur only when a JoyRun command is run.
 
+## Install with an AI agent
+
+Copy and send this prompt to your coding agent:
+
+```text
+Install https://raw.githubusercontent.com/wxia529/joyrun/main/SKILL.md as a global user-level JoyRun skill so it is available in all projects, then follow it to install the latest stable JoyRun release for this machine.
+```
+
+The prompt explicitly requests a global user-level skill rather than a
+project-local instruction. The skill tells the agent how to detect the
+platform, install without guessing an archive name, and stop for authorization
+or compatibility problems. It does not authorize silent installation or
+upgrades during normal JoyRun task operations. You can also
+[review the skill on GitHub](https://github.com/wxia529/joyrun/blob/main/SKILL.md)
+before using it.
+
 ## Install and build
 
 The official installers detect the operating system and CPU architecture,
@@ -94,21 +110,6 @@ the explicit `-AddToPath` option. See the
 [installation and upgrade guide](docs/install.md) for platform details and
 agent-safety rules.
 
-### Install with an AI agent
-
-Copy and send this prompt to your coding agent:
-
-```text
-Follow https://raw.githubusercontent.com/wxia529/joyrun/main/SKILL.md to install the latest stable JoyRun release for this machine.
-```
-
-The skill tells the agent how to detect the platform, install without guessing
-an archive name, and stop for authorization or compatibility problems. It
-does not authorize silent installation or upgrades during normal JoyRun task
-operations. You can also
-[review the skill on GitHub](https://github.com/wxia529/joyrun/blob/main/SKILL.md)
-before using it.
-
 Alternatively, install from source with Go 1.24 or later:
 
 ```bash
@@ -159,6 +160,19 @@ to:
 
 `$XDG_CONFIG_HOME` is honored. `JOYRUN_CONFIG` or the global `--config` option
 can select another file.
+
+### Configure with an AI agent
+
+Copy this prompt to your coding agent and replace the placeholders:
+
+```text
+Follow https://raw.githubusercontent.com/wxia529/joyrun/main/SKILL.md to create a JoyRun target from my existing Slurm script at <SCRIPT_PATH> for inputs under <SOURCE_PATH>. Do not guess cluster-specific values, submit a real job, or overwrite unrelated configuration. Validate the configuration, run doctor, and finish with a dry-run.
+```
+
+The Skill routes configuration work to the detailed
+[Agent configuration guide](docs/agent-configuration.md). The agent should ask
+only for values that cannot be established from the existing script or cluster
+documentation.
 
 A cluster describes connectivity and scheduling:
 
