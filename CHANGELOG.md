@@ -5,6 +5,16 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.4] - 2026-07-28
+
+### Changed
+
+- Clarified that failed and cancelled tasks may be pulled normally, while
+  their outputs can be incomplete.
+- Required a fresh official installer for version checks and upgrades.
+- Added safeguards for replacing same-named local outputs when pulling
+  historical tasks.
+
 ## [v0.1.3] - 2026-07-28
 
 ### Changed
@@ -68,7 +78,8 @@ The SQLite schema remains `stable/stable-1`.
 - First public release with asynchronous Slurm submission, status, logs,
   bounded pull, global SQLite state, Project identity, and remote recovery.
 
-[Unreleased]: https://github.com/wxia529/joyrun/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/wxia529/joyrun/compare/v0.1.4...HEAD
+[v0.1.4]: https://github.com/wxia529/joyrun/compare/v0.1.3...v0.1.4
 [v0.1.3]: https://github.com/wxia529/joyrun/compare/v0.1.2...v0.1.3
 [v0.1.2]: https://github.com/wxia529/joyrun/compare/v0.1.1...v0.1.2
 [v0.1.1]: https://github.com/wxia529/joyrun/compare/v0.1.0...v0.1.1

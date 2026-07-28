@@ -126,13 +126,20 @@ immediate scheduling.
 ## Check and upgrade JoyRun
 
 Do not check for updates during normal task operations. Check only when the
-user requests version or update information:
+user requests version or update information. Do not assume an installer from a
+previous session still exists or is current; download a fresh official
+installer before checking or upgrading:
 
 ```bash
+curl -fsSLO \
+  https://github.com/wxia529/joyrun/releases/latest/download/install.sh
 sh install.sh --check
 ```
 
 ```powershell
+Invoke-WebRequest `
+  https://github.com/wxia529/joyrun/releases/latest/download/install.ps1 `
+  -OutFile install.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\install.ps1 -Check
 ```
@@ -343,7 +350,9 @@ workflow.
 
 ## Pull results safely
 
-After `completed`, use the target's default pull patterns:
+For any terminal compute state—`completed`, `failed`, or `cancelled`—normal
+pull is allowed. Inspect status and logs before pulling a failed or cancelled
+task because its outputs may be incomplete. Use the target's default patterns:
 
 ```bash
 joyrun pull jr_TASK_ID --json
@@ -375,7 +384,10 @@ joyrun pull jr_TASK_ID --all --json
 
 Submitted input files are protected by default. Never use
 `--overwrite-inputs` unless the user explicitly requests restoring or
-replacing them.
+replacing them. Other selected files are outputs and may replace same-named
+local outputs. Before pulling a historical task or into a directory containing
+newer results, inspect `files`, run `pull --dry-run`, and confirm that replacing
+those outputs matches the user's intent.
 
 Use `--live` only for deliberate diagnostic retrieval from a task that has not
 completed:
