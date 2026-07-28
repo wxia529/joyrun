@@ -61,6 +61,7 @@ Inspect:
 - resolved `.Input`, `.Stem`, `.Name`, and `.WorkDir` values;
 - files included in the upload snapshot;
 - ignored files;
+- `push.mode`, explicit dependency patterns, and upload limits;
 - resolved parameters and their sources;
 - remote directory;
 - rendered job script.
@@ -70,6 +71,13 @@ included, or the rendered command does not match the requested calculation.
 Treat `SOURCE_KIND_MISMATCH` and `SOURCE_PATTERN_MISMATCH` as input-selection
 errors; do not work around them by submitting a containing directory to a file
 target.
+
+For `push.mode: entry`, confirm that only the selected input and intentional
+`push.include` dependencies are present. For `push.mode: workdir`, inspect the
+whole manifest because every non-excluded file is part of the task. Never add
+`--allow-project-root` merely to bypass `PROJECT_ROOT_UPLOAD_FORBIDDEN`; use it
+only when the user explicitly intends to upload from the complete project
+root.
 
 Before the first real use of a target on the current machine, run:
 
@@ -101,9 +109,13 @@ Record the returned `result.task.id`, which has the form `jr_...`. Use this
 exact task ID for all subsequent operations. A source path resolves to its
 newest task and can silently select a later submission.
 
-Submitting a file snapshots its entire containing directory. Submitting a
-directory snapshots that directory. Respect `.joyrunignore` and target
-`push.exclude`; do not work around them without user intent.
+The target controls upload scope. `push.mode: entry` snapshots only the
+selected file and explicit `push.include` dependencies. `push.mode: workdir`
+snapshots the directory. Respect upload limits, `.joyrunignore`, and target
+`push.exclude`; do not work around them without user intent. Treat
+`UPLOAD_POLICY_EXCEEDED`, `SOURCE_ENTRY_EXCLUDED`, and
+`PROJECT_ROOT_UPLOAD_FORBIDDEN` as safety failures requiring review, not flags
+to bypass automatically.
 
 Submission is asynchronous. Return control after JoyRun returns the task ID.
 Do not keep a terminal occupied waiting for a long computation.

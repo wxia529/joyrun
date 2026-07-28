@@ -45,6 +45,7 @@ type Preview struct {
 	Source         model.Source          `json:"source"`
 	Target         string                `json:"target"`
 	Cluster        string                `json:"cluster"`
+	Push           model.PushPolicy      `json:"push"`
 	RemoteDir      string                `json:"remote_dir"`
 	Params         map[string]any        `json:"params"`
 	ParamSources   map[string]string     `json:"param_sources"`
@@ -150,8 +151,13 @@ func (a *App) InitProject(ctx context.Context, root string) (model.Project, erro
 	return p, nil
 }
 
-func (a *App) Preview(ctx context.Context, cwd, sourcePath, targetName string, sets []string) (Preview, model.Task, string, error) {
-	return a.prepare(ctx, cwd, sourcePath, targetName, sets, true)
+func (a *App) Preview(
+	ctx context.Context,
+	cwd, sourcePath, targetName string,
+	sets []string,
+	allowProjectRoot bool,
+) (Preview, model.Task, string, error) {
+	return a.prepare(ctx, cwd, sourcePath, targetName, sets, true, allowProjectRoot)
 }
 
 func (a *App) prepare(
@@ -159,6 +165,7 @@ func (a *App) prepare(
 	cwd, sourcePath, targetName string,
 	sets []string,
 	scanManifest bool,
+	allowProjectRoot bool,
 ) (Preview, model.Task, string, error) {
 	p, err := project.Discover(cwd)
 	if err != nil {
@@ -167,6 +174,11 @@ func (a *App) prepare(
 	src, localWorkDir, err := source.Resolve(p, resolveFrom(cwd, sourcePath))
 	if err != nil {
 		return Preview{}, model.Task{}, "", err
+	}
+	if !allowProjectRoot && sameDirectory(localWorkDir, p.Root) {
+		return Preview{}, model.Task{}, "", fault.New("PROJECT_ROOT_UPLOAD_FORBIDDEN",
+			"the selected source would upload from the JoyRun project root", false).
+			WithAction("move the task into its own directory or explicitly add --allow-project-root")
 	}
 	target, ok := a.Config.Targets[targetName]
 	if !ok {
@@ -193,8 +205,12 @@ func (a *App) prepare(
 	}
 	var inputManifest []model.ManifestEntry
 	var ignored []string
+	selection, err := uploadSelection(p.Root, localWorkDir, src, target)
+	if err != nil {
+		return Preview{}, model.Task{}, "", err
+	}
 	if scanManifest {
-		inputManifest, ignored, err = manifest.Build(localWorkDir, p.Root, target.Push.Exclude)
+		inputManifest, ignored, err = manifest.Build(localWorkDir, selection)
 		if err != nil {
 			return Preview{}, model.Task{}, "", err
 		}
@@ -219,12 +235,12 @@ func (a *App) prepare(
 		ResolvedParams: params,
 		RenderedScript: script, TargetHash: jtemplate.TargetHash(target), InputManifest: inputManifest,
 		PullPatterns: append([]string{}, target.Pull.Default...),
-		PushExcludes: manifest.ExcludePatterns(p.Root, localWorkDir, target.Push.Exclude),
+		PushExcludes: selection.Exclude,
 		Logs:         logs, Metadata: map[string]string{"recovery_format": "1"},
 		CreatedAt: now, UpdatedAt: now,
 	}
 	preview := Preview{
-		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster,
+		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster, Push: target.Push,
 		RemoteDir: remoteDir, Params: params, ParamSources: paramSources, Files: files,
 		Ignored: ignored, RenderedScript: script, InputManifest: inputManifest,
 		TemplateValues: TemplateValues{
@@ -233,6 +249,43 @@ func (a *App) prepare(
 		SchedulerLog: "joyrun-slurm-<jobid>.log",
 	}
 	return preview, task, localWorkDir, nil
+}
+
+func sameDirectory(left, right string) bool {
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	if leftErr == nil && rightErr == nil {
+		return os.SameFile(leftInfo, rightInfo)
+	}
+	leftAbsolute, _ := filepath.Abs(left)
+	rightAbsolute, _ := filepath.Abs(right)
+	return filepath.Clean(leftAbsolute) == filepath.Clean(rightAbsolute)
+}
+
+func uploadSelection(
+	projectRoot, localWorkDir string,
+	src model.Source,
+	target model.Target,
+) (manifest.Selection, error) {
+	var maxTotalBytes int64
+	var err error
+	if target.Push.Limits.MaxTotalSize != "" {
+		maxTotalBytes, err = config.ParseByteSize(target.Push.Limits.MaxTotalSize)
+		if err != nil {
+			return manifest.Selection{}, fault.Wrap("TARGET_INVALID",
+				"cannot resolve push.limits.max_total_size", false, err)
+		}
+	}
+	entry := ""
+	if src.Entry != nil {
+		entry = *src.Entry
+	}
+	return manifest.Selection{
+		Mode: target.Push.Mode, Entry: entry,
+		Include:  append([]string{}, target.Push.Include...),
+		Exclude:  manifest.ExcludePatterns(projectRoot, localWorkDir, target.Push.Exclude),
+		MaxFiles: target.Push.Limits.MaxFiles, MaxTotalBytes: maxTotalBytes,
+	}, nil
 }
 
 func validateSourceContract(src model.Source, localWorkDir, targetName string, target model.Target) error {
@@ -294,8 +347,15 @@ func singleSourceCandidate(workDir string, patterns []string) string {
 	return candidate
 }
 
-func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, sets []string) (SubmitResult, error) {
-	_, task, localWorkDir, err := a.prepare(ctx, cwd, sourcePath, targetName, sets, false)
+func (a *App) Submit(
+	ctx context.Context,
+	cwd, sourcePath, targetName string,
+	sets []string,
+	allowProjectRoot bool,
+) (SubmitResult, error) {
+	_, task, localWorkDir, err := a.prepare(
+		ctx, cwd, sourcePath, targetName, sets, false, allowProjectRoot,
+	)
 	if err != nil {
 		return SubmitResult{}, err
 	}
@@ -306,7 +366,12 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 	if err := a.Store.BindProject(ctx, p); err != nil {
 		return SubmitResult{}, err
 	}
-	snapshotDir, inputManifest, _, cleanup, err := manifest.Snapshot(localWorkDir, task.PushExcludes)
+	target := a.Config.Targets[task.TargetName]
+	selection, err := uploadSelection(p.Root, localWorkDir, model.Source{Entry: task.SourceEntry}, target)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	snapshotDir, inputManifest, _, cleanup, err := manifest.Snapshot(localWorkDir, selection)
 	if err != nil {
 		return SubmitResult{}, err
 	}

@@ -20,6 +20,7 @@ import (
 )
 
 var paramName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+var byteSize = regexp.MustCompile(`(?i)^([1-9][0-9]*)(B|KB|MB|GB|TB|KIB|MIB|GIB|TIB)?$`)
 
 const starter = `# JoyRun user configuration.
 # Add clusters and execution targets, then run:
@@ -40,6 +41,12 @@ const starter = `# JoyRun user configuration.
 #     source:
 #       kind: file
 #       patterns: ["*.inp"]
+#     push:
+#       mode: entry
+#       include: ["*.xyz"]
+#       limits:
+#         max_files: 20
+#         max_total_size: 2GiB
 #     script: |
 #       #!/bin/bash
 #       #SBATCH --job-name={{ .Stem }}
@@ -177,9 +184,62 @@ func Load(path string) (model.Config, error) {
 					fmt.Sprintf("target %q has invalid source pattern %q", name, pattern), false, err)
 			}
 		}
+		switch target.Push.Mode {
+		case "entry":
+			if target.Source.Kind != "file" {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("target %q push.mode entry requires source.kind file", name), false)
+			}
+		case "workdir":
+		default:
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q requires push.mode entry or workdir", name), false)
+		}
+		for _, pattern := range append(append([]string{}, target.Push.Include...), target.Push.Exclude...) {
+			if pattern == "" {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("target %q has an empty push pattern", name), false)
+			}
+			trimmed := strings.TrimSuffix(strings.TrimPrefix(filepath.ToSlash(pattern), "/"), "/")
+			if _, err := pathpkg.Match(trimmed, "entry"); err != nil {
+				return model.Config{}, fault.Wrap("CONFIG_INVALID",
+					fmt.Sprintf("target %q has invalid push pattern %q", name, pattern), false, err)
+			}
+		}
+		if target.Push.Limits.MaxFiles < 0 {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q push.limits.max_files cannot be negative", name), false)
+		}
+		if target.Push.Limits.MaxTotalSize != "" {
+			if _, err := ParseByteSize(target.Push.Limits.MaxTotalSize); err != nil {
+				return model.Config{}, fault.Wrap("CONFIG_INVALID",
+					fmt.Sprintf("target %q has invalid push.limits.max_total_size", name), false, err)
+			}
+		}
 		cfg.Targets[name] = target
 	}
 	return cfg, nil
+}
+
+func ParseByteSize(raw string) (int64, error) {
+	match := byteSize.FindStringSubmatch(strings.TrimSpace(raw))
+	if match == nil {
+		return 0, fmt.Errorf("size %q must be a positive integer followed by B, KB, MB, GB, TB, KiB, MiB, GiB, or TiB", raw)
+	}
+	value, err := strconv.ParseInt(match[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	multipliers := map[string]int64{
+		"": 1, "B": 1,
+		"KB": 1000, "MB": 1000 * 1000, "GB": 1000 * 1000 * 1000, "TB": 1000 * 1000 * 1000 * 1000,
+		"KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40,
+	}
+	multiplier := multipliers[strings.ToUpper(match[2])]
+	if value > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("size %q exceeds the supported range", raw)
+	}
+	return value * multiplier, nil
 }
 
 func validateSpec(name string, spec model.ParamSpec) error {

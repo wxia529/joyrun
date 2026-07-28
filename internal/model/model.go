@@ -28,6 +28,18 @@ type FilePolicy struct {
 	Default []string `yaml:"default,omitempty" json:"default,omitempty"`
 }
 
+type PushLimits struct {
+	MaxFiles     int    `yaml:"max_files,omitempty" json:"max_files,omitempty"`
+	MaxTotalSize string `yaml:"max_total_size,omitempty" json:"max_total_size,omitempty"`
+}
+
+type PushPolicy struct {
+	Mode    string     `yaml:"mode" json:"mode"`
+	Include []string   `yaml:"include,omitempty" json:"include,omitempty"`
+	Exclude []string   `yaml:"exclude,omitempty" json:"exclude,omitempty"`
+	Limits  PushLimits `yaml:"limits,omitempty" json:"limits,omitempty"`
+}
+
 type SourcePolicy struct {
 	Kind     string   `yaml:"kind,omitempty" json:"kind"`
 	Patterns []string `yaml:"patterns,omitempty" json:"patterns,omitempty"`
@@ -38,7 +50,7 @@ type Target struct {
 	Source  SourcePolicy         `yaml:"source,omitempty" json:"source"`
 	Params  map[string]ParamSpec `yaml:"params,omitempty" json:"params,omitempty"`
 	Script  string               `yaml:"script" json:"script"`
-	Push    FilePolicy           `yaml:"push,omitempty" json:"push,omitempty"`
+	Push    PushPolicy           `yaml:"push" json:"push"`
 	Pull    FilePolicy           `yaml:"pull,omitempty" json:"pull,omitempty"`
 	Logs    []string             `yaml:"logs,omitempty" json:"logs,omitempty"`
 }

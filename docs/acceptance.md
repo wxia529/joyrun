@@ -19,7 +19,11 @@ test project and run `joyrun doctor TARGET` before the scenarios below.
 ## Required scenarios
 
 - Preview reports the correct entry, rendered script, included/ignored files,
-  file count, and total bytes.
+  push mode, file count, and total bytes.
+- An `entry` target uploads its selected input and declared dependencies but
+  not sibling input/output files.
+- Project-root submission fails without `--allow-project-root`; upload file
+  count and total-size limits fail locally before SSH.
 - Submit returns immediately with a `jr_...` ID; status reaches queued,
   running, and completed.
 - `files` reports remote sizes and marks the submitted input.

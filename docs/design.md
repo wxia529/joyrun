@@ -11,6 +11,16 @@ targets can constrain entry names with glob patterns. Targets that use
 `.Input` or `.Stem` require a file entry, so directory submissions fail before
 rendering and before task persistence.
 
+Each target also declares `push.mode`. `entry` is valid only for a file target
+and snapshots the selected entry plus explicit `push.include` dependencies.
+`workdir` snapshots the whole source working directory. Exclusions always win,
+including built-in `.joyrun/` and `.git/` rules. Optional file-count and
+total-size limits reject unexpectedly broad snapshots before SSH is used.
+
+The project root is not a valid upload working directory by default, including
+when a file source lives directly beneath it. `--allow-project-root` is an
+explicit escape hatch for intentional whole-project scope.
+
 ## Persistence and recovery
 
 The SQLite database under the platform data directory (XDG data on Unix,

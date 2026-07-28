@@ -15,12 +15,22 @@ import (
 	"github.com/wxia529/joyrun/internal/model"
 )
 
-func Build(root, projectRoot string, excludes []string) ([]model.ManifestEntry, []string, error) {
-	patterns := []string{".joyrun/"}
-	patterns = append(patterns, excludes...)
-	patterns = append(patterns, projectIgnorePatterns(projectRoot, root)...)
+type Selection struct {
+	Mode          string
+	Entry         string
+	Include       []string
+	Exclude       []string
+	MaxFiles      int
+	MaxTotalBytes int64
+}
+
+func Build(root string, selection Selection) ([]model.ManifestEntry, []string, error) {
+	if err := validateSelection(selection); err != nil {
+		return nil, nil, err
+	}
 	var entries []model.ManifestEntry
 	var ignored []string
+	var totalBytes int64
 	rootAbsolute, err := filepath.Abs(root)
 	if err != nil {
 		return nil, nil, fault.Wrap("SOURCE_SCAN_FAILED", "cannot resolve manifest root", false, err)
@@ -37,7 +47,7 @@ func Build(root, projectRoot string, excludes []string) ([]model.ManifestEntry, 
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if matches(rel, entry.IsDir(), patterns) {
+		if matches(rel, entry.IsDir(), selection.Exclude) {
 			ignored = append(ignored, rel)
 			if entry.IsDir() {
 				return filepath.SkipDir
@@ -45,6 +55,10 @@ func Build(root, projectRoot string, excludes []string) ([]model.ManifestEntry, 
 			return nil
 		}
 		if entry.IsDir() {
+			return nil
+		}
+		if !selected(rel, selection) {
+			ignored = append(ignored, rel)
 			return nil
 		}
 		info, err := entry.Info()
@@ -63,14 +77,21 @@ func Build(root, projectRoot string, excludes []string) ([]model.ManifestEntry, 
 		} else if !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported special file %s (%s)", rel, info.Mode().Type())
 		}
+		if err := enforceLimits(selection, len(entries)+1, totalBytes+info.Size()); err != nil {
+			return err
+		}
 		hash, err := hashFile(path)
 		if err != nil {
 			return err
 		}
 		entries = append(entries, model.ManifestEntry{Path: rel, Size: info.Size(), SHA256: hash})
+		totalBytes += info.Size()
 		return nil
 	})
 	if err != nil {
+		if code := fault.As(err).Code; code == "UPLOAD_POLICY_EXCEEDED" {
+			return nil, nil, err
+		}
 		return nil, nil, fault.Wrap("SOURCE_SCAN_FAILED", "cannot build input manifest", false, err)
 	}
 	return entries, ignored, nil
@@ -79,16 +100,18 @@ func Build(root, projectRoot string, excludes []string) ([]model.ManifestEntry, 
 // Snapshot copies the included source files into an immutable staging directory
 // and computes the manifest from the bytes written there. The returned cleanup
 // function must be called by the caller.
-func Snapshot(root string, excludes []string) (string, []model.ManifestEntry, []string, func(), error) {
+func Snapshot(root string, selection Selection) (string, []model.ManifestEntry, []string, func(), error) {
+	if err := validateSelection(selection); err != nil {
+		return "", nil, nil, func() {}, err
+	}
 	staging, err := os.MkdirTemp("", "joyrun-snapshot-*")
 	if err != nil {
 		return "", nil, nil, func() {}, fault.Wrap("SOURCE_SNAPSHOT_FAILED", "cannot create input snapshot", false, err)
 	}
 	cleanup := func() { _ = os.RemoveAll(staging) }
-	patterns := []string{".joyrun/"}
-	patterns = append(patterns, excludes...)
 	var entries []model.ManifestEntry
 	var ignored []string
+	var totalBytes int64
 	rootAbsolute, err := filepath.Abs(root)
 	if err != nil {
 		cleanup()
@@ -106,21 +129,25 @@ func Snapshot(root string, excludes []string) (string, []model.ManifestEntry, []
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if matches(rel, entry.IsDir(), patterns) {
+		if matches(rel, entry.IsDir(), selection.Exclude) {
 			ignored = append(ignored, rel)
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		destination := filepath.Join(staging, filepath.FromSlash(rel))
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
 		if entry.IsDir() {
-			return os.MkdirAll(destination, info.Mode().Perm())
+			return nil
 		}
+		if !selected(rel, selection) {
+			ignored = append(ignored, rel)
+			return nil
+		}
+		destination := filepath.Join(staging, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 			return err
 		}
@@ -136,28 +163,77 @@ func Snapshot(root string, excludes []string) (string, []model.ManifestEntry, []
 			if !targetInfo.Mode().IsRegular() {
 				return fmt.Errorf("symbolic link %s must point to a regular file", rel)
 			}
+			if err := enforceLimits(selection, len(entries)+1, totalBytes+targetInfo.Size()); err != nil {
+				return err
+			}
 			size, hash, err := copyAndHash(target, destination, targetInfo.Mode().Perm())
 			if err != nil {
 				return err
 			}
 			entries = append(entries, model.ManifestEntry{Path: rel, Size: size, SHA256: hash})
+			totalBytes += size
 			return nil
 		}
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported special file %s (%s)", rel, info.Mode().Type())
+		}
+		if err := enforceLimits(selection, len(entries)+1, totalBytes+info.Size()); err != nil {
+			return err
 		}
 		size, hash, err := copyAndHash(sourcePath, destination, info.Mode().Perm())
 		if err != nil {
 			return err
 		}
 		entries = append(entries, model.ManifestEntry{Path: rel, Size: size, SHA256: hash})
+		totalBytes += size
 		return nil
 	})
 	if err != nil {
 		cleanup()
+		if code := fault.As(err).Code; code == "UPLOAD_POLICY_EXCEEDED" {
+			return "", nil, nil, func() {}, err
+		}
 		return "", nil, nil, func() {}, fault.Wrap("SOURCE_SNAPSHOT_FAILED", "cannot create input snapshot", false, err)
 	}
 	return staging, entries, ignored, cleanup, nil
+}
+
+func validateSelection(selection Selection) error {
+	if selection.Mode != "entry" {
+		return nil
+	}
+	if selection.Entry == "" {
+		return fault.New("SOURCE_ENTRY_REQUIRED", "entry upload mode requires a concrete source file", false)
+	}
+	if matches(selection.Entry, false, selection.Exclude) {
+		return fault.New("SOURCE_ENTRY_EXCLUDED",
+			fmt.Sprintf("selected input %q is excluded by the upload policy", selection.Entry), false).
+			WithAction("remove the matching push.exclude or .joyrunignore rule")
+	}
+	return nil
+}
+
+func selected(rel string, selection Selection) bool {
+	if selection.Mode == "workdir" {
+		return true
+	}
+	return rel == selection.Entry || matches(rel, false, selection.Include)
+}
+
+func enforceLimits(selection Selection, files int, totalBytes int64) error {
+	if selection.MaxFiles > 0 && files > selection.MaxFiles {
+		return fault.New("UPLOAD_POLICY_EXCEEDED",
+			fmt.Sprintf("upload snapshot selects at least %d files, exceeding max_files=%d",
+				files, selection.MaxFiles), false).
+			WithAction("review `joyrun submit ... --dry-run` and adjust target push.limits.max_files")
+	}
+	if selection.MaxTotalBytes > 0 && totalBytes > selection.MaxTotalBytes {
+		return fault.New("UPLOAD_POLICY_EXCEEDED",
+			fmt.Sprintf("upload snapshot selects at least %d bytes, exceeding max_total_size=%d bytes",
+				totalBytes, selection.MaxTotalBytes), false).
+			WithAction("review `joyrun submit ... --dry-run` and adjust target push.limits.max_total_size")
+	}
+	return nil
 }
 
 func validateFileSymlink(rootAbsolute, sourcePath, rel string) (string, error) {
@@ -185,7 +261,7 @@ func validateFileSymlink(rootAbsolute, sourcePath, rel string) (string, error) {
 }
 
 func ExcludePatterns(projectRoot, workDir string, targetPatterns []string) []string {
-	result := []string{".joyrun/"}
+	result := []string{".joyrun/", ".git/"}
 	result = append(result, targetPatterns...)
 	return append(result, projectIgnorePatterns(projectRoot, workDir)...)
 }
@@ -240,7 +316,8 @@ func matches(path string, isDir bool, patterns []string) bool {
 		pattern = strings.TrimPrefix(pattern, "/")
 		if strings.HasSuffix(pattern, "/") {
 			prefix := strings.TrimSuffix(pattern, "/")
-			if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			if path == prefix || strings.HasPrefix(path, prefix+"/") ||
+				(!strings.Contains(prefix, "/") && containsPathSegment(path, prefix)) {
 				return true
 			}
 			continue
@@ -254,6 +331,15 @@ func matches(path string, isDir bool, patterns []string) bool {
 			}
 		}
 		if isDir && (path == pattern || strings.HasPrefix(path, pattern+"/")) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPathSegment(value, segment string) bool {
+	for _, candidate := range strings.Split(filepath.ToSlash(value), "/") {
+		if candidate == segment {
 			return true
 		}
 	}

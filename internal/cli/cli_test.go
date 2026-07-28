@@ -151,6 +151,8 @@ targets:
     cluster: c
     source:
       kind: directory
+    push:
+      mode: workdir
     script: "true"
 `), 0o600); err != nil {
 		t.Fatal(err)
@@ -187,6 +189,8 @@ targets:
     cluster: c
     source:
       kind: file
+    push:
+      mode: entry
     script: "cp {{ .Input }} result.dat"
 `), 0o600); err != nil {
 		t.Fatal(err)
@@ -205,7 +209,9 @@ targets:
 		ctx: context.Background(), config: configPath,
 		stdout: &stdout, stderr: &stderr,
 	}
-	if err := c.execute("submit", []string{"input.dat", "-t", "c/run", "--dry-run"}); err != nil {
+	if err := c.execute("submit", []string{
+		"input.dat", "-t", "c/run", "--dry-run", "--allow-project-root",
+	}); err != nil {
 		t.Fatalf("dry-run unexpectedly required the task database: %v", err)
 	}
 }

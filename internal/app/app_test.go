@@ -215,7 +215,7 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 						"cpus": {Type: "int", Default: 32},
 					},
 					Script: "orca {{ .Input }} > {{ .Stem }}.out\n",
-					Push:   model.FilePolicy{Exclude: []string{"*.out"}},
+					Push:   model.PushPolicy{Mode: "entry", Exclude: []string{"*.out"}},
 					Pull:   model.FilePolicy{Default: []string{"*.out", "*.gbw"}},
 					Logs:   []string{"{{ .Stem }}.out"},
 				},
@@ -223,7 +223,9 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 		},
 		Store: s, Runner: runner, Transfer: xfer,
 	}
-	result, err := application.Submit(ctx, root, "task01/eg.inp", "gibbs/orca", []string{"cpus=64"})
+	result, err := application.Submit(
+		ctx, root, "task01/eg.inp", "gibbs/orca", []string{"cpus=64"}, false,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,11 +432,12 @@ func TestPreviewRejectsDirectoryForFileTarget(t *testing.T) {
 				Cluster: "mindu",
 				Source:  model.SourcePolicy{Kind: "file", Patterns: []string{"*.gjf"}},
 				Script:  "g16 < {{ .Input }} > {{ .Stem }}.log",
+				Push:    model.PushPolicy{Mode: "entry"},
 			}},
 		},
 		Store: s,
 	}
-	_, _, _, err = application.Preview(ctx, root, "benzene", "mindu/gaussian", nil)
+	_, _, _, err = application.Preview(ctx, root, "benzene", "mindu/gaussian", nil, false)
 	if fault.As(err).Code != "SOURCE_KIND_MISMATCH" {
 		t.Fatalf("expected source kind mismatch, got %v", err)
 	}
@@ -471,6 +474,40 @@ func TestSourceContractRejectsWrongKindAndPattern(t *testing.T) {
 				t.Fatalf("expected %s, got %v", test.code, err)
 			}
 		})
+	}
+}
+
+func TestPreviewRejectsProjectRootWithoutExplicitOverride(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{Config: model.Config{
+		Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		},
+		Targets: map[string]model.Target{
+			"c/run": {
+				Cluster: "c", Source: model.SourcePolicy{Kind: "file"},
+				Push: model.PushPolicy{Mode: "entry"}, Script: "run {{ .Input }}",
+			},
+		},
+	}}
+	if _, _, _, err := application.Preview(
+		ctx, root, "job.inp", "c/run", nil, false,
+	); fault.As(err).Code != "PROJECT_ROOT_UPLOAD_FORBIDDEN" {
+		t.Fatalf("expected project-root upload rejection, got %v", err)
+	}
+	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview.InputManifest) != 1 || preview.InputManifest[0].Path != "job.inp" {
+		t.Fatalf("unexpected explicitly allowed snapshot: %#v", preview.InputManifest)
 	}
 }
 
@@ -584,11 +621,13 @@ func TestDryRunMakesNoTaskRecord(t *testing.T) {
 	application := &App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
-			Targets:  map[string]model.Target{"c/run": {Cluster: "c", Script: "run {{ .Input }}"}},
+			Targets: map[string]model.Target{"c/run": {
+				Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+			}},
 		},
 		Store: s,
 	}
-	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil)
+	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,11 +657,13 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 	application := &App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
-			Targets:  map[string]model.Target{"c/run": {Cluster: "c", Script: "run {{ .Input }}"}},
+			Targets: map[string]model.Target{"c/run": {
+				Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+			}},
 		},
 		Store: s, Runner: runner, Transfer: &fakeTransfer{},
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil)
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, true)
 	if err != nil {
 		t.Fatalf("submission should remain successful after metadata refresh failure: %v", err)
 	}
@@ -676,12 +717,14 @@ func TestSubmitReconcilesAcceptedJobAfterSSHDisconnect(t *testing.T) {
 				"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
 			},
 			Targets: map[string]model.Target{
-				"c/run": {Cluster: "c", Script: "run {{ .Input }}"},
+				"c/run": {
+					Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+				},
 			},
 		},
 		Store: s, Runner: runner, Transfer: &fakeTransfer{},
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil)
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -713,11 +756,13 @@ func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 	application := &App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
-			Targets:  map[string]model.Target{"c/run": {Cluster: "c", Script: "run {{ .Input }}"}},
+			Targets: map[string]model.Target{"c/run": {
+				Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+			}},
 		},
 		Store: s, Runner: &fakeRunner{}, Transfer: xfer,
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil)
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}

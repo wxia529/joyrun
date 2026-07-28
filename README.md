@@ -139,6 +139,11 @@ targets:
       #SBATCH --job-name={{ .Stem }}
       orca {{ .Input }} > {{ .Stem }}.out
     push:
+      mode: entry
+      include: ["*.xyz"]
+      limits:
+        max_files: 20
+        max_total_size: 2GiB
       exclude: ["*.out", "*.gbw"]
     pull:
       default: ["*.out", "*.xyz", "*.gbw"]
@@ -156,6 +161,22 @@ directory submitted to a file target before rendering or creating a task, with
 an actionable command that names the sole matching candidate when possible.
 Every target must declare `source.kind` explicitly. JoyRun does not infer an
 input contract from the script.
+
+Every target must also declare an upload boundary:
+
+- `push.mode: entry` uploads only the selected source file plus files matching
+  `push.include`; it is restricted to `source.kind: file` targets.
+- `push.mode: workdir` uploads the complete source working directory after
+  exclusions.
+
+`push.exclude`, the project `.joyrunignore`, and built-in `.joyrun/` and
+`.git/` rules take precedence over inclusion. Optional
+`push.limits.max_files` and `push.limits.max_total_size` reject unexpectedly
+large snapshots locally. Size values accept units such as `2GB` and `2GiB`.
+
+JoyRun rejects any source whose working directory is the project root. This
+protects agents from accidentally uploading the entire project. Use
+`--allow-project-root` only when that scope is deliberate.
 
 Public template values are:
 
@@ -285,9 +306,14 @@ snapshot, including parameters, manifest, and rendered script.
 queries Slurm for all non-terminal tasks and records observed transitions
 without creating a new calculation.
 
-For a file source, JoyRun uploads the file's entire containing directory.
-For a directory source, it uploads the directory contents. `.joyrunignore`,
-target `push.exclude`, and a built-in `.joyrun/` exclusion control the snapshot.
+The target's `push.mode` determines whether JoyRun uploads only the selected
+file and explicit dependencies or the directory contents. The resulting input
+manifest is frozen in the Task. Preview the exact bounded snapshot before
+submission:
+
+```bash
+joyrun submit task01/eg.inp -t gibbs/orca --dry-run
+```
 
 Default pull patterns come from the task's target snapshot:
 
@@ -390,3 +416,10 @@ See [the v0.1 design notes](docs/design.md) for the state and recovery model.
 Maintainers should complete the
 [real HPC acceptance checklist](docs/acceptance.md) before publishing a
 release.
+
+## License
+
+Copyright 2026 Wanting Xia.
+
+JoyRun is licensed under the
+[Apache License 2.0](LICENSE).

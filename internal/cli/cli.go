@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -237,8 +238,9 @@ func (c *command) target(application *app.App, args []string) error {
 		return fault.New("TARGET_NOT_FOUND", fmt.Sprintf("target %q not found", args[1]), false)
 	}
 	c.write(map[string]any{"name": args[1], "target": target},
-		fmt.Sprintf("Target: %s\nCluster: %s\nSource: %s\nPull: %s\n\nParameters:\n%s",
+		fmt.Sprintf("Target: %s\nCluster: %s\nSource: %s\nPush mode: %s\nPush include: %s\nPull: %s\n\nParameters:\n%s",
 			args[1], target.Cluster, target.Source.Kind,
+			target.Push.Mode, displayList(target.Push.Include),
 			strings.Join(target.Pull.Default, ", "), formatParams(target)))
 	return nil
 }
@@ -248,21 +250,26 @@ func (c *command) submit(application *app.App, args []string) error {
 	var target string
 	var sets stringList
 	var dryRun bool
+	var allowProjectRoot bool
 	flags.StringVar(&target, "target", "", "execution target")
 	flags.StringVar(&target, "t", "", "execution target")
 	flags.Var(&sets, "set", "target parameter key=value")
 	flags.BoolVar(&dryRun, "dry-run", false, "preview without remote changes")
+	flags.BoolVar(&allowProjectRoot, "allow-project-root", false, "explicitly allow uploading from the project root")
 	if err := flags.Parse(interspersed(args,
 		map[string]bool{"--target": true, "-t": true, "--set": true},
-		map[string]bool{"--dry-run": true})); err != nil {
+		map[string]bool{"--dry-run": true, "--allow-project-root": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid submit arguments", false, err)
 	}
 	if flags.NArg() != 1 || target == "" {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun submit <source> -t <target> [--set key=value] [--dry-run]", false)
+		return fault.New("INVALID_ARGUMENT",
+			"usage: joyrun submit <source> -t <target> [--set key=value] [--dry-run] [--allow-project-root]", false)
 	}
 	cwd, _ := os.Getwd()
 	if dryRun {
-		preview, _, _, err := application.Preview(c.ctx, cwd, flags.Arg(0), target, sets)
+		preview, _, _, err := application.Preview(
+			c.ctx, cwd, flags.Arg(0), target, sets, allowProjectRoot,
+		)
 		if err != nil {
 			return err
 		}
@@ -270,7 +277,9 @@ func (c *command) submit(application *app.App, args []string) error {
 		return nil
 	}
 	fmt.Fprintln(c.stderr, "Preparing immutable input snapshot and uploading task...")
-	result, err := application.Submit(c.ctx, cwd, flags.Arg(0), target, sets)
+	result, err := application.Submit(
+		c.ctx, cwd, flags.Arg(0), target, sets, allowProjectRoot,
+	)
 	if err != nil {
 		return err
 	}
@@ -623,7 +632,7 @@ func (c *command) usage() {
 Usage:
   joyrun config <path|init|validate>
   joyrun init [directory]
-  joyrun submit <source> -t <target> [--set key=value] [--dry-run]
+  joyrun submit <source> -t <target> [--set key=value] [--dry-run] [--allow-project-root]
   joyrun status <source|task-id>
   joyrun status --all
   joyrun list [source]
@@ -649,7 +658,7 @@ func (c *command) commandUsage(name string) bool {
 	usage := map[string]string{
 		"config":  "Usage: joyrun config <path|init|validate>\n",
 		"init":    "Usage: joyrun init [directory]\n",
-		"submit":  "Usage: joyrun submit <source> -t <target> [--set key=value] [--dry-run]\n",
+		"submit":  "Usage: joyrun submit <source> -t <target> [--set key=value] [--dry-run] [--allow-project-root]\n",
 		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
 		"list":    "Usage: joyrun list [source]\n",
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
@@ -788,10 +797,12 @@ func formatPreview(preview app.Preview) string {
 	if preview.Source.Entry != nil {
 		entry = *preview.Source.Entry
 	}
-	fmt.Fprintf(&builder, "Task: %s\nTarget: %s\nCluster: %s\nRemote: %s\nScheduler log: %s\n\nSource:\n  Path:     %s\n  Kind:     %s\n  WorkDir:  %s\n  Entry:    %s\n\nTemplate values:\n  Input:    %s\n  Stem:     %s\n  Name:     %s\n  WorkDir:  %s\n\nParameters:\n",
+	fmt.Fprintf(&builder, "Task: %s\nTarget: %s\nCluster: %s\nRemote: %s\nScheduler log: %s\n\nSource:\n  Path:     %s\n  Kind:     %s\n  WorkDir:  %s\n  Entry:    %s\n\nUpload policy:\n  Mode:           %s\n  Include:        %s\n  Max files:      %s\n  Max total size: %s\n\nTemplate values:\n  Input:    %s\n  Stem:     %s\n  Name:     %s\n  WorkDir:  %s\n\nParameters:\n",
 		preview.TaskID, preview.Target, preview.Cluster, preview.RemoteDir,
 		preview.SchedulerLog,
 		preview.Source.RelativePath, preview.Source.Kind, preview.Source.WorkDir, entry,
+		preview.Push.Mode, displayList(preview.Push.Include),
+		displayLimit(preview.Push.Limits.MaxFiles), displayEmpty(preview.Push.Limits.MaxTotalSize),
 		displayEmpty(preview.TemplateValues.Input), displayEmpty(preview.TemplateValues.Stem),
 		displayEmpty(preview.TemplateValues.Name), displayEmpty(preview.TemplateValues.WorkDir))
 	names := make([]string, 0, len(preview.Params))
@@ -823,6 +834,20 @@ func formatPreview(preview app.Preview) string {
 		builder.WriteByte('\n')
 	}
 	return builder.String()
+}
+
+func displayList(values []string) string {
+	if len(values) == 0 {
+		return "<none>"
+	}
+	return strings.Join(values, ", ")
+}
+
+func displayLimit(value int) string {
+	if value == 0 {
+		return "<unlimited>"
+	}
+	return strconv.Itoa(value)
 }
 
 func humanBytes(size int64) string {

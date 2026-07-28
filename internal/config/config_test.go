@@ -42,6 +42,7 @@ targets:
     source:
       kind: file
       patterns: ["*.inp"]
+    push: {mode: entry}
     params:
       cpus:
         type: int
@@ -106,6 +107,7 @@ targets:
   c/run:
     cluster: c
     source: {kind: directory}
+    push: {mode: workdir}
     script: "run {{ .Input }}"
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -140,6 +142,7 @@ targets:
   c/run:
     cluster: c
     source: {kind: either}
+    push: {mode: workdir}
     params:
       mode: {type: string, default: a, choices: [a, b]}
     script: "echo {{ .Params.mode }}"
@@ -182,5 +185,54 @@ targets:
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected control-flow template to be rejected")
+	}
+}
+
+func TestLoadRequiresSafePushMode(t *testing.T) {
+	tests := []struct {
+		name string
+		push string
+	}{
+		{name: "missing", push: ""},
+		{name: "entry with directory source", push: "push: {mode: entry}"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			content := `version: 1
+clusters:
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+targets:
+  c/run:
+    cluster: c
+    source: {kind: directory}
+    ` + test.push + `
+    script: "true"
+`
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected unsafe push policy %q to be rejected", test.name)
+			}
+		})
+	}
+}
+
+func TestParseByteSize(t *testing.T) {
+	tests := map[string]int64{
+		"2GB":    2_000_000_000,
+		"2GiB":   2 * (1 << 30),
+		"512MiB": 512 * (1 << 20),
+	}
+	for raw, expected := range tests {
+		if got, err := ParseByteSize(raw); err != nil || got != expected {
+			t.Fatalf("ParseByteSize(%q) = %d, %v; want %d", raw, got, err, expected)
+		}
+	}
+	for _, raw := range []string{"", "0GB", "-1GB", "1.5GB", "huge"} {
+		if _, err := ParseByteSize(raw); err == nil {
+			t.Fatalf("expected invalid size %q to fail", raw)
+		}
 	}
 }
