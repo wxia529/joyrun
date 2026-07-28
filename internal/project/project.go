@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/wxia529/joyrun/internal/fault"
 	"github.com/wxia529/joyrun/internal/identity"
@@ -13,6 +14,7 @@ import (
 )
 
 const metadataPath = ".joyrun/project.yaml"
+const ignorePath = ".joyrun/.gitignore"
 
 func Init(root string) (model.Project, error) {
 	absolute, err := filepath.Abs(root)
@@ -24,7 +26,14 @@ func Init(root string) (model.Project, error) {
 	}
 	path := filepath.Join(absolute, metadataPath)
 	if _, err := os.Stat(path); err == nil {
-		return Load(absolute)
+		project, err := Load(absolute)
+		if err != nil {
+			return model.Project{}, err
+		}
+		if err := ensureProjectIgnore(absolute); err != nil {
+			return model.Project{}, err
+		}
+		return project, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return model.Project{}, fault.Wrap("PROJECT_INIT_FAILED", "cannot inspect project metadata", false, err)
 	}
@@ -40,10 +49,72 @@ func Init(root string) (model.Project, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return model.Project{}, fault.Wrap("PROJECT_INIT_FAILED", "cannot create .joyrun directory", false, err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := writeNewFileAtomic(path, data, 0o644); err != nil {
 		return model.Project{}, fault.Wrap("PROJECT_INIT_FAILED", "cannot write project metadata", false, err)
 	}
+	if err := ensureProjectIgnore(absolute); err != nil {
+		return model.Project{}, err
+	}
 	return p, nil
+}
+
+func ensureProjectIgnore(root string) error {
+	ignore := filepath.Join(root, ignorePath)
+	data, err := os.ReadFile(ignore)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := writeNewFileAtomic(ignore, []byte("project.yaml\n"), 0o644); err != nil {
+			return fault.Wrap("PROJECT_INIT_FAILED", "cannot write .joyrun/.gitignore", false, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fault.Wrap("PROJECT_INIT_FAILED", "cannot read .joyrun/.gitignore", false, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "project.yaml" {
+			return nil
+		}
+	}
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		data = append(data, '\n')
+	}
+	data = append(data, []byte("project.yaml\n")...)
+	if err := writeNewFileAtomic(ignore, data, 0o644); err != nil {
+		return fault.Wrap("PROJECT_INIT_FAILED", "cannot update .joyrun/.gitignore", false, err)
+	}
+	return nil
+}
+
+func writeNewFileAtomic(path string, data []byte, mode os.FileMode) error {
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempPath := file.Name()
+	keep := true
+	defer func() {
+		_ = file.Close()
+		if keep {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Chmod(mode); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	keep = false
+	return nil
 }
 
 func Discover(start string) (model.Project, error) {

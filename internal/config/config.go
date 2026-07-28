@@ -2,9 +2,12 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	pathpkg "path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -18,10 +21,71 @@ import (
 
 var paramName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+const starter = `# JoyRun user configuration.
+# Add clusters and execution targets, then run:
+#   joyrun config validate
+#   joyrun doctor <target>
+#
+# Example:
+# clusters:
+#   mycluster:
+#     host: mycluster
+#     scheduler: slurm
+#     remote_root: /scratch/your-user/joyrun
+#     transfer: auto
+#
+# targets:
+#   mycluster/program:
+#     cluster: mycluster
+#     source:
+#       kind: file
+#       patterns: ["*.inp"]
+#     script: |
+#       #!/bin/bash
+#       #SBATCH --job-name={{ .Stem }}
+#       program {{ .Input }} > {{ .Stem }}.out
+#     pull:
+#       default: ["*.out"]
+version: 1
+
+clusters: {}
+targets: {}
+`
+
+func Init(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fault.Wrap("CONFIG_INIT_FAILED", "cannot create JoyRun configuration directory", false, err)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return fault.New("CONFIG_EXISTS", fmt.Sprintf("configuration already exists at %s", path), false).
+			WithAction("edit the existing file or select another path with --config")
+	}
+	if err != nil {
+		return fault.Wrap("CONFIG_INIT_FAILED", fmt.Sprintf("cannot create configuration %s", path), false, err)
+	}
+	if _, err := file.WriteString(starter); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return fault.Wrap("CONFIG_INIT_FAILED", "cannot write starter configuration", false, err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return fault.Wrap("CONFIG_INIT_FAILED", "cannot finalize starter configuration", false, err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return fault.Wrap("CONFIG_INIT_FAILED", "cannot close starter configuration", false, err)
+	}
+	return nil
+}
+
 func Load(path string) (model.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return model.Config{}, fault.Wrap("CONFIG_NOT_FOUND", fmt.Sprintf("cannot read config %s", path), false, err)
+		return model.Config{}, fault.Wrap("CONFIG_NOT_FOUND", fmt.Sprintf("cannot read config %s", path), false, err).
+			WithAction("run `joyrun config init` or select a configuration with --config")
 	}
 	var cfg model.Config
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
@@ -191,7 +255,14 @@ func convert(kind, raw string) (any, error) {
 	case "int":
 		return strconv.ParseInt(raw, 10, 64)
 	case "float":
-		return strconv.ParseFloat(raw, 64)
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, err
+		}
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, fmt.Errorf("float must be finite")
+		}
+		return value, nil
 	case "bool":
 		return strconv.ParseBool(raw)
 	default:

@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pkg/sftp"
 	"github.com/wxia529/joyrun/internal/fault"
@@ -119,7 +120,9 @@ func (s *SFTP) push(ctx context.Context, client *sftp.Client, localDir, remoteDi
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("unsupported staged file %s (%s)", rel, info.Mode().Type())
 		}
-		if err := uploadFile(client, localPath, remotePath, info.Mode().Perm()); err != nil {
+		reportProgress(s.Stderr, "Uploading", rel, info.Size())
+		if err := uploadFile(client, localPath, remotePath, info.Mode().Perm(),
+			s.Stderr, rel, info.Size()); err != nil {
 			return fmt.Errorf("upload %s: %w", rel, err)
 		}
 		return nil
@@ -136,7 +139,14 @@ func (s *SFTP) push(ctx context.Context, client *sftp.Client, localDir, remoteDi
 	return nil
 }
 
-func uploadFile(client *sftp.Client, localPath, remotePath string, mode os.FileMode) error {
+func uploadFile(
+	client *sftp.Client,
+	localPath, remotePath string,
+	mode os.FileMode,
+	progress io.Writer,
+	relative string,
+	size int64,
+) error {
 	input, err := os.Open(localPath)
 	if err != nil {
 		return err
@@ -147,7 +157,7 @@ func uploadFile(client *sftp.Client, localPath, remotePath string, mode os.FileM
 	if err != nil {
 		return err
 	}
-	_, copyErr := output.ReadFrom(input)
+	_, copyErr := io.Copy(output, newProgressReader(input, progress, "Uploading", relative, size))
 	chmodErr := output.Chmod(mode)
 	closeErr := output.Close()
 	if copyErr != nil {
@@ -192,14 +202,15 @@ func (s *SFTP) pull(ctx context.Context, client *sftp.Client, remoteDir, localDi
 		if err != nil {
 			return fault.Wrap("PULL_FAILED", "unsafe remote file path", false, err)
 		}
-		if err := downloadFile(client, path.Join(remoteDir, rel), filepath.Join(localDir, filepath.FromSlash(rel))); err != nil {
+		if err := downloadFile(client, path.Join(remoteDir, rel),
+			filepath.Join(localDir, filepath.FromSlash(rel)), s.Stderr, rel); err != nil {
 			return fault.Wrap("PULL_FAILED", "SFTP download failed for "+rel, true, err)
 		}
 	}
 	return nil
 }
 
-func downloadFile(client *sftp.Client, remotePath, localPath string) error {
+func downloadFile(client *sftp.Client, remotePath, localPath string, progress io.Writer, relative string) error {
 	input, err := client.Open(remotePath)
 	if err != nil {
 		return err
@@ -212,6 +223,7 @@ func downloadFile(client *sftp.Client, remotePath, localPath string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("remote path is not a regular file: %s", remotePath)
 	}
+	reportProgress(progress, "Downloading", relative, info.Size())
 	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 		return err
 	}
@@ -227,7 +239,8 @@ func downloadFile(client *sftp.Client, remotePath, localPath string) error {
 			_ = os.Remove(tempPath)
 		}
 	}()
-	if _, err := input.WriteTo(output); err != nil {
+	if _, err := io.Copy(output,
+		newProgressReader(input, progress, "Downloading", relative, info.Size())); err != nil {
 		return err
 	}
 	if err := output.Sync(); err != nil {
@@ -244,6 +257,68 @@ func downloadFile(client *sftp.Client, remotePath, localPath string) error {
 	}
 	keepTemp = false
 	return nil
+}
+
+func reportProgress(writer io.Writer, action, relative string, size int64) {
+	if writer == nil {
+		return
+	}
+	fmt.Fprintf(writer, "%s %s (%s)\n", action, relative, byteSize(size))
+}
+
+type progressReader struct {
+	reader      io.Reader
+	writer      io.Writer
+	action      string
+	relative    string
+	total       int64
+	transferred int64
+	nextReport  int64
+	lastReport  time.Time
+}
+
+func newProgressReader(
+	reader io.Reader,
+	writer io.Writer,
+	action, relative string,
+	total int64,
+) io.Reader {
+	if writer == nil || total < 1024*1024 {
+		return reader
+	}
+	return &progressReader{
+		reader: reader, writer: writer, action: action, relative: relative,
+		total: total, nextReport: 16 * 1024 * 1024, lastReport: time.Now(),
+	}
+}
+
+func (r *progressReader) Read(buffer []byte) (int, error) {
+	count, err := r.reader.Read(buffer)
+	r.transferred += int64(count)
+	now := time.Now()
+	done := err == io.EOF || r.transferred >= r.total
+	if done || r.transferred >= r.nextReport || now.Sub(r.lastReport) >= 2*time.Second {
+		percent := 100 * float64(r.transferred) / float64(r.total)
+		fmt.Fprintf(r.writer, "%s %s: %s / %s (%.0f%%)\n",
+			r.action, r.relative, byteSize(r.transferred), byteSize(r.total), percent)
+		r.nextReport = r.transferred + 16*1024*1024
+		r.lastReport = now
+	}
+	return count, err
+}
+
+func byteSize(size int64) string {
+	if size < 1024 {
+		return fmt.Sprintf("%d B", size)
+	}
+	value := float64(size)
+	for _, unit := range []string{"KiB", "MiB", "GiB", "TiB"} {
+		value /= 1024
+		if value < 1024 || unit == "TiB" {
+			return fmt.Sprintf("%.1f %s", value, unit)
+		}
+	}
+	panic("unreachable")
 }
 
 func cleanRelative(value string) (string, error) {

@@ -39,18 +39,29 @@ JoyRun does not interpret results, modify inputs, restart failed calculations,
 build workflow DAGs, or expose a general-purpose remote shell. It has no
 required daemon: remote actions occur only when a JoyRun command is run.
 
-## Build
+## Install and build
 
-JoyRun requires Go 1.24 or later at build time and the OpenSSH `ssh` command
-at runtime. On Linux and macOS, `rsync` is preferred when it is available on
-both the local and remote systems. Native Windows uses SFTP over the bundled
-OpenSSH client and does not require WSL, Cygwin, MSYS2, or rsync.
+Download a platform archive and `SHA256SUMS` from the
+[GitHub releases page](https://github.com/wxia529/joyrun/releases), or install
+from source with Go 1.24 or later:
+
+```bash
+go install github.com/wxia529/joyrun/cmd/joyrun@latest
+```
+
+JoyRun requires the OpenSSH `ssh` command at runtime. On Linux and macOS,
+`rsync` is preferred when it is available on both the local and remote
+systems. Native Windows uses SFTP over the bundled OpenSSH client and does not
+require WSL, Cygwin, MSYS2, or rsync.
+
+To build or install a checkout:
 
 ```bash
 git clone git@github.com:wxia529/joyrun.git
 cd joyrun
 make build
 ./bin/joyrun version
+sudo make install
 ```
 
 Cross-compile a native Windows binary from Linux or macOS with:
@@ -61,7 +72,20 @@ GOOS=windows GOARCH=amd64 go build -trimpath -o joyrun.exe ./cmd/joyrun
 
 ## Configure
 
-Copy [the example configuration](examples/config.yaml) to:
+Find or create the user configuration without manually locating a
+platform-specific directory:
+
+```bash
+joyrun config path
+joyrun config init
+joyrun config validate
+```
+
+`config init` refuses to overwrite an existing file. It creates a commented,
+valid starter at the path printed by `config path`.
+
+Alternatively, copy [the complete example configuration](examples/config.yaml)
+to:
 
 ```text
 ~/.config/joyrun/config.yaml
@@ -165,9 +189,11 @@ cd my-project
 joyrun init
 ```
 
-This creates `.joyrun/project.yaml` with a stable Project ID. The global SQLite
-database uses that ID plus source-relative paths, so moving the entire project
-does not break task lookup.
+This creates `.joyrun/project.yaml` with a stable Project ID and a
+`.joyrun/.gitignore` that keeps the machine-local identity out of Git. The
+global SQLite database uses that ID plus source-relative paths, so moving the
+entire project does not break task lookup while a fresh Git clone receives a
+new identity when initialized.
 
 Preview performs local validation and makes no SSH connection or database task
 record:
@@ -185,6 +211,9 @@ script containing empty `.Input` or `.Stem` values.
 
 ```bash
 joyrun init [directory]
+joyrun config path
+joyrun config init
+joyrun config validate
 joyrun target list
 joyrun target show gibbs/orca
 joyrun doctor gibbs/orca
@@ -196,7 +225,10 @@ joyrun list [task01/eg.inp]
 joyrun inspect jr_TASK_ID
 joyrun inspect jr_TASK_ID --events
 joyrun logs task01/eg.inp --lines 200
+joyrun logs jr_TASK_ID --file alternate.log
+joyrun files jr_TASK_ID
 joyrun pull task01/eg.inp
+joyrun pull jr_TASK_ID --dry-run
 joyrun cancel jr_TASK_ID
 ```
 
@@ -205,6 +237,8 @@ first reads the first configured application log that exists, then falls back
 to this scheduler log. For tasks created by older JoyRun versions it also
 checks `slurm-<jobid>.out`. If no candidate exists yet, the retryable
 `LOG_NOT_READY` error lists every checked path.
+Use `--file PATH` to select a specific log relative to the remote task work
+directory.
 
 `doctor` reports checks as `PASS`, `WARN`, or `FAIL`. A missing `remote_root`
 whose nearest existing ancestor is writable is a non-blocking warning because
@@ -234,6 +268,12 @@ For example, a completed calculation whose download failed remains
 `compute_state=completed` and becomes `pull_state=failed`. Retry
 `pull`; do not recompute it.
 
+Status also records the raw Slurm state, elapsed time, start/end timestamps,
+pending/failure reason, and exit code when Slurm provides them. Human output
+exposes these fields directly; JSON includes `scheduler_state`,
+`scheduler_reason`, `elapsed`, `exit_code`, `scheduler_start`, and
+`scheduler_end`.
+
 `pull_state` describes only the latest requested pull operation. It does not
 claim that every remote file still exists or that every scientifically
 important file has been downloaded.
@@ -252,10 +292,20 @@ target `push.exclude`, and a built-in `.joyrun/` exclusion control the snapshot.
 Default pull patterns come from the task's target snapshot:
 
 ```bash
+joyrun files jr_TASK_ID
+joyrun pull jr_TASK_ID --dry-run
 joyrun pull task01/eg.inp
 joyrun pull task01/eg.inp --include "*.out" --include "*.xyz"
 joyrun pull task01/eg.inp --all
 ```
+
+`files` lists remote paths, sizes, and which paths were submitted inputs.
+`pull --dry-run` applies the real pull policy and input protection, validates
+the local destination, and reports the exact files and total bytes without
+transferring them or changing `pull_state`.
+
+If no remote files match, JoyRun returns `NO_FILES_MATCHED` instead of
+recording an empty pull as successful.
 
 Files present in the submitted input manifest are protected even with `--all`.
 Use `--overwrite-inputs` explicitly to replace them. Output files may be
@@ -295,6 +345,8 @@ Failure:
 ```
 
 Progress and diagnostics use stderr and never contaminate JSON stdout.
+Snapshot preparation and transfers report their current phase there. rsync
+uses aggregate byte progress; SFTP reports each file and its size.
 
 ## Data and recovery
 
@@ -308,7 +360,7 @@ or `~/.local/share/joyrun/joyrun.db` when `XDG_DATA_HOME` is unset.
 `JOYRUN_DB` can override it.
 
 The current database format is explicitly development-only. Its metadata is
-marked `release_channel=development` and `schema_label=dev-1`. JoyRun rejects
+marked `release_channel=development` and `schema_label=dev-3`. JoyRun rejects
 older or differently marked databases instead of migrating them.
 
 On Windows the defaults are:
@@ -323,10 +375,18 @@ case-insensitive collisions such as `A.out` and `a.out` rather than silently
 overwriting data.
 
 Every remote task contains a `metadata.json` recovery snapshot. If the local
-database is lost, recover a known task ID with:
+database is lost, discover matching remote metadata for the current Project ID
+and Target, then recover a selected task:
 
 ```bash
+joyrun recover --scan -t gibbs/orca
 joyrun recover jr_TASK_ID -t gibbs/orca
 ```
 
+Recovery scanning does not require a usable local task database and never
+imports tasks automatically.
+
 See [the v0.1 design notes](docs/design.md) for the state and recovery model.
+Maintainers should complete the
+[real HPC acceptance checklist](docs/acceptance.md) before publishing a
+release.

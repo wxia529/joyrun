@@ -18,7 +18,7 @@ type Rsync struct {
 }
 
 func (r Rsync) Push(ctx context.Context, host, localDir, remoteDir string, excludes []string) error {
-	args := []string{"-az", "--partial", "--protect-args"}
+	args := []string{"-az", "--partial", "--protect-args", "--info=progress2"}
 	for _, pattern := range excludes {
 		args = append(args, "--exclude", pattern)
 	}
@@ -45,7 +45,7 @@ func (r Rsync) Pull(ctx context.Context, host, remoteDir, localDir string, files
 	if err := temp.Close(); err != nil {
 		return fault.Wrap("PULL_FAILED", "cannot finalize pull file list", false, err)
 	}
-	args := []string{"-az", "--partial", "--protect-args", "--from0", "--files-from", name,
+	args := []string{"-az", "--partial", "--protect-args", "--info=progress2", "--from0", "--files-from", name,
 		host + ":" + strings.TrimSuffix(remoteDir, "/") + "/", filepath.Clean(localDir) + string(filepath.Separator)}
 	return r.run(ctx, "PULL_FAILED", "rsync pull failed", args, nil)
 }
@@ -53,6 +53,7 @@ func (r Rsync) Pull(ctx context.Context, host, remoteDir, localDir string, files
 func (r Rsync) run(ctx context.Context, code, message string, args []string, stdin io.Reader) error {
 	cmd := exec.CommandContext(ctx, "rsync", args...)
 	cmd.Stdin = stdin
+	cmd.Stdout = r.Stderr
 	var stderr bytes.Buffer
 	if r.Stderr != nil {
 		cmd.Stderr = io.MultiWriter(&stderr, r.Stderr)

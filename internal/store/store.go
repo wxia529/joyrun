@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	schemaVersion = 1
+	schemaVersion = 3
 	schemaChannel = "development"
-	schemaLabel   = "dev-1"
+	schemaLabel   = "dev-3"
 )
 
 type Store struct {
@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS joyrun_meta (
 );
 INSERT OR IGNORE INTO joyrun_meta(key,value) VALUES
   ('release_channel','development'),
-  ('schema_label','dev-1');
+  ('schema_label','dev-3');
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   last_path TEXT NOT NULL,
@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL,
   project_id TEXT NOT NULL,
   source_path TEXT NOT NULL,
   source_workdir TEXT NOT NULL,
@@ -161,6 +162,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   compute_state TEXT NOT NULL,
   pull_state TEXT NOT NULL,
   scheduler_state TEXT NOT NULL DEFAULT '',
+  scheduler_reason TEXT NOT NULL DEFAULT '',
+  elapsed TEXT NOT NULL DEFAULT '',
+  exit_code TEXT NOT NULL DEFAULT '',
+  scheduler_start TEXT NOT NULL DEFAULT '',
+  scheduler_end TEXT NOT NULL DEFAULT '',
   resolved_params TEXT NOT NULL,
   rendered_script TEXT NOT NULL,
   target_hash TEXT NOT NULL,
@@ -201,13 +207,16 @@ ON CONFLICT(id) DO UPDATE SET last_path=excluded.last_path,updated_at=excluded.u
 	return nil
 }
 
-func (s *Store) CreateTask(ctx context.Context, task model.Task) error {
+func (s *Store) CreateTask(ctx context.Context, task *model.Task) error {
+	if task.Revision == 0 {
+		task.Revision = 1
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fault.Wrap("DATABASE_BUSY", "cannot begin task transaction", true, err)
 	}
 	defer tx.Rollback()
-	if err := insertTask(ctx, tx, task); err != nil {
+	if err := insertTask(ctx, tx, *task); err != nil {
 		return err
 	}
 	event := model.TaskEvent{
@@ -223,18 +232,21 @@ func (s *Store) CreateTask(ctx context.Context, task model.Task) error {
 	return nil
 }
 
-func (s *Store) ImportTask(ctx context.Context, task model.Task) error {
+func (s *Store) ImportTask(ctx context.Context, task *model.Task) error {
 	if _, err := s.GetTask(ctx, task.ID); err == nil {
 		return fault.New("TASK_ALREADY_EXISTS", fmt.Sprintf("task %s already exists", task.ID), false)
 	} else if fault.As(err).Code != "TASK_NOT_FOUND" {
 		return err
+	}
+	if task.Revision == 0 {
+		task.Revision = 1
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fault.Wrap("DATABASE_BUSY", "cannot begin task import", true, err)
 	}
 	defer tx.Rollback()
-	if err := insertTask(ctx, tx, task); err != nil {
+	if err := insertTask(ctx, tx, *task); err != nil {
 		return err
 	}
 	if err := insertEvent(ctx, tx, model.TaskEvent{
@@ -249,11 +261,11 @@ func (s *Store) ImportTask(ctx context.Context, task model.Task) error {
 	return nil
 }
 
-func (s *Store) UpdateTask(ctx context.Context, task model.Task) error {
+func (s *Store) UpdateTask(ctx context.Context, task *model.Task) error {
 	return s.updateTask(ctx, task, nil)
 }
 
-func (s *Store) UpdateTaskWithEvent(ctx context.Context, task model.Task, event model.TaskEvent) error {
+func (s *Store) UpdateTaskWithEvent(ctx context.Context, task *model.Task, event model.TaskEvent) error {
 	if event.TaskID == "" {
 		event.TaskID = task.ID
 	}
@@ -263,30 +275,38 @@ func (s *Store) UpdateTaskWithEvent(ctx context.Context, task model.Task, event 
 	return s.updateTask(ctx, task, &event)
 }
 
-func (s *Store) updateTask(ctx context.Context, task model.Task, event *model.TaskEvent) error {
+func (s *Store) updateTask(ctx context.Context, task *model.Task, event *model.TaskEvent) error {
+	if task.Revision < 1 {
+		return fault.New("DATABASE_CONFLICT", "task has no persistence revision", true)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fault.Wrap("DATABASE_BUSY", "cannot begin task update", true, err)
 	}
 	defer tx.Rollback()
-	values, err := encodeTask(task)
+	updated := *task
+	updated.Revision++
+	values, err := encodeTask(updated)
 	if err != nil {
 		return err
 	}
-	values = append(values[1:], task.ID)
+	values = append(values[1:], task.ID, task.Revision)
 	result, err := tx.ExecContext(ctx, `
 UPDATE tasks SET
- project_id=?,source_path=?,source_workdir=?,source_entry=?,target_name=?,cluster_name=?,remote_dir=?,
- scheduler_id=?,compute_state=?,pull_state=?,scheduler_state=?,resolved_params=?,rendered_script=?,
+ revision=?,project_id=?,source_path=?,source_workdir=?,source_entry=?,target_name=?,cluster_name=?,remote_dir=?,
+ scheduler_id=?,compute_state=?,pull_state=?,scheduler_state=?,scheduler_reason=?,elapsed=?,exit_code=?,
+ scheduler_start=?,scheduler_end=?,
+ resolved_params=?,rendered_script=?,
  target_hash=?,input_manifest=?,pull_patterns=?,push_excludes=?,logs=?,metadata=?,created_at=?,
  submitted_at=?,updated_at=?,pulled_at=?
-WHERE id=?`, values...)
+WHERE id=? AND revision=?`, values...)
 	if err != nil {
 		return fault.Wrap("DATABASE_FAILED", "cannot update task record", true, err)
 	}
 	count, _ := result.RowsAffected()
 	if count == 0 {
-		return fault.New("TASK_NOT_FOUND", fmt.Sprintf("task %s not found", task.ID), false)
+		return fault.New("DATABASE_CONFLICT",
+			fmt.Sprintf("task %s changed in another JoyRun process; reload it and retry", task.ID), true)
 	}
 	if event != nil {
 		if err := insertEvent(ctx, tx, *event); err != nil {
@@ -296,6 +316,7 @@ WHERE id=?`, values...)
 	if err := tx.Commit(); err != nil {
 		return fault.Wrap("DATABASE_FAILED", "cannot commit task update", true, err)
 	}
+	task.Revision = updated.Revision
 	return nil
 }
 
@@ -401,8 +422,9 @@ FROM task_events WHERE task_id=? ORDER BY id`, taskID)
 	return events, nil
 }
 
-const columns = `id,project_id,source_path,source_workdir,source_entry,target_name,cluster_name,
-remote_dir,scheduler_id,compute_state,pull_state,scheduler_state,resolved_params,rendered_script,
+const columns = `id,revision,project_id,source_path,source_workdir,source_entry,target_name,cluster_name,
+remote_dir,scheduler_id,compute_state,pull_state,scheduler_state,scheduler_reason,elapsed,exit_code,
+scheduler_start,scheduler_end,resolved_params,rendered_script,
 target_hash,input_manifest,pull_patterns,push_excludes,logs,metadata,created_at,submitted_at,
 updated_at,pulled_at`
 
@@ -421,11 +443,12 @@ func insertTask(ctx context.Context, exec sqlExecutor, task model.Task) error {
 	}
 	_, err = exec.ExecContext(ctx, `
 INSERT INTO tasks(
- id,project_id,source_path,source_workdir,source_entry,target_name,cluster_name,remote_dir,
- scheduler_id,compute_state,pull_state,scheduler_state,resolved_params,rendered_script,target_hash,
+ id,revision,project_id,source_path,source_workdir,source_entry,target_name,cluster_name,remote_dir,
+ scheduler_id,compute_state,pull_state,scheduler_state,scheduler_reason,elapsed,exit_code,
+ scheduler_start,scheduler_end,resolved_params,rendered_script,target_hash,
  input_manifest,pull_patterns,push_excludes,logs,metadata,created_at,submitted_at,updated_at,
  pulled_at
-) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, values...)
+) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, values...)
 	if err != nil {
 		return fault.Wrap("DATABASE_FAILED", "cannot create task record", true, err)
 	}
@@ -452,9 +475,10 @@ func scanTask(row scanner) (model.Task, error) {
 	var entry, submitted, pulled sql.NullString
 	var params, manifest, pull, push, logs, metadata string
 	var created, updated string
-	err := row.Scan(&task.ID, &task.ProjectID, &task.SourcePath, &task.SourceWorkDir, &entry,
+	err := row.Scan(&task.ID, &task.Revision, &task.ProjectID, &task.SourcePath, &task.SourceWorkDir, &entry,
 		&task.TargetName, &task.ClusterName, &task.RemoteDir, &task.SchedulerID,
-		&task.ComputeState, &task.PullState, &task.SchedulerState, &params,
+		&task.ComputeState, &task.PullState, &task.SchedulerState, &task.SchedulerReason,
+		&task.Elapsed, &task.ExitCode, &task.SchedulerStart, &task.SchedulerEnd, &params,
 		&task.RenderedScript, &task.TargetHash, &manifest, &pull, &push, &logs,
 		&metadata, &created, &submitted, &updated, &pulled)
 	if err != nil {
@@ -527,9 +551,11 @@ func encodeTask(task model.Task) ([]any, error) {
 		pulled = task.PulledAt.UTC().Format(time.RFC3339Nano)
 	}
 	return []any{
-		task.ID, task.ProjectID, task.SourcePath, task.SourceWorkDir, entry, task.TargetName,
+		task.ID, task.Revision, task.ProjectID, task.SourcePath, task.SourceWorkDir, entry, task.TargetName,
 		task.ClusterName, task.RemoteDir, task.SchedulerID, task.ComputeState, task.PullState,
-		task.SchedulerState, string(params), task.RenderedScript, task.TargetHash, string(manifest),
+		task.SchedulerState, task.SchedulerReason, task.Elapsed, task.ExitCode,
+		task.SchedulerStart, task.SchedulerEnd,
+		string(params), task.RenderedScript, task.TargetHash, string(manifest),
 		string(pull), string(push), string(logs), string(metadata),
 		task.CreatedAt.UTC().Format(time.RFC3339Nano), submitted,
 		task.UpdatedAt.UTC().Format(time.RFC3339Nano), pulled,

@@ -4,7 +4,29 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/wxia529/joyrun/internal/fault"
 )
+
+func TestInitCreatesValidStarterAndRefusesOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
+	if err := Init(path); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Clusters) != 0 || len(cfg.Targets) != 0 {
+		t.Fatalf("starter configuration is not empty: %#v", cfg)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("unexpected starter permissions: info=%v err=%v", info, err)
+	}
+	if err := Init(path); fault.As(err).Code != "CONFIG_EXISTS" {
+		t.Fatalf("expected existing configuration rejection, got %v", err)
+	}
+}
 
 func TestLoadAndResolveParams(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -134,6 +156,14 @@ targets:
 	}
 	if _, _, err := ResolveParams(cfg.Targets["c/run"], []string{"mode=x"}); err == nil {
 		t.Fatal("expected invalid choice error")
+	}
+}
+
+func TestFloatParamsMustBeFinite(t *testing.T) {
+	for _, value := range []string{"NaN", "+Inf", "-Inf"} {
+		if _, err := convert("float", value); err == nil {
+			t.Fatalf("expected non-finite float %q to be rejected", value)
+		}
 	}
 }
 

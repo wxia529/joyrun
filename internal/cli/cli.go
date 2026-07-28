@@ -34,13 +34,35 @@ type command struct {
 func Run(ctx context.Context, args []string, version string) int {
 	c := &command{ctx: ctx, version: version, stdout: os.Stdout, stderr: os.Stderr, config: paths.ConfigFile()}
 	args = c.extractGlobals(args)
-	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+	if len(args) == 0 || (len(args) == 1 && (args[0] == "help" || args[0] == "--help" || args[0] == "-h")) {
 		c.usage()
+		return 0
+	}
+	if args[0] == "help" {
+		if len(args) != 2 {
+			c.writeError(fault.New("INVALID_ARGUMENT", "usage: joyrun help <command>", false))
+			return 1
+		}
+		if !c.commandUsage(args[1]) {
+			c.writeError(fault.New("UNKNOWN_COMMAND", fmt.Sprintf("unknown command %q", args[1]), false))
+			return 1
+		}
+		return 0
+	}
+	if len(args) >= 2 && (containsFlag(args[1:], "--help") || containsFlag(args[1:], "-h")) {
+		if !c.commandUsage(args[0]) {
+			c.writeError(fault.New("UNKNOWN_COMMAND", fmt.Sprintf("unknown command %q", args[0]), false))
+			return 1
+		}
 		return 0
 	}
 	if args[0] == "version" || args[0] == "--version" {
 		c.write(map[string]any{"version": version}, "joyrun "+version+"\n")
 		return 0
+	}
+	if !knownCommand(args[0]) {
+		c.writeError(fault.New("UNKNOWN_COMMAND", fmt.Sprintf("unknown command %q", args[0]), false))
+		return 1
 	}
 	if err := c.execute(args[0], args[1:]); err != nil {
 		c.writeError(err)
@@ -74,12 +96,15 @@ func (c *command) extractGlobals(args []string) []string {
 }
 
 func (c *command) execute(name string, args []string) error {
-	db, err := store.Open(paths.DatabaseFile())
-	if err != nil {
-		return err
+	if name == "config" {
+		return c.configure(args)
 	}
-	defer db.Close()
 	if name == "init" {
+		db, err := store.Open(paths.DatabaseFile())
+		if err != nil {
+			return err
+		}
+		defer db.Close()
 		return c.init(db, args)
 	}
 	cfg, err := config.Load(c.config)
@@ -88,12 +113,28 @@ func (c *command) execute(name string, args []string) error {
 	}
 	runner := remote.SSH{Stderr: c.stderr}
 	application := &app.App{
-		Config: cfg, Store: db, Runner: runner,
+		Config: cfg, Runner: runner,
 		Transfer: transfer.Manager{Stderr: c.stderr, Runner: runner},
 	}
-	switch name {
-	case "target":
+	if name == "target" {
 		return c.target(application, args)
+	}
+	if name == "doctor" {
+		return c.doctor(application, args)
+	}
+	if name == "submit" && containsFlag(args, "--dry-run") {
+		return c.submit(application, args)
+	}
+	if name == "recover" && containsFlag(args, "--scan") {
+		return c.recover(application, args)
+	}
+	db, err := store.Open(paths.DatabaseFile())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	application.Store = db
+	switch name {
 	case "submit":
 		return c.submit(application, args)
 	case "status":
@@ -104,16 +145,47 @@ func (c *command) execute(name string, args []string) error {
 		return c.inspect(application, args)
 	case "logs":
 		return c.logs(application, args)
+	case "files":
+		return c.files(application, args)
 	case "cancel":
 		return c.cancel(application, args)
 	case "pull":
 		return c.pull(application, args)
-	case "doctor":
-		return c.doctor(application, args)
 	case "recover":
 		return c.recover(application, args)
 	default:
 		return fault.New("UNKNOWN_COMMAND", fmt.Sprintf("unknown command %q", name), false)
+	}
+}
+
+func (c *command) configure(args []string) error {
+	if len(args) != 1 {
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun config <path|init|validate>", false)
+	}
+	switch args[0] {
+	case "path":
+		c.write(map[string]string{"path": c.config}, c.config+"\n")
+		return nil
+	case "init":
+		if err := config.Init(c.config); err != nil {
+			return err
+		}
+		c.write(map[string]string{"path": c.config},
+			"Created JoyRun configuration at "+c.config+"\n")
+		return nil
+	case "validate":
+		cfg, err := config.Load(c.config)
+		if err != nil {
+			return err
+		}
+		result := map[string]any{
+			"path": c.config, "clusters": len(cfg.Clusters), "targets": len(cfg.Targets),
+		}
+		c.write(result, fmt.Sprintf("Valid JoyRun configuration: %s (%d cluster(s), %d target(s))\n",
+			c.config, len(cfg.Clusters), len(cfg.Targets)))
+		return nil
+	default:
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun config <path|init|validate>", false)
 	}
 }
 
@@ -147,6 +219,11 @@ func (c *command) target(application *app.App, args []string) error {
 			c.write(map[string]any{"targets": names}, "")
 			return nil
 		}
+		if len(names) == 0 {
+			fmt.Fprintln(c.stdout, "No targets configured.")
+			return nil
+		}
+		fmt.Fprintf(c.stdout, "%-28s %s\n", "TARGET", "CLUSTER")
 		for _, name := range names {
 			fmt.Fprintf(c.stdout, "%-28s %s\n", name, application.Config.Targets[name].Cluster)
 		}
@@ -192,11 +269,12 @@ func (c *command) submit(application *app.App, args []string) error {
 		c.write(preview, formatPreview(preview))
 		return nil
 	}
+	fmt.Fprintln(c.stderr, "Preparing immutable input snapshot and uploading task...")
 	result, err := application.Submit(c.ctx, cwd, flags.Arg(0), target, sets)
 	if err != nil {
 		return err
 	}
-	c.write(result, formatTask(result.Task))
+	c.write(result, "Submitted "+formatTask(result.Task))
 	return nil
 }
 
@@ -223,12 +301,17 @@ func (c *command) status(application *app.App, args []string) error {
 				"failures": failures,
 			}, "")
 		} else {
+			if len(result.Tasks) == 0 && len(result.Failures) == 0 {
+				fmt.Fprintln(c.stdout, "No tasks.")
+			} else if len(result.Tasks) > 0 {
+				fmt.Fprint(c.stdout, taskHeader())
+			}
 			for _, task := range result.Tasks {
 				fmt.Fprint(c.stdout, formatTask(task))
 			}
 			for _, failure := range result.Failures {
-				fmt.Fprintf(c.stderr, "Error [%s] %s: %s\n",
-					failure.Error.Code, failure.TaskID, failure.Error.Error())
+				fmt.Fprintf(c.stderr, "Task %s:\n", failure.TaskID)
+				c.writeError(failure.Error)
 			}
 		}
 		if len(result.Failures) > 0 {
@@ -266,6 +349,11 @@ func (c *command) list(application *app.App, args []string) error {
 		c.write(map[string]any{"tasks": summarizeTasks(tasks)}, "")
 		return nil
 	}
+	if len(tasks) == 0 {
+		fmt.Fprintln(c.stdout, "No tasks.")
+		return nil
+	}
+	fmt.Fprint(c.stdout, taskHeader())
 	for _, task := range tasks {
 		fmt.Fprint(c.stdout, formatTask(task))
 	}
@@ -312,20 +400,54 @@ func (c *command) inspect(application *app.App, args []string) error {
 func (c *command) logs(application *app.App, args []string) error {
 	flags := newFlags("logs", c.stderr)
 	lines := 100
+	var file string
 	flags.IntVar(&lines, "lines", 100, "number of lines")
+	flags.StringVar(&file, "file", "", "specific remote log path")
 	if err := flags.Parse(interspersed(args,
-		map[string]bool{"--lines": true}, map[string]bool{})); err != nil {
+		map[string]bool{"--lines": true, "--file": true}, map[string]bool{})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid logs arguments", false, err)
 	}
 	if flags.NArg() != 1 || lines < 1 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun logs <source|task-id> [--lines N]", false)
+		return fault.New("INVALID_ARGUMENT",
+			"usage: joyrun logs <source|task-id> [--lines N] [--file PATH]", false)
 	}
 	cwd, _ := os.Getwd()
-	result, err := application.Logs(c.ctx, cwd, flags.Arg(0), lines)
+	result, err := application.Logs(c.ctx, cwd, flags.Arg(0), lines, file)
 	if err != nil {
 		return err
 	}
 	c.write(result, result.Content)
+	return nil
+}
+
+func (c *command) files(application *app.App, args []string) error {
+	if len(args) != 1 {
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun files <source|task-id>", false)
+	}
+	cwd, _ := os.Getwd()
+	files, err := application.RemoteFiles(c.ctx, cwd, args[0])
+	if err != nil {
+		return err
+	}
+	if c.json {
+		c.write(map[string]any{"files": files}, "")
+		return nil
+	}
+	if len(files) == 0 {
+		fmt.Fprintln(c.stdout, "No remote files.")
+		return nil
+	}
+	var total int64
+	fmt.Fprintf(c.stdout, "%10s  %-6s  %s\n", "SIZE", "INPUT", "PATH")
+	for _, file := range files {
+		total += file.Size
+		input := ""
+		if file.Input {
+			input = "yes"
+		}
+		fmt.Fprintf(c.stdout, "%10s  %-6s  %s\n", humanBytes(file.Size), input, file.Path)
+	}
+	fmt.Fprintf(c.stdout, "\n%d file(s), %s total\n", len(files), humanBytes(total))
 	return nil
 }
 
@@ -349,23 +471,42 @@ func (c *command) pull(application *app.App, args []string) error {
 	flags.BoolVar(&options.All, "all", false, "pull all generated files")
 	flags.BoolVar(&options.OverwriteInputs, "overwrite-inputs", false, "allow submitted inputs to be overwritten")
 	flags.BoolVar(&options.Live, "live", false, "pull files while task is not complete")
+	flags.BoolVar(&options.DryRun, "dry-run", false, "preview selected files without downloading")
 	flags.Var(&includes, "include", "include glob (repeatable)")
 	if err := flags.Parse(interspersed(args,
 		map[string]bool{"--include": true},
-		map[string]bool{"--all": true, "--overwrite-inputs": true, "--live": true})); err != nil {
+		map[string]bool{"--all": true, "--overwrite-inputs": true, "--live": true, "--dry-run": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid pull arguments", false, err)
 	}
 	if flags.NArg() != 1 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun pull <source|task-id> [--all|--include glob] [--live]", false)
+		return fault.New("INVALID_ARGUMENT",
+			"usage: joyrun pull <source|task-id> [--all|--include glob] [--live] [--dry-run]", false)
 	}
 	if options.All && len(includes) > 0 {
 		return fault.New("INVALID_ARGUMENT", "--all and --include are mutually exclusive", false)
 	}
 	options.Include = includes
 	cwd, _ := os.Getwd()
+	if options.DryRun {
+		fmt.Fprintln(c.stderr, "Selecting remote files without downloading...")
+	} else {
+		fmt.Fprintln(c.stderr, "Selecting and pulling remote files...")
+	}
 	result, err := application.Pull(c.ctx, cwd, flags.Arg(0), options)
 	if err != nil {
 		return err
+	}
+	if result.DryRun {
+		if c.json {
+			c.write(result, "")
+			return nil
+		}
+		fmt.Fprintf(c.stdout, "Would pull %d file(s), %s, to %s:\n",
+			len(result.Files), humanBytes(result.TotalBytes), result.Destination)
+		for _, file := range result.Files {
+			fmt.Fprintln(c.stdout, "  "+file)
+		}
+		return nil
 	}
 	c.write(result, fmt.Sprintf("Pulled %d file(s) to %s\n", len(result.Files), result.Destination))
 	return nil
@@ -398,16 +539,44 @@ func (c *command) doctor(application *app.App, args []string) error {
 func (c *command) recover(application *app.App, args []string) error {
 	flags := newFlags("recover", c.stderr)
 	var target string
+	var scan bool
 	flags.StringVar(&target, "target", "", "execution target")
 	flags.StringVar(&target, "t", "", "execution target")
+	flags.BoolVar(&scan, "scan", false, "list recoverable tasks for the current project")
 	if err := flags.Parse(interspersed(args,
-		map[string]bool{"--target": true, "-t": true}, map[string]bool{})); err != nil {
+		map[string]bool{"--target": true, "-t": true}, map[string]bool{"--scan": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid recover arguments", false, err)
 	}
-	if flags.NArg() != 1 || target == "" {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun recover <task-id> -t <target>", false)
-	}
 	cwd, _ := os.Getwd()
+	if scan {
+		if flags.NArg() != 0 || target == "" {
+			return fault.New("INVALID_ARGUMENT", "usage: joyrun recover --scan -t <target>", false)
+		}
+		candidates, err := application.RecoveryCandidates(c.ctx, cwd, target)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			c.write(map[string]any{"candidates": candidates}, "")
+			return nil
+		}
+		if len(candidates) == 0 {
+			fmt.Fprintln(c.stdout, "No recoverable tasks found for this project and target.")
+			return nil
+		}
+		fmt.Fprintf(c.stdout, "%-29s %-18s %-20s %s\n", "TASK", "COMPUTE", "UPDATED", "SOURCE")
+		for _, candidate := range candidates {
+			fmt.Fprintf(c.stdout, "%-29s %-18s %-20s %s\n",
+				candidate.TaskID, candidate.ComputeState,
+				candidate.UpdatedAt.Local().Format("2006-01-02 15:04:05"),
+				candidate.SourcePath)
+		}
+		return nil
+	}
+	if flags.NArg() != 1 || target == "" {
+		return fault.New("INVALID_ARGUMENT",
+			"usage: joyrun recover <task-id> -t <target> | joyrun recover --scan -t <target>", false)
+	}
 	task, err := application.Recover(c.ctx, cwd, flags.Arg(0), target)
 	if err != nil {
 		return err
@@ -433,12 +602,26 @@ func (c *command) writeError(err error) {
 		return
 	}
 	fmt.Fprintf(c.stderr, "Error [%s]: %s\n", typed.Code, typed.Error())
+	if typed.Stage != "" {
+		fmt.Fprintf(c.stderr, "Stage: %s\n", typed.Stage)
+	}
+	if typed.ComputeState != "" || typed.PullState != "" {
+		fmt.Fprintf(c.stderr, "State: compute=%s pull=%s\n",
+			displayEmpty(typed.ComputeState), displayEmpty(typed.PullState))
+	}
+	if typed.Retryable {
+		fmt.Fprintln(c.stderr, "Retryable: yes")
+	}
+	if typed.SuggestedAction != "" {
+		fmt.Fprintf(c.stderr, "Next: %s\n", typed.SuggestedAction)
+	}
 }
 
 func (c *command) usage() {
 	fmt.Fprint(c.stdout, `JoyRun — a local-first remote task runner for HPC
 
 Usage:
+  joyrun config <path|init|validate>
   joyrun init [directory]
   joyrun submit <source> -t <target> [--set key=value] [--dry-run]
   joyrun status <source|task-id>
@@ -446,18 +629,63 @@ Usage:
   joyrun list [source]
   joyrun inspect <source|task-id>
   joyrun inspect <source|task-id> --events
-  joyrun logs <source|task-id> [--lines N]
-  joyrun pull <source|task-id> [--all|--include glob] [--live]
+  joyrun logs <source|task-id> [--lines N] [--file PATH]
+  joyrun files <source|task-id>
+  joyrun pull <source|task-id> [--all|--include glob] [--live] [--dry-run]
   joyrun cancel <task-id>
   joyrun target list
   joyrun target show <target>
   joyrun doctor <target>
   joyrun recover <task-id> -t <target>
+  joyrun recover --scan -t <target>
 
 Global options:
   --json           emit machine-readable JSON only on stdout
   --config PATH    use a specific config file
 `)
+}
+
+func (c *command) commandUsage(name string) bool {
+	usage := map[string]string{
+		"config":  "Usage: joyrun config <path|init|validate>\n",
+		"init":    "Usage: joyrun init [directory]\n",
+		"submit":  "Usage: joyrun submit <source> -t <target> [--set key=value] [--dry-run]\n",
+		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
+		"list":    "Usage: joyrun list [source]\n",
+		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
+		"logs":    "Usage: joyrun logs <source|task-id> [--lines N] [--file PATH]\n",
+		"files":   "Usage: joyrun files <source|task-id>\n",
+		"pull":    "Usage: joyrun pull <source|task-id> [--all|--include glob] [--live] [--dry-run]\n",
+		"cancel":  "Usage: joyrun cancel <task-id>\n",
+		"target":  "Usage: joyrun target <list|show TARGET>\n",
+		"doctor":  "Usage: joyrun doctor <target>\n",
+		"recover": "Usage: joyrun recover <task-id> -t <target> | joyrun recover --scan -t <target>\n",
+		"version": "Usage: joyrun version\n",
+	}
+	text, ok := usage[name]
+	if ok {
+		fmt.Fprint(c.stdout, text)
+	}
+	return ok
+}
+
+func knownCommand(name string) bool {
+	switch name {
+	case "config", "init", "submit", "status", "list", "inspect", "logs",
+		"files", "pull", "cancel", "target", "doctor", "recover":
+		return true
+	default:
+		return false
+	}
+}
+
+func containsFlag(args []string, name string) bool {
+	for _, value := range args {
+		if value == name {
+			return true
+		}
+	}
+	return false
 }
 
 func newFlags(name string, stderr io.Writer) *flag.FlagSet {
@@ -479,9 +707,27 @@ func formatTask(task model.Task) string {
 	if task.SchedulerID != "" {
 		scheduler = " slurm:" + task.SchedulerID
 	}
-	return fmt.Sprintf("%s  compute:%-17s pull:%-15s %s  %s%s\n",
+	detail := ""
+	if task.SchedulerState != "" && !strings.EqualFold(task.SchedulerState, task.ComputeState) {
+		detail += " state:" + task.SchedulerState
+	}
+	if task.Elapsed != "" {
+		detail += " elapsed:" + task.Elapsed
+	}
+	if task.ExitCode != "" {
+		detail += " exit:" + task.ExitCode
+	}
+	if task.SchedulerReason != "" && task.SchedulerReason != "None" {
+		detail += " reason:" + task.SchedulerReason
+	}
+	return fmt.Sprintf("%s  compute:%-17s pull:%-15s %s  %s%s%s\n",
 		task.ID, strings.ToUpper(task.ComputeState), strings.ToUpper(task.PullState),
-		task.TargetName, task.SourcePath, scheduler)
+		task.TargetName, task.SourcePath, scheduler, detail)
+}
+
+func taskHeader() string {
+	return fmt.Sprintf("%-29s %-19s %-17s %-24s %s\n",
+		"TASK", "COMPUTE", "PULL", "TARGET", "SOURCE")
 }
 
 func formatInspect(task model.Task) string {
@@ -490,6 +736,14 @@ func formatInspect(task model.Task) string {
 		task.ID, task.ProjectID, task.SourcePath, task.TargetName, task.ClusterName)
 	fmt.Fprintf(&builder, "Compute state: %s\nPull state:    %s\nScheduler:     %s\nRemote:        %s\n",
 		task.ComputeState, task.PullState, task.SchedulerID, task.RemoteDir)
+	if task.SchedulerState != "" || task.SchedulerReason != "" ||
+		task.Elapsed != "" || task.ExitCode != "" ||
+		task.SchedulerStart != "" || task.SchedulerEnd != "" {
+		fmt.Fprintf(&builder, "Slurm state:   %s\nReason:        %s\nElapsed:       %s\nExit code:     %s\nStarted:       %s\nEnded:         %s\n",
+			displayEmpty(task.SchedulerState), displayEmpty(task.SchedulerReason),
+			displayEmpty(task.Elapsed), displayEmpty(task.ExitCode),
+			displayEmpty(task.SchedulerStart), displayEmpty(task.SchedulerEnd))
+	}
 	fmt.Fprintf(&builder, "Created:       %s\nUpdated:       %s\n\nRendered script:\n%s",
 		task.CreatedAt.Local().Format(time.RFC3339), task.UpdatedAt.Local().Format(time.RFC3339),
 		task.RenderedScript)
@@ -548,9 +802,20 @@ func formatPreview(preview app.Preview) string {
 	for _, name := range names {
 		fmt.Fprintf(&builder, "  %-20s %v (%s)\n", name, preview.Params[name], preview.ParamSources[name])
 	}
-	builder.WriteString("\nUpload snapshot:\n")
-	for _, file := range preview.Files {
-		builder.WriteString("  " + file + "\n")
+	var total int64
+	for _, file := range preview.InputManifest {
+		total += file.Size
+	}
+	fmt.Fprintf(&builder, "\nUpload snapshot: %d file(s), %s\n",
+		len(preview.InputManifest), humanBytes(total))
+	for _, file := range preview.InputManifest {
+		fmt.Fprintf(&builder, "  %10s  %s\n", humanBytes(file.Size), file.Path)
+	}
+	if len(preview.Ignored) > 0 {
+		fmt.Fprintf(&builder, "\nIgnored: %d path(s)\n", len(preview.Ignored))
+		for _, file := range preview.Ignored {
+			builder.WriteString("  " + file + "\n")
+		}
 	}
 	builder.WriteString("\nRendered script:\n")
 	builder.WriteString(preview.RenderedScript)
@@ -558,6 +823,22 @@ func formatPreview(preview app.Preview) string {
 		builder.WriteByte('\n')
 	}
 	return builder.String()
+}
+
+func humanBytes(size int64) string {
+	const unit = int64(1024)
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	value := float64(size)
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	for _, name := range units {
+		value /= 1024
+		if value < 1024 || name == units[len(units)-1] {
+			return fmt.Sprintf("%.1f %s", value, name)
+		}
+	}
+	panic("unreachable")
 }
 
 func displayEmpty(value string) string {

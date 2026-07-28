@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,12 +72,21 @@ type PullOptions struct {
 	Include         []string
 	OverwriteInputs bool
 	Live            bool
+	DryRun          bool
 }
 
 type PullResult struct {
 	Task        model.Task `json:"task"`
 	Files       []string   `json:"files"`
 	Destination string     `json:"destination"`
+	TotalBytes  int64      `json:"total_bytes"`
+	DryRun      bool       `json:"dry_run"`
+}
+
+type RemoteFile struct {
+	Path  string `json:"path"`
+	Size  int64  `json:"size"`
+	Input bool   `json:"input"`
 }
 
 type LogResult struct {
@@ -115,6 +125,13 @@ type DoctorResult struct {
 	Checks []DoctorCheck `json:"checks"`
 }
 
+type RecoveryCandidate struct {
+	TaskID       string    `json:"task_id"`
+	SourcePath   string    `json:"source_path"`
+	ComputeState string    `json:"compute_state"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 func (a *App) Close() error {
 	if a.Store != nil {
 		return a.Store.Close()
@@ -134,11 +151,17 @@ func (a *App) InitProject(ctx context.Context, root string) (model.Project, erro
 }
 
 func (a *App) Preview(ctx context.Context, cwd, sourcePath, targetName string, sets []string) (Preview, model.Task, string, error) {
+	return a.prepare(ctx, cwd, sourcePath, targetName, sets, true)
+}
+
+func (a *App) prepare(
+	ctx context.Context,
+	cwd, sourcePath, targetName string,
+	sets []string,
+	scanManifest bool,
+) (Preview, model.Task, string, error) {
 	p, err := project.Discover(cwd)
 	if err != nil {
-		return Preview{}, model.Task{}, "", err
-	}
-	if err := a.Store.BindProject(ctx, p); err != nil {
 		return Preview{}, model.Task{}, "", err
 	}
 	src, localWorkDir, err := source.Resolve(p, resolveFrom(cwd, sourcePath))
@@ -168,9 +191,13 @@ func (a *App) Preview(ctx context.Context, cwd, sourcePath, targetName string, s
 	if err != nil {
 		return Preview{}, model.Task{}, "", err
 	}
-	inputManifest, ignored, err := manifest.Build(localWorkDir, p.Root, target.Push.Exclude)
-	if err != nil {
-		return Preview{}, model.Task{}, "", err
+	var inputManifest []model.ManifestEntry
+	var ignored []string
+	if scanManifest {
+		inputManifest, ignored, err = manifest.Build(localWorkDir, p.Root, target.Push.Exclude)
+		if err != nil {
+			return Preview{}, model.Task{}, "", err
+		}
 	}
 	files := make([]string, 0, len(inputManifest))
 	for _, entry := range inputManifest {
@@ -193,7 +220,8 @@ func (a *App) Preview(ctx context.Context, cwd, sourcePath, targetName string, s
 		RenderedScript: script, TargetHash: jtemplate.TargetHash(target), InputManifest: inputManifest,
 		PullPatterns: append([]string{}, target.Pull.Default...),
 		PushExcludes: manifest.ExcludePatterns(p.Root, localWorkDir, target.Push.Exclude),
-		Logs:         logs, CreatedAt: now, UpdatedAt: now,
+		Logs:         logs, Metadata: map[string]string{"recovery_format": "1"},
+		CreatedAt: now, UpdatedAt: now,
 	}
 	preview := Preview{
 		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster,
@@ -267,8 +295,15 @@ func singleSourceCandidate(workDir string, patterns []string) string {
 }
 
 func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, sets []string) (SubmitResult, error) {
-	_, task, localWorkDir, err := a.Preview(ctx, cwd, sourcePath, targetName, sets)
+	_, task, localWorkDir, err := a.prepare(ctx, cwd, sourcePath, targetName, sets, false)
 	if err != nil {
+		return SubmitResult{}, err
+	}
+	p, err := project.Discover(cwd)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	if err := a.Store.BindProject(ctx, p); err != nil {
 		return SubmitResult{}, err
 	}
 	snapshotDir, inputManifest, _, cleanup, err := manifest.Snapshot(localWorkDir, task.PushExcludes)
@@ -277,13 +312,13 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 	}
 	defer cleanup()
 	task.InputManifest = inputManifest
-	if err := a.Store.CreateTask(ctx, task); err != nil {
+	if err := a.Store.CreateTask(ctx, &task); err != nil {
 		return SubmitResult{}, err
 	}
 	cluster := a.Config.Clusters[task.ClusterName]
 	workDir := path.Join(task.RemoteDir, "work")
 	task.UpdatedAt = time.Now().UTC()
-	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "UPLOAD_STARTED", "upload",
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "UPLOAD_STARTED", "upload",
 		"Uploading immutable input snapshot", nil)); err != nil {
 		return SubmitResult{}, err
 	}
@@ -304,7 +339,7 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 			"cannot upload rendered job script", true, err)
 	}
 	task.UpdatedAt = time.Now().UTC()
-	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "UPLOAD_COMPLETED", "upload",
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "UPLOAD_COMPLETED", "upload",
 		"Input snapshot and rendered script uploaded", nil)); err != nil {
 		return SubmitResult{}, err
 	}
@@ -313,23 +348,23 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 		return SubmitResult{}, err
 	}
 	slurm := scheduler.Slurm{Runner: a.Runner}
-	schedulerID, err := slurm.Submit(ctx, cluster.Host, workDir)
+	schedulerID, err := slurm.Submit(ctx, cluster.Host, workDir, task.ID)
 	if err != nil {
 		// Submission may have succeeded even if the SSH connection dropped before
-		// stdout arrived. The remote scheduler_id marker resolves that ambiguity.
-		data, recoveryErr := remote.ReadFile(ctx, a.Runner, cluster.Host, path.Join(task.RemoteDir, "scheduler_id"))
-		if recoveryErr != nil || strings.TrimSpace(string(data)) == "" {
+		// stdout arrived. Recover from the marker or the immutable Slurm comment.
+		recoveredID, recoveryErr := a.recoverSchedulerID(ctx, cluster, task)
+		if recoveryErr != nil || recoveredID == "" {
 			return SubmitResult{}, a.failSubmission(ctx, &task, "SUBMIT_FAILED", "submit",
 				"cannot submit task to Slurm", true, err)
 		}
-		schedulerID = strings.TrimSpace(string(data))
+		schedulerID = recoveredID
 	}
 	now := time.Now().UTC()
 	task.SchedulerID = schedulerID
 	task.ComputeState = model.ComputeQueued
 	task.SubmittedAt = &now
 	task.UpdatedAt = now
-	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "SCHEDULER_ACCEPTED", "submit",
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "SCHEDULER_ACCEPTED", "submit",
 		"Scheduler accepted task", map[string]string{"scheduler_id": schedulerID})); err != nil {
 		// The scheduler accepted the job. Preserve the complete recovery record
 		// remotely even when local persistence is unavailable.
@@ -342,7 +377,7 @@ func (a *App) Submit(ctx context.Context, cwd, sourcePath, targetName string, se
 		}
 		task.Metadata["remote_metadata_error"] = err.Error()
 		task.UpdatedAt = time.Now().UTC()
-		_ = a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "REMOTE_METADATA_WARNING", "recovery",
+		_ = a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "REMOTE_METADATA_WARNING", "recovery",
 			"Scheduler accepted task but metadata refresh failed", map[string]string{"error": err.Error()}))
 	}
 	return SubmitResult{Task: task}, nil
@@ -442,49 +477,108 @@ func (a *App) refreshTask(ctx context.Context, task model.Task) (model.Task, err
 				task.ComputeState, task.PullState)
 	}
 	if task.SchedulerID == "" {
-		marker, err := remote.ReadFile(ctx, a.Runner, cluster.Host, path.Join(task.RemoteDir, "scheduler_id"))
-		if err != nil || strings.TrimSpace(string(marker)) == "" {
+		schedulerID, err := a.recoverSchedulerID(ctx, cluster, task)
+		if err != nil {
+			return task, fault.As(err).
+				WithTask("status", "joyrun status "+task.ID, task.ComputeState, task.PullState)
+		}
+		if schedulerID == "" {
 			return task, nil
 		}
-		task.SchedulerID = strings.TrimSpace(string(marker))
+		task.SchedulerID = schedulerID
 		task.ComputeState = model.ComputeQueued
 		task.UpdatedAt = time.Now().UTC()
-		if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "SCHEDULER_ID_RECOVERED",
-			"status", "Recovered scheduler ID from remote marker",
+		if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "SCHEDULER_ID_RECOVERED",
+			"status", "Recovered scheduler ID from remote marker or Slurm task comment",
 			map[string]string{"scheduler_id": task.SchedulerID})); err != nil {
 			return task, err
 		}
 	}
-	state, raw, err := (scheduler.Slurm{Runner: a.Runner}).Status(ctx, cluster.Host, task.SchedulerID)
+	status, err := (scheduler.Slurm{Runner: a.Runner}).Status(ctx, cluster.Host, task.SchedulerID)
 	if err != nil {
 		return task, fault.As(err).
 			WithTask("status", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 	}
 	previousCompute := task.ComputeState
 	previousRaw := task.SchedulerState
-	if terminalComputeState(previousCompute) && !terminalComputeState(state) {
+	previousReason, previousElapsed, previousExitCode :=
+		task.SchedulerReason, task.Elapsed, task.ExitCode
+	previousStart, previousEnd := task.SchedulerStart, task.SchedulerEnd
+	if terminalComputeState(previousCompute) && !terminalComputeState(status.State) {
 		// A scheduler may purge old accounting records. Never erase a terminal
 		// state that JoyRun has already observed.
-		state = previousCompute
+		status.State = previousCompute
+		if status.RawState == "" {
+			status.RawState = previousRaw
+			status.Reason = previousReason
+			status.Elapsed = previousElapsed
+			status.ExitCode = previousExitCode
+			status.Start = previousStart
+			status.End = previousEnd
+		}
 	}
-	task.ComputeState = state
-	task.SchedulerState = raw
+	task.ComputeState = status.State
+	task.SchedulerState = status.RawState
+	task.SchedulerReason = status.Reason
+	task.Elapsed = status.Elapsed
+	task.ExitCode = status.ExitCode
+	task.SchedulerStart = status.Start
+	task.SchedulerEnd = status.End
 	if previousCompute == task.ComputeState &&
-		previousRaw == task.SchedulerState {
+		previousRaw == task.SchedulerState &&
+		previousReason == task.SchedulerReason &&
+		previousExitCode == task.ExitCode &&
+		previousStart == task.SchedulerStart &&
+		previousEnd == task.SchedulerEnd {
+		// Elapsed time changes on every poll. Return the fresh value without
+		// creating a database revision and lifecycle event for a timer tick.
 		return task, nil
 	}
 	task.UpdatedAt = time.Now().UTC()
-	event := taskEvent(task, "COMPUTE_STATE_CHANGED", "status",
-		"Scheduler state refreshed", map[string]string{
+	eventType := "SCHEDULER_STATUS_CHANGED"
+	eventMessage := "Scheduler diagnostics refreshed"
+	if previousCompute != task.ComputeState || previousRaw != task.SchedulerState {
+		eventType = "COMPUTE_STATE_CHANGED"
+		eventMessage = "Scheduler state refreshed"
+	}
+	event := taskEvent(task, eventType, "status",
+		eventMessage, map[string]string{
 			"previous_compute_state": previousCompute,
 			"compute_state":          task.ComputeState,
 			"scheduler_state":        task.SchedulerState,
+			"scheduler_reason":       task.SchedulerReason,
+			"elapsed":                task.Elapsed,
+			"exit_code":              task.ExitCode,
+			"scheduler_start":        task.SchedulerStart,
+			"scheduler_end":          task.SchedulerEnd,
 		})
-	if err := a.Store.UpdateTaskWithEvent(ctx, task, event); err != nil {
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, event); err != nil {
 		return task, err
 	}
 	_ = a.writeMetadata(ctx, cluster, task)
 	return task, nil
+}
+
+func (a *App) recoverSchedulerID(
+	ctx context.Context,
+	cluster model.Cluster,
+	task model.Task,
+) (string, error) {
+	marker, markerErr := remote.ReadFile(ctx, a.Runner, cluster.Host,
+		path.Join(task.RemoteDir, "scheduler_id"))
+	if markerErr == nil {
+		if id := strings.TrimSpace(string(marker)); id != "" {
+			if _, err := strconv.ParseUint(id, 10, 64); err == nil {
+				return id, nil
+			}
+		}
+	}
+	id, err := (scheduler.Slurm{Runner: a.Runner}).FindByTaskID(
+		ctx, cluster.Host, task.ID, task.CreatedAt.Add(-time.Minute))
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func (a *App) Cancel(ctx context.Context, cwd, identifier string) (model.Task, error) {
@@ -518,7 +612,7 @@ func (a *App) Cancel(ctx context.Context, cwd, identifier string) (model.Task, e
 	}
 	task.Metadata["cancel_requested_at"] = time.Now().UTC().Format(time.RFC3339Nano)
 	task.UpdatedAt = time.Now().UTC()
-	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "CANCEL_ACCEPTED", "cancel",
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "CANCEL_ACCEPTED", "cancel",
 		"Scheduler accepted cancellation request; run status to observe the terminal state", nil)); err != nil {
 		return task, err
 	}
@@ -526,26 +620,40 @@ func (a *App) Cancel(ctx context.Context, cwd, identifier string) (model.Task, e
 	return task, nil
 }
 
-func (a *App) Logs(ctx context.Context, cwd, identifier string, lines int) (LogResult, error) {
+func (a *App) Logs(ctx context.Context, cwd, identifier string, lines int, requested string) (LogResult, error) {
 	task, _, err := a.ResolveTask(ctx, cwd, identifier)
 	if err != nil {
 		return LogResult{}, err
 	}
-	cluster := a.Config.Clusters[task.ClusterName]
+	cluster, ok := a.Config.Clusters[task.ClusterName]
+	if !ok {
+		return LogResult{}, fault.New("CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false).
+			WithTask("logs", "restore cluster configuration, then run joyrun logs "+task.ID,
+				task.ComputeState, task.PullState)
+	}
 	type candidate struct {
 		path string
 		kind string
 	}
 	var candidates []candidate
-	for _, logPath := range task.Logs {
-		if logPath != "" {
-			candidates = append(candidates, candidate{path: logPath, kind: "application"})
+	if requested != "" {
+		if !safeTaskRelative(requested, true) {
+			return LogResult{}, fault.New("INVALID_ARGUMENT",
+				"log path must be relative to the remote task work directory", false)
 		}
-	}
-	if task.SchedulerID != "" {
-		candidates = append(candidates,
-			candidate{path: scheduler.LogName(task.SchedulerID), kind: "scheduler"},
-			candidate{path: "slurm-" + task.SchedulerID + ".out", kind: "scheduler_legacy"})
+		candidates = append(candidates, candidate{path: requested, kind: "requested"})
+	} else {
+		for _, logPath := range task.Logs {
+			if logPath != "" {
+				candidates = append(candidates, candidate{path: logPath, kind: "application"})
+			}
+		}
+		if task.SchedulerID != "" {
+			candidates = append(candidates,
+				candidate{path: scheduler.LogName(task.SchedulerID), kind: "scheduler"},
+				candidate{path: "slurm-" + task.SchedulerID + ".out", kind: "scheduler_legacy"})
+		}
 	}
 	checked := make([]string, 0, len(candidates))
 	workDir := path.Join(task.RemoteDir, "work")
@@ -600,10 +708,14 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 			fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false)
 	}
 	workDir := path.Join(task.RemoteDir, "work")
-	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, "cd "+remote.Quote(workDir)+" && find . -type f -printf '%P\\0'", nil)
+	remoteFiles, err := a.listRemoteFiles(ctx, cluster, workDir)
 	if err != nil {
-		return PullResult{}, a.failPull(ctx, &task, "list",
-			message("cannot list remote task files", stderr), err)
+		if options.DryRun {
+			return PullResult{}, fault.As(err).
+				WithTask("pull", "joyrun pull "+task.ID+" --dry-run",
+					task.ComputeState, task.PullState)
+		}
+		return PullResult{}, a.failPull(ctx, &task, "list", "cannot list remote task files", err)
 	}
 	patterns := task.PullPatterns
 	if len(options.Include) > 0 {
@@ -614,8 +726,9 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 		inputs[entry.Path] = true
 	}
 	var files []string
-	for _, file := range strings.Split(stdout, "\x00") {
-		file = filepath.ToSlash(file)
+	var totalBytes int64
+	for _, remoteFile := range remoteFiles {
+		file := filepath.ToSlash(remoteFile.Path)
 		if file == "" || file == "joyrun-job.sh" {
 			continue
 		}
@@ -626,16 +739,29 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 			continue
 		}
 		files = append(files, file)
+		totalBytes += remoteFile.Size
 	}
 	sort.Strings(files)
-	if err := localfs.ValidatePullPaths(files); err != nil {
+	if len(files) == 0 {
+		return PullResult{}, fault.New("NO_FILES_MATCHED",
+			"no remote files matched the requested pull policy", false).
+			WithTask("pull", "adjust --include or use --all for task "+task.ID,
+				task.ComputeState, task.PullState)
+	}
+	destination := filepath.Join(p.Root, filepath.FromSlash(task.SourceWorkDir))
+	if err := localfs.ValidatePullDestination(destination, files); err != nil {
 		return PullResult{}, fault.As(err).
 			WithTask("pull", "joyrun inspect "+task.ID, task.ComputeState, task.PullState)
 	}
-	destination := filepath.Join(p.Root, filepath.FromSlash(task.SourceWorkDir))
+	if options.DryRun {
+		return PullResult{
+			Task: task, Files: files, Destination: destination,
+			TotalBytes: totalBytes, DryRun: true,
+		}, nil
+	}
 	task.PullState = model.PullInProgress
 	task.UpdatedAt = time.Now().UTC()
-	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "PULL_STARTED", "pull",
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "PULL_STARTED", "pull",
 		"Selected file transfer started", map[string]string{"destination": destination})); err != nil {
 		return PullResult{}, err
 	}
@@ -649,12 +775,82 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	} else {
 		task.PullState = model.PullPartial
 	}
-	if err := a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(task, "PULL_COMPLETED", "pull",
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "PULL_COMPLETED", "pull",
 		"Selected file transfer completed", map[string]string{"files": fmt.Sprintf("%d", len(files))})); err != nil {
 		return PullResult{}, err
 	}
 	_ = a.writeMetadata(ctx, cluster, task)
-	return PullResult{Task: task, Files: files, Destination: destination}, nil
+	return PullResult{
+		Task: task, Files: files, Destination: destination,
+		TotalBytes: totalBytes,
+	}, nil
+}
+
+func (a *App) RemoteFiles(ctx context.Context, cwd, identifier string) ([]RemoteFile, error) {
+	task, _, err := a.ResolveTask(ctx, cwd, identifier)
+	if err != nil {
+		return nil, err
+	}
+	cluster, ok := a.Config.Clusters[task.ClusterName]
+	if !ok {
+		return nil, fault.New("CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false).
+			WithTask("files", "restore cluster configuration, then run joyrun files "+task.ID,
+				task.ComputeState, task.PullState)
+	}
+	files, err := a.listRemoteFiles(ctx, cluster, path.Join(task.RemoteDir, "work"))
+	if err != nil {
+		return nil, fault.As(err).
+			WithTask("files", "joyrun files "+task.ID, task.ComputeState, task.PullState)
+	}
+	inputs := make(map[string]bool, len(task.InputManifest))
+	for _, entry := range task.InputManifest {
+		inputs[entry.Path] = true
+	}
+	result := make([]RemoteFile, 0, len(files))
+	for _, file := range files {
+		if file.Path == "joyrun-job.sh" {
+			continue
+		}
+		file.Input = inputs[file.Path]
+		result = append(result, file)
+	}
+	return result, nil
+}
+
+func (a *App) listRemoteFiles(
+	ctx context.Context,
+	cluster model.Cluster,
+	workDir string,
+) ([]RemoteFile, error) {
+	command := "cd " + remote.Quote(workDir) + " && find . -type f -printf '%P\\0%s\\0'"
+	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
+	if err != nil {
+		return nil, fault.Wrap("REMOTE_LIST_FAILED",
+			message("cannot list remote task files", stderr), true, err)
+	}
+	records := strings.Split(stdout, "\x00")
+	var files []RemoteFile
+	for index := 0; index < len(records); {
+		name := records[index]
+		index++
+		if name == "" {
+			continue
+		}
+		var size int64
+		if index < len(records) && records[index] != "" {
+			rawSize := records[index]
+			index++
+			size, err = strconv.ParseInt(rawSize, 10, 64)
+			if err != nil || size < 0 {
+				return nil, fault.New("REMOTE_LIST_FAILED",
+					"remote file listing returned an invalid size", true)
+			}
+		}
+		files = append(files, RemoteFile{Path: filepath.ToSlash(name), Size: size})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	return files, nil
 }
 
 func (a *App) History(ctx context.Context, cwd, sourcePath string) ([]model.Task, error) {
@@ -816,26 +1012,122 @@ func (a *App) Recover(ctx context.Context, cwd, taskID, targetName string) (mode
 	if task.ID != taskID || task.ProjectID != p.ProjectID {
 		return task, fault.New("RECOVERY_FAILED", "remote metadata does not match task or current project", false)
 	}
+	if task.Metadata["recovery_format"] != "1" {
+		return task, fault.New("RECOVERY_FAILED", "unsupported or missing remote recovery metadata format", false)
+	}
+	expectedRemoteDir := path.Join(cluster.RemoteRoot, taskID)
+	if task.TargetName != targetName || task.ClusterName != target.Cluster ||
+		path.Clean(task.RemoteDir) != expectedRemoteDir {
+		return task, fault.New("RECOVERY_FAILED",
+			"remote metadata target, cluster, or remote directory does not match the recovery location", false)
+	}
+	if !safeTaskRelative(task.SourcePath, true) ||
+		!safeTaskRelative(task.SourceWorkDir, false) {
+		return task, fault.New("RECOVERY_FAILED", "remote metadata contains an unsafe source path", false)
+	}
+	if task.SourceEntry != nil &&
+		(*task.SourceEntry == "" || strings.ContainsAny(*task.SourceEntry, "\\\x00") ||
+			path.Base(*task.SourceEntry) != *task.SourceEntry) {
+		return task, fault.New("RECOVERY_FAILED", "remote metadata contains an unsafe source entry", false)
+	}
 	if task.ComputeState == "" {
 		task.ComputeState = model.ComputeCreated
 	}
 	if task.PullState == "" {
 		task.PullState = model.PullNotPulled
 	}
-	if task.SchedulerID == "" {
-		marker, markerErr := remote.ReadFile(ctx, a.Runner, cluster.Host, path.Join(cluster.RemoteRoot, taskID, "scheduler_id"))
-		if markerErr == nil {
-			task.SchedulerID = strings.TrimSpace(string(marker))
-			if task.SchedulerID != "" &&
-				(task.ComputeState == model.ComputeCreated || task.ComputeState == model.ComputeSubmissionFailed) {
-				task.ComputeState = model.ComputeQueued
-			}
+	if task.SchedulerID != "" {
+		if _, err := strconv.ParseUint(task.SchedulerID, 10, 64); err != nil {
+			return task, fault.New("RECOVERY_FAILED", "remote metadata contains an invalid scheduler ID", false)
 		}
 	}
-	if err := a.Store.ImportTask(ctx, task); err != nil {
+	if task.SchedulerID == "" {
+		task.SchedulerID, err = a.recoverSchedulerID(ctx, cluster, task)
+		if err != nil {
+			return task, fault.As(err).WithTask(
+				"recovery", "verify Slurm accounting and retry recovery",
+				task.ComputeState, task.PullState)
+		}
+		if task.SchedulerID != "" &&
+			(task.ComputeState == model.ComputeCreated || task.ComputeState == model.ComputeSubmissionFailed) {
+			task.ComputeState = model.ComputeQueued
+		}
+	}
+	if err := a.Store.ImportTask(ctx, &task); err != nil {
 		return task, err
 	}
 	return a.refreshTask(ctx, task)
+}
+
+func (a *App) RecoveryCandidates(
+	ctx context.Context,
+	cwd, targetName string,
+) ([]RecoveryCandidate, error) {
+	p, err := project.Discover(cwd)
+	if err != nil {
+		return nil, err
+	}
+	target, ok := a.Config.Targets[targetName]
+	if !ok {
+		return nil, fault.New("TARGET_NOT_FOUND", fmt.Sprintf("target %q not found", targetName), false)
+	}
+	cluster := a.Config.Clusters[target.Cluster]
+	command := "find " + remote.Quote(cluster.RemoteRoot) +
+		" -mindepth 2 -maxdepth 2 -type f -name metadata.json -printf '%h\\0'"
+	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
+	if err != nil {
+		return nil, fault.Wrap("RECOVERY_SCAN_FAILED",
+			message("cannot scan remote JoyRun metadata", stderr), true, err)
+	}
+	seen := map[string]bool{}
+	var candidates []RecoveryCandidate
+	for _, directory := range strings.Split(stdout, "\x00") {
+		taskID := path.Base(directory)
+		if taskID == "" || !strings.HasPrefix(taskID, "jr_") || seen[taskID] {
+			continue
+		}
+		seen[taskID] = true
+		data, err := remote.ReadFile(ctx, a.Runner, cluster.Host,
+			path.Join(cluster.RemoteRoot, taskID, "metadata.json"))
+		if err != nil {
+			continue
+		}
+		var task model.Task
+		if json.Unmarshal(data, &task) != nil ||
+			task.ID != taskID ||
+			task.ProjectID != p.ProjectID ||
+			task.TargetName != targetName ||
+			task.ClusterName != target.Cluster ||
+			path.Clean(task.RemoteDir) != path.Join(cluster.RemoteRoot, taskID) ||
+			!safeTaskRelative(task.SourcePath, true) ||
+			!safeTaskRelative(task.SourceWorkDir, false) ||
+			task.Metadata["recovery_format"] != "1" {
+			continue
+		}
+		candidates = append(candidates, RecoveryCandidate{
+			TaskID: task.ID, SourcePath: task.SourcePath,
+			ComputeState: task.ComputeState, UpdatedAt: task.UpdatedAt,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].UpdatedAt.After(candidates[j].UpdatedAt)
+	})
+	return candidates, nil
+}
+
+func safeTaskRelative(value string, allowDot bool) bool {
+	if strings.ContainsAny(value, "\\\x00") {
+		return false
+	}
+	if value == "" {
+		return !allowDot
+	}
+	cleaned := path.Clean(value)
+	if allowDot && cleaned == "." {
+		return value == "."
+	}
+	return cleaned == value && !path.IsAbs(cleaned) && cleaned != ".." &&
+		!strings.HasPrefix(cleaned, "../")
 }
 
 func (a *App) writeMetadata(ctx context.Context, cluster model.Cluster, task model.Task) error {
@@ -861,7 +1153,7 @@ func (a *App) failSubmission(
 	task.Metadata["error_code"] = code
 	task.Metadata["error"] = cause.Error()
 	task.Metadata["error_stage"] = stage
-	_ = a.Store.UpdateTaskWithEvent(ctx, *task, taskEvent(*task, "SUBMISSION_FAILED", stage,
+	_ = a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(*task, "SUBMISSION_FAILED", stage,
 		msg, map[string]string{"code": code, "error": cause.Error()}))
 	return fault.Wrap(code, msg, retryable, cause).
 		WithTask(stage, "joyrun status "+task.ID, task.ComputeState, task.PullState)
@@ -881,7 +1173,7 @@ func (a *App) failPull(
 	task.Metadata["error_code"] = "PULL_FAILED"
 	task.Metadata["error"] = cause.Error()
 	task.Metadata["error_stage"] = stage
-	_ = a.Store.UpdateTaskWithEvent(ctx, *task, taskEvent(*task, "PULL_FAILED", "pull",
+	_ = a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(*task, "PULL_FAILED", "pull",
 		msg, map[string]string{"stage": stage, "error": cause.Error()}))
 	return fault.Wrap("PULL_FAILED", msg, true, cause).
 		WithTask("pull", "joyrun pull "+task.ID, task.ComputeState, task.PullState)

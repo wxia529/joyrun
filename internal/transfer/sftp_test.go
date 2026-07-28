@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -12,7 +13,8 @@ import (
 )
 
 func TestSFTPPushAndPull(t *testing.T) {
-	backend := &SFTP{connect: inMemorySFTPConnector(t)}
+	var progress bytes.Buffer
+	backend := &SFTP{connect: inMemorySFTPConnector(t), Stderr: &progress}
 	source := t.TempDir()
 	if err := os.Mkdir(filepath.Join(source, "nested"), 0o755); err != nil {
 		t.Fatal(err)
@@ -41,6 +43,10 @@ func TestSFTPPushAndPull(t *testing.T) {
 	assertFileContent(t, filepath.Join(destination, "nested", "result.txt"), "result")
 	if _, err := os.Stat(filepath.Join(destination, "ignored.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("excluded file was unexpectedly downloaded: %v", err)
+	}
+	if !bytes.Contains(progress.Bytes(), []byte("Uploading input.txt")) ||
+		!bytes.Contains(progress.Bytes(), []byte("Downloading nested/result.txt")) {
+		t.Fatalf("missing transfer progress: %q", progress.String())
 	}
 }
 

@@ -20,6 +20,14 @@ Treat stdout as the JSON interface and stderr as diagnostics.
    joyrun version --json
    ```
 
+   If configuration is missing, locate or create it explicitly:
+
+   ```bash
+   joyrun config path --json
+   joyrun config init --json
+   joyrun config validate --json
+   ```
+
 2. Locate `.joyrun/project.yaml` in the current directory or an ancestor. If
    the user asked to use JoyRun and the project is not initialized, run:
 
@@ -146,6 +154,7 @@ Read logs without downloading the complete result:
 
 ```bash
 joyrun logs jr_TASK_ID --lines 200 --json
+joyrun logs jr_TASK_ID --file alternate.log --lines 200 --json
 ```
 
 JoyRun selects an existing configured application log and automatically falls
@@ -165,6 +174,14 @@ After `completed`, use the target's default pull patterns:
 
 ```bash
 joyrun pull jr_TASK_ID --json
+```
+
+Inspect remote paths and preview the exact pull first when file sizes or
+artifact selection are uncertain:
+
+```bash
+joyrun files jr_TASK_ID --json
+joyrun pull jr_TASK_ID --dry-run --json
 ```
 
 Prefer explicit subsets when only particular outputs are required:
@@ -197,6 +214,10 @@ joyrun pull jr_TASK_ID --live --include "partial.log" --json
 A transfer failure does not imply computation failure. Retry `pull`; do not
 resubmit the calculation.
 
+`NO_FILES_MATCHED` means the selected pull policy found no transferable
+outputs. Inspect the task and use an appropriate `--include` pattern or
+`--all`; do not treat an empty selection as retrieved results.
+
 ## History, cancellation, and recovery
 
 Pass a source to `list` to inspect repeated submissions:
@@ -220,6 +241,13 @@ joyrun recover jr_TASK_ID -t TARGET --json
 ```
 
 Then query status again using the recovered task ID.
+
+If the task ID is unknown, discover candidates scoped to the current Project
+ID and Target without opening the local task database:
+
+```bash
+joyrun recover --scan -t TARGET --json
+```
 
 ## Handle errors
 

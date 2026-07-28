@@ -1,8 +1,11 @@
 package localfs
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"unicode/utf8"
@@ -12,6 +15,52 @@ import (
 
 func ValidatePullPaths(files []string) error {
 	return validatePullPaths(files, runtime.GOOS)
+}
+
+func ValidatePullDestination(root string, files []string) error {
+	if err := ValidatePullPaths(files); err != nil {
+		return err
+	}
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return fault.Wrap("LOCAL_PATH_UNSUPPORTED", "cannot resolve pull destination", false, err)
+	}
+	if info, err := os.Lstat(absolute); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fault.New("LOCAL_PATH_UNSUPPORTED",
+				fmt.Sprintf("pull destination %q is a symbolic link", absolute), false)
+		}
+		if !info.IsDir() {
+			return fault.New("LOCAL_PATH_UNSUPPORTED",
+				fmt.Sprintf("pull destination %q is not a directory", absolute), false)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fault.Wrap("LOCAL_PATH_UNSUPPORTED", "cannot inspect pull destination", false, err)
+	}
+	for _, file := range files {
+		current := absolute
+		components := strings.Split(filepath.FromSlash(file), string(filepath.Separator))
+		for _, component := range components[:len(components)-1] {
+			current = filepath.Join(current, component)
+			info, err := os.Lstat(current)
+			if errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			if err != nil {
+				return fault.Wrap("LOCAL_PATH_UNSUPPORTED",
+					"cannot inspect pull destination "+current, false, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fault.New("LOCAL_PATH_UNSUPPORTED",
+					fmt.Sprintf("pull destination parent %q is a symbolic link", current), false)
+			}
+			if !info.IsDir() {
+				return fault.New("LOCAL_PATH_UNSUPPORTED",
+					fmt.Sprintf("pull destination parent %q is not a directory", current), false)
+			}
+		}
+	}
+	return nil
 }
 
 func validatePullPaths(files []string, goos string) error {

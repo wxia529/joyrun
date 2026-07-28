@@ -61,5 +61,5 @@ examples, and `SKILL.md` when their contracts are affected.
 
 Never store SSH credentials; rely on OpenSSH configuration and host-key
 verification. Preserve unrelated working-tree changes. The SQLite schema is
-currently `development/dev-1`: reject incompatible databases and do not add
+currently `development/dev-3`: reject incompatible databases and do not add
 silent migrations during this development phase.

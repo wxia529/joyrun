@@ -20,7 +20,7 @@ command rebinds that ID to the current path, so a project can be moved without
 losing source-path lookup.
 
 The current database is a development format identified by
-`release_channel=development` and `schema_label=dev-1`. Unsupported versions
+`release_channel=development` and `schema_label=dev-3`. Unsupported versions
 and other release channels are rejected; development schemas are not migrated.
 
 Every remote task directory also contains `metadata.json`. It is updated after
@@ -32,6 +32,9 @@ joyrun recover jr_TASK_ID -t cluster/target
 ```
 
 The target identifies the cluster from which metadata must be read.
+`joyrun recover --scan -t cluster/target` discovers compatible metadata for
+the current Project ID without opening the local database; it never imports
+candidates automatically.
 
 ## Compute state, pull progress, and events
 
@@ -60,6 +63,9 @@ command results.
 from the remote marker when available, queries Slurm, and records an event only
 when observable state changes. It never retries or resubmits a task.
 
+Status snapshots also retain Slurm's raw state, elapsed duration, reason, and
+exit code. These are scheduler diagnostics, not scientific interpretation.
+
 ## Remote layout
 
 Each submission gets an isolated directory:
@@ -75,8 +81,13 @@ REMOTE_ROOT/
 ```
 
 The `scheduler_id` marker is written atomically by the same remote shell that
-runs `sbatch`. It lets the client recover the Slurm job ID if SSH disconnects
-after submission but before stdout reaches the local process.
+runs `sbatch`. Every submitted job also carries the immutable Slurm comment
+`joyrun:<task-id>`. If SSH disconnects before the marker or stdout arrives,
+JoyRun reconciles that comment through `squeue` and `sacct`.
+
+Task rows use an optimistic revision. A stale command cannot overwrite state
+recorded by a concurrent JoyRun process; it receives `DATABASE_CONFLICT` and
+must reload the task.
 
 JoyRun passes `--output=joyrun-slurm-%j.log` to `sbatch`, reserving a scheduler
 diagnostic log independently of target-owned application logs. Log lookup uses

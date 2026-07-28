@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -26,17 +27,47 @@ type fakeRunner struct {
 	schedulerID        string
 	missingLogs        []string
 	rootResult         string
+	reconcileID        string
+	reconcileTaskID    string
+	submitDisconnect   bool
+	markerMissing      bool
+	findOutput         *string
+	recoveryScanOutput string
 }
 
 func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader) (string, string, error) {
 	switch {
 	case strings.Contains(command, "sbatch --parsable"):
 		f.schedulerID = "12345"
+		if f.reconcileTaskID == "" {
+			if start := strings.Index(command, "joyrun:"); start >= 0 {
+				value := command[start+len("joyrun:"):]
+				if end := strings.IndexAny(value, "'\" "); end >= 0 {
+					value = value[:end]
+				}
+				f.reconcileTaskID = value
+			}
+		}
+		if f.submitDisconnect {
+			return "", "connection lost", errors.New("connection lost")
+		}
 		return "12345\n", "", nil
+	case strings.Contains(command, "squeue -h -o '%A|%k'"):
+		if f.reconcileID != "" {
+			return f.reconcileID + "|joyrun:" + f.reconcileTaskID + "\n", "", nil
+		}
+		return "", "", nil
+	case strings.Contains(command, "sacct -n -X --starttime"):
+		return "", "", nil
 	case strings.Contains(command, "squeue -h"):
 		return f.state, "", nil
 	case strings.Contains(command, "find . -type f"):
-		return "eg.inp\x00eg.out\x00eg.gbw\x00scratch.tmp\x00joyrun-job.sh\x00", "", nil
+		if f.findOutput != nil {
+			return *f.findOutput, "", nil
+		}
+		return "eg.inp\x00100\x00eg.out\x00200\x00eg.gbw\x00300\x00scratch.tmp\x00400\x00joyrun-job.sh\x00500\x00", "", nil
+	case strings.Contains(command, "-name metadata.json"):
+		return f.recoveryScanOutput, "", nil
 	case strings.Contains(command, "tail -n"):
 		for _, name := range f.missingLogs {
 			if strings.Contains(command, name) {
@@ -56,7 +87,7 @@ func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader)
 	case strings.HasPrefix(command, "cat ") && strings.Contains(command, "metadata.json"):
 		return string(f.metadata), "", nil
 	case strings.HasPrefix(command, "cat ") && strings.Contains(command, "scheduler_id"):
-		if f.schedulerID == "" {
+		if f.markerMissing || f.schedulerID == "" {
 			return "", "not found", errors.New("not found")
 		}
 		return f.schedulerID + "\n", "", nil
@@ -169,7 +200,7 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	runner := &fakeRunner{state: "COMPLETED"}
+	runner := &fakeRunner{state: "COMPLETED|00:12:34|0:0|None|2026-07-28T10:00:00|2026-07-28T10:12:34"}
 	xfer := &fakeTransfer{}
 	application := &App{
 		Config: model.Config{
@@ -207,8 +238,41 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.ComputeState != model.ComputeCompleted || status.PullState != model.PullNotPulled || status.SchedulerState != "COMPLETED" {
+	if status.ComputeState != model.ComputeCompleted ||
+		status.PullState != model.PullNotPulled ||
+		status.SchedulerState != "COMPLETED" ||
+		status.Elapsed != "00:12:34" ||
+		status.ExitCode != "0:0" ||
+		status.SchedulerStart == "" ||
+		status.SchedulerEnd == "" {
 		t.Fatalf("unexpected status: %#v", status)
+	}
+	remoteFiles, err := application.RemoteFiles(ctx, movedRoot, result.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputMarked := false
+	for _, file := range remoteFiles {
+		inputMarked = inputMarked || (file.Path == "eg.inp" && file.Input)
+	}
+	if len(remoteFiles) != 4 || !inputMarked {
+		t.Fatalf("unexpected remote files: %#v", remoteFiles)
+	}
+	planned, err := application.Pull(ctx, movedRoot, result.Task.ID, PullOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !planned.DryRun || planned.TotalBytes != 500 ||
+		strings.Join(planned.Files, ",") != "eg.gbw,eg.out" ||
+		len(xfer.pulled) != 0 {
+		t.Fatalf("dry-run changed state or selected unexpected files: %#v transfer=%#v", planned, xfer)
+	}
+	storedAfterPlan, err := s.GetTask(ctx, result.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedAfterPlan.PullState != model.PullNotPulled {
+		t.Fatalf("dry-run changed pull state: %#v", storedAfterPlan)
 	}
 	pulled, err := application.Pull(ctx, movedRoot, result.Task.ID, PullOptions{})
 	if err != nil {
@@ -239,7 +303,7 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 			t.Fatalf("missing event %s in %#v", expected, eventTypes)
 		}
 	}
-	log, err := application.Logs(ctx, movedRoot, result.Task.ID, 10)
+	log, err := application.Logs(ctx, movedRoot, result.Task.ID, 10, "")
 	if err != nil || log.Content != "calculation output\n" || log.Kind != "application" {
 		t.Fatalf("unexpected logs: %#v, %v", log, err)
 	}
@@ -289,7 +353,7 @@ func TestPullFailurePreservesCompletedComputeState(t *testing.T) {
 		ResolvedParams: map[string]any{}, CreatedAt: now, UpdatedAt: now,
 		PullPatterns: []string{"*.out"},
 	}
-	if err := s.CreateTask(ctx, task); err != nil {
+	if err := s.CreateTask(ctx, &task); err != nil {
 		t.Fatal(err)
 	}
 	xfer := &fakeTransfer{pullErr: errors.New("connection reset")}
@@ -437,7 +501,7 @@ func TestLogsFallBackToJoyRunSchedulerLog(t *testing.T) {
 		Logs:           []string{"job.log"},
 		ResolvedParams: map[string]any{}, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := s.CreateTask(ctx, task); err != nil {
+	if err := s.CreateTask(ctx, &task); err != nil {
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{missingLogs: []string{"job.log"}}
@@ -447,7 +511,7 @@ func TestLogsFallBackToJoyRunSchedulerLog(t *testing.T) {
 		}},
 		Store: s, Runner: runner,
 	}
-	result, err := application.Logs(ctx, root, task.ID, 20)
+	result, err := application.Logs(ctx, root, task.ID, 20, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +547,7 @@ func TestLogsSupportLegacySchedulerOutput(t *testing.T) {
 		Logs:           []string{".log"},
 		ResolvedParams: map[string]any{}, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := s.CreateTask(ctx, task); err != nil {
+	if err := s.CreateTask(ctx, &task); err != nil {
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{missingLogs: []string{".log", "joyrun-slurm-9876.log"}}
@@ -493,7 +557,7 @@ func TestLogsSupportLegacySchedulerOutput(t *testing.T) {
 		}},
 		Store: s, Runner: runner,
 	}
-	result, err := application.Logs(ctx, root, task.ID, 20)
+	result, err := application.Logs(ctx, root, task.ID, 20, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,6 +653,43 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 	}
 }
 
+func TestSubmitReconcilesAcceptedJobAfterSSHDisconnect(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	runner := &fakeRunner{
+		submitDisconnect: true, markerMissing: true, reconcileID: "12345",
+	}
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{
+				"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+			},
+			Targets: map[string]model.Target{
+				"c/run": {Cluster: "c", Script: "run {{ .Input }}"},
+			},
+		},
+		Store: s, Runner: runner, Transfer: &fakeTransfer{},
+	}
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Task.SchedulerID != "12345" || result.Task.ComputeState != model.ComputeQueued {
+		t.Fatalf("accepted Slurm job was not reconciled: %#v", result.Task)
+	}
+}
+
 func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -627,5 +728,209 @@ func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 	sum := sha256.Sum256(uploaded)
 	if got := result.Task.InputManifest[0].SHA256; got != hex.EncodeToString(sum[:]) {
 		t.Fatalf("manifest %s does not describe uploaded bytes", got)
+	}
+}
+
+func TestStatusReconcilesSchedulerIDWhenMarkerIsMissing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	task := model.Task{
+		ID: "jr_reconcile", ProjectID: p.ProjectID, SourcePath: ".",
+		TargetName: "c/run", ClusterName: "c", RemoteDir: "/tmp/joyrun/jr_reconcile",
+		ComputeState: model.ComputeSubmissionFailed, PullState: model.PullNotPulled,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateTask(ctx, &task); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{
+		markerMissing: true, reconcileID: "24680", reconcileTaskID: task.ID, state: "PENDING",
+	}
+	application := &App{
+		Config: model.Config{Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		}},
+		Store: s, Runner: runner,
+	}
+	got, err := application.Status(ctx, root, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SchedulerID != "24680" || got.ComputeState != model.ComputeQueued {
+		t.Fatalf("failed to reconcile scheduler task: %#v", got)
+	}
+}
+
+func TestRecoverRejectsMetadataOutsideExpectedTaskDirectory(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now().UTC()
+	unsafe := model.Task{
+		ID: "jr_unsafe", ProjectID: p.ProjectID, SourcePath: ".", TargetName: "c/run",
+		ClusterName: "c", RemoteDir: "/home/user", ComputeState: model.ComputeCompleted,
+		PullState: model.PullNotPulled, CreatedAt: now, UpdatedAt: now,
+		Metadata: map[string]string{"recovery_format": "1"},
+	}
+	data, err := json.Marshal(unsafe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{
+				"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+			},
+			Targets: map[string]model.Target{"c/run": {Cluster: "c"}},
+		},
+		Store: s, Runner: &fakeRunner{metadata: data},
+	}
+	if _, err := application.Recover(ctx, root, unsafe.ID, "c/run"); fault.As(err).Code != "RECOVERY_FAILED" {
+		t.Fatalf("expected unsafe metadata to be rejected, got %v", err)
+	}
+}
+
+func TestRecoveryRelativePathsRejectWindowsAndPOSIXEscapes(t *testing.T) {
+	for _, value := range []string{"../escape", `..\escape`, "/absolute", `C:\absolute`} {
+		if safeTaskRelative(value, false) {
+			t.Fatalf("unsafe recovery path accepted: %q", value)
+		}
+	}
+	for _, value := range []string{"", "task01", "nested/results"} {
+		if !safeTaskRelative(value, false) {
+			t.Fatalf("safe recovery path rejected: %q", value)
+		}
+	}
+}
+
+func TestPullRejectsEmptySelection(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	task := model.Task{
+		ID: "jr_empty_pull", ProjectID: p.ProjectID, SourcePath: ".",
+		TargetName: "c/run", ClusterName: "c", RemoteDir: "/tmp/joyrun/jr_empty_pull",
+		SchedulerID: "123", ComputeState: model.ComputeCompleted, PullState: model.PullNotPulled,
+		PullPatterns: []string{"*.out"}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateTask(ctx, &task); err != nil {
+		t.Fatal(err)
+	}
+	output := "joyrun-job.sh\x00"
+	application := &App{
+		Config: model.Config{Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		}},
+		Store: s, Runner: &fakeRunner{state: "COMPLETED", findOutput: &output},
+		Transfer: &fakeTransfer{},
+	}
+	if _, err := application.Pull(ctx, root, task.ID, PullOptions{}); fault.As(err).Code != "NO_FILES_MATCHED" {
+		t.Fatalf("expected empty pull to fail clearly, got %v", err)
+	}
+}
+
+func TestLogsReportsRemovedCluster(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	task := model.Task{
+		ID: "jr_missing_cluster", ProjectID: p.ProjectID, SourcePath: ".",
+		TargetName: "c/run", ClusterName: "removed", RemoteDir: "/tmp/joyrun/task",
+		ComputeState: model.ComputeFailed, PullState: model.PullNotPulled,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.CreateTask(ctx, &task); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{Config: model.Config{Clusters: map[string]model.Cluster{}}, Store: s}
+	if _, err := application.Logs(ctx, root, task.ID, 10, ""); fault.As(err).Code != "CLUSTER_NOT_FOUND" {
+		t.Fatalf("expected missing cluster error, got %v", err)
+	}
+}
+
+func TestRecoveryScanFindsCurrentProjectTasksWithoutDatabase(t *testing.T) {
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	task := model.Task{
+		ID: "jr_scan_test", ProjectID: p.ProjectID,
+		SourcePath: "task/job.inp", SourceWorkDir: "task",
+		TargetName: "c/run", ClusterName: "c",
+		RemoteDir:    "/tmp/joyrun/jr_scan_test",
+		ComputeState: model.ComputeCompleted, UpdatedAt: now,
+		Metadata: map[string]string{"recovery_format": "1"},
+	}
+	metadata, err := json.Marshal(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeRunner{
+		metadata:           metadata,
+		recoveryScanOutput: "/tmp/joyrun/jr_scan_test\x00",
+	}
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{
+				"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+			},
+			Targets: map[string]model.Target{"c/run": {Cluster: "c"}},
+		},
+		Runner: runner,
+	}
+	candidates, err := application.RecoveryCandidates(
+		context.Background(), root, "c/run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].TaskID != task.ID {
+		t.Fatalf("unexpected recovery candidates: %#v", candidates)
 	}
 }

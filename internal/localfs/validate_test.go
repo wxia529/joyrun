@@ -1,6 +1,10 @@
 package localfs
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestWindowsPullPathValidation(t *testing.T) {
 	for _, files := range [][]string{
@@ -23,5 +27,16 @@ func TestWindowsPullPathValidation(t *testing.T) {
 func TestUnixAllowsCaseDistinctPaths(t *testing.T) {
 	if err := validatePullPaths([]string{"A.out", "a.out", "name:result"}, "linux"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPullDestinationRejectsSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "results")); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if err := ValidatePullDestination(root, []string{"results/output.dat"}); err == nil {
+		t.Fatal("expected symbolic-link parent to be rejected")
 	}
 }

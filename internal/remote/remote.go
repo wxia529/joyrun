@@ -38,8 +38,12 @@ func Check(ctx context.Context, runner Runner, host string) error {
 }
 
 func WriteFile(ctx context.Context, runner Runner, host, path string, content []byte, mode string) error {
-	command := fmt.Sprintf("umask 077 && mkdir -p %s && cat > %s && chmod %s %s",
-		Quote(Dir(path)), Quote(path), Quote(mode), Quote(path))
+	tempPrefix := path + ".joyrun-tmp"
+	command := fmt.Sprintf(
+		"umask 077 && mkdir -p %s && tmp=%s.$$ && "+
+			"trap 'rm -f \"$tmp\"' EXIT HUP INT TERM && "+
+			"cat > \"$tmp\" && chmod %s \"$tmp\" && mv -f \"$tmp\" %s && trap - EXIT HUP INT TERM",
+		Quote(Dir(path)), Quote(tempPrefix), Quote(mode), Quote(path))
 	_, stderr, err := runner.Exec(ctx, host, command, bytes.NewReader(content))
 	if err != nil {
 		return fault.Wrap("REMOTE_WRITE_FAILED", detail("cannot write remote file", stderr), true, err)

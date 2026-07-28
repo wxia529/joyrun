@@ -58,6 +58,11 @@ func (e *Error) WithTask(stage, action, computeState, pullState string) *Error {
 	return e
 }
 
+func (e *Error) WithAction(action string) *Error {
+	e.SuggestedAction = action
+	return e
+}
+
 func As(err error) *Error {
 	var target *Error
 	if errors.As(err, &target) {

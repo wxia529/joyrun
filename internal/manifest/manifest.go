@@ -21,7 +21,11 @@ func Build(root, projectRoot string, excludes []string) ([]model.ManifestEntry, 
 	patterns = append(patterns, projectIgnorePatterns(projectRoot, root)...)
 	var entries []model.ManifestEntry
 	var ignored []string
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+	rootAbsolute, err := filepath.Abs(root)
+	if err != nil {
+		return nil, nil, fault.Wrap("SOURCE_SCAN_FAILED", "cannot resolve manifest root", false, err)
+	}
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -46,6 +50,18 @@ func Build(root, projectRoot string, excludes []string) ([]model.ManifestEntry, 
 		info, err := entry.Info()
 		if err != nil {
 			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := validateFileSymlink(rootAbsolute, path, rel)
+			if err != nil {
+				return err
+			}
+			info, err = os.Stat(target)
+			if err != nil {
+				return err
+			}
+		} else if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported special file %s (%s)", rel, info.Mode().Type())
 		}
 		hash, err := hashFile(path)
 		if err != nil {
@@ -109,17 +125,9 @@ func Snapshot(root string, excludes []string) (string, []model.ManifestEntry, []
 			return err
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
-			target, err := filepath.EvalSymlinks(sourcePath)
+			target, err := validateFileSymlink(rootAbsolute, sourcePath, rel)
 			if err != nil {
 				return err
-			}
-			target, err = filepath.Abs(target)
-			if err != nil {
-				return err
-			}
-			targetRelative, err := filepath.Rel(rootAbsolute, target)
-			if err != nil || targetRelative == ".." || strings.HasPrefix(targetRelative, ".."+string(filepath.Separator)) {
-				return fmt.Errorf("symbolic link %s points outside the source work directory", rel)
 			}
 			targetInfo, err := os.Stat(target)
 			if err != nil {
@@ -150,6 +158,30 @@ func Snapshot(root string, excludes []string) (string, []model.ManifestEntry, []
 		return "", nil, nil, func() {}, fault.Wrap("SOURCE_SNAPSHOT_FAILED", "cannot create input snapshot", false, err)
 	}
 	return staging, entries, ignored, cleanup, nil
+}
+
+func validateFileSymlink(rootAbsolute, sourcePath, rel string) (string, error) {
+	target, err := filepath.EvalSymlinks(sourcePath)
+	if err != nil {
+		return "", err
+	}
+	target, err = filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	targetRelative, err := filepath.Rel(rootAbsolute, target)
+	if err != nil || targetRelative == ".." ||
+		strings.HasPrefix(targetRelative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("symbolic link %s points outside the source work directory", rel)
+	}
+	targetInfo, err := os.Stat(target)
+	if err != nil {
+		return "", err
+	}
+	if !targetInfo.Mode().IsRegular() {
+		return "", fmt.Errorf("symbolic link %s must point to a regular file", rel)
+	}
+	return target, nil
 }
 
 func ExcludePatterns(projectRoot, workDir string, targetPatterns []string) []string {
