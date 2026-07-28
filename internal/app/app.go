@@ -41,20 +41,23 @@ type Transfer interface {
 }
 
 type Preview struct {
-	TaskID         string                `json:"task_id"`
-	Source         model.Source          `json:"source"`
-	Target         string                `json:"target"`
-	Cluster        string                `json:"cluster"`
-	Push           model.PushPolicy      `json:"push"`
-	RemoteDir      string                `json:"remote_dir"`
-	Params         map[string]any        `json:"params"`
-	ParamSources   map[string]string     `json:"param_sources"`
-	Files          []string              `json:"upload_files"`
-	Ignored        []string              `json:"ignored"`
-	RenderedScript string                `json:"rendered_script"`
-	InputManifest  []model.ManifestEntry `json:"input_manifest"`
-	TemplateValues TemplateValues        `json:"template_values"`
-	SchedulerLog   string                `json:"scheduler_log"`
+	TaskID          string                  `json:"task_id"`
+	Source          model.Source            `json:"source"`
+	Target          string                  `json:"target"`
+	Cluster         string                  `json:"cluster"`
+	Software        model.Software          `json:"software"`
+	Partition       model.ResolvedPartition `json:"partition"`
+	PartitionSource string                  `json:"partition_source"`
+	Push            model.PushPolicy        `json:"push"`
+	RemoteDir       string                  `json:"remote_dir"`
+	Params          map[string]any          `json:"params"`
+	ParamSources    map[string]string       `json:"param_sources"`
+	Files           []string                `json:"upload_files"`
+	Ignored         []string                `json:"ignored"`
+	RenderedScript  string                  `json:"rendered_script"`
+	InputManifest   []model.ManifestEntry   `json:"input_manifest"`
+	TemplateValues  TemplateValues          `json:"template_values"`
+	SchedulerLog    string                  `json:"scheduler_log"`
 }
 
 type TemplateValues struct {
@@ -156,9 +159,10 @@ func (a *App) Preview(
 	cwd, sourcePath, targetName string,
 	sets []string,
 	includes []string,
+	partitionOverride string,
 	allowProjectRoot bool,
 ) (Preview, model.Task, string, error) {
-	return a.prepare(ctx, cwd, sourcePath, targetName, sets, includes, true, allowProjectRoot)
+	return a.prepare(ctx, cwd, sourcePath, targetName, sets, includes, partitionOverride, true, allowProjectRoot)
 }
 
 func (a *App) prepare(
@@ -166,6 +170,7 @@ func (a *App) prepare(
 	cwd, sourcePath, targetName string,
 	sets []string,
 	includes []string,
+	partitionOverride string,
 	scanManifest bool,
 	allowProjectRoot bool,
 ) (Preview, model.Task, string, error) {
@@ -190,6 +195,10 @@ func (a *App) prepare(
 		return Preview{}, model.Task{}, "", err
 	}
 	cluster := a.Config.Clusters[target.Cluster]
+	partition, partitionSource, err := config.ResolvePartition(cluster, target, partitionOverride)
+	if err != nil {
+		return Preview{}, model.Task{}, "", err
+	}
 	params, paramSources, err := config.ResolveParams(target, sets)
 	if err != nil {
 		return Preview{}, model.Task{}, "", err
@@ -201,6 +210,7 @@ func (a *App) prepare(
 	remoteDir := path.Join(cluster.RemoteRoot, taskID)
 	remoteWorkDir := path.Join(remoteDir, "work")
 	values := jtemplate.Values(src, taskID, remoteWorkDir, filepath.Base(localWorkDir), params)
+	values.Partition = partition
 	script, err := jtemplate.Render(target, values)
 	if err != nil {
 		return Preview{}, model.Task{}, "", err
@@ -234,6 +244,22 @@ func (a *App) prepare(
 	}
 	now := time.Now().UTC()
 	metadata := map[string]string{"recovery_format": "1"}
+	if target.Software.Name != "" {
+		metadata["software_name"] = target.Software.Name
+	}
+	if target.Software.Version != "" {
+		metadata["software_version"] = target.Software.Version
+	}
+	if partition.Name != "" {
+		metadata["partition"] = partition.Name
+		metadata["partition_source"] = partitionSource
+		if partition.CoresPerNode > 0 {
+			metadata["cores_per_node"] = strconv.Itoa(partition.CoresPerNode)
+		}
+		if partition.MemoryPerNode != "" {
+			metadata["memory_per_node"] = partition.MemoryPerNode
+		}
+	}
 	if len(includes) > 0 {
 		encoded, _ := json.Marshal(includes)
 		metadata["submit_includes"] = string(encoded)
@@ -252,7 +278,9 @@ func (a *App) prepare(
 	resolvedPush := target.Push
 	resolvedPush.Include = append([]string{}, selection.Include...)
 	preview := Preview{
-		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster, Push: resolvedPush,
+		TaskID: taskID, Source: src, Target: targetName, Cluster: target.Cluster,
+		Software: target.Software, Partition: partition, PartitionSource: partitionSource,
+		Push:      resolvedPush,
 		RemoteDir: remoteDir, Params: params, ParamSources: paramSources, Files: files,
 		Ignored: ignored, RenderedScript: script, InputManifest: inputManifest,
 		TemplateValues: TemplateValues{
@@ -427,10 +455,11 @@ func (a *App) Submit(
 	cwd, sourcePath, targetName string,
 	sets []string,
 	includes []string,
+	partitionOverride string,
 	allowProjectRoot bool,
 ) (SubmitResult, error) {
 	_, task, localWorkDir, err := a.prepare(
-		ctx, cwd, sourcePath, targetName, sets, includes, false, allowProjectRoot,
+		ctx, cwd, sourcePath, targetName, sets, includes, partitionOverride, false, allowProjectRoot,
 	)
 	if err != nil {
 		return SubmitResult{}, err
@@ -492,7 +521,9 @@ func (a *App) Submit(
 		return SubmitResult{}, err
 	}
 	slurm := scheduler.Slurm{Runner: a.Runner}
-	schedulerID, err := slurm.Submit(ctx, cluster.Host, workDir, task.ID)
+	schedulerID, err := slurm.Submit(
+		ctx, cluster.Host, workDir, task.ID, task.Metadata["partition"],
+	)
 	if err != nil {
 		// Submission may have succeeded even if the SSH connection dropped before
 		// stdout arrived. Recover from the marker or the immutable Slurm comment.

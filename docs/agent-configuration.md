@@ -54,16 +54,50 @@ clusters:
     scheduler: slurm
     remote_root: /scratch/username/joyrun
     transfer: auto
+    partitions:
+      normal:
+        cores_per_node: 64
+        memory_per_node: 256GiB
+      highio:
+        cores_per_node: 64
 ```
 
 - `host` must be an OpenSSH host or alias that the user intends to use.
 - `remote_root` must be an absolute POSIX path owned or writable by the user.
 - `transfer` is `auto`, `rsync`, or `sftp`. Prefer `auto` unless the user has a
   confirmed reason to force a backend.
+- `partitions` records verified hardware facts. `cores_per_node` and
+  `memory_per_node` are optional; omit unknown facts instead of estimating.
+  Partition names may contain letters, digits, `.`, `_`, and `-`.
+  Capacity accepts decimal `GB`, explicit binary `GiB`, and HPC-style binary
+  suffixes such as `180G`.
 - Reuse an existing cluster entry instead of duplicating connection details.
 
 Do not put usernames, ports, keys, `ProxyJump`, or authentication material in
 JoyRun configuration; those belong in OpenSSH configuration.
+
+## Identify software and constrain placement
+
+Every Target must identify its software and declare where it may run:
+
+```yaml
+software:
+  name: orca
+  version: "6.1.1"
+placement:
+  default_partition: normal
+  allowed_partitions: [normal, highio]
+```
+
+`software` is opaque descriptive data for users and agents; it does not enable
+JoyRun parsing or validation. Every placement name must exist under the
+Target's cluster. Keep application parameters such as executable variant,
+nodes, or memory request under `params`, but keep the Slurm partition in
+`placement`. Use `--partition APPROVED_NAME` to override the default. JoyRun
+passes the resolved value directly to `sbatch --partition`; using
+`.Partition.Name` in the script remains useful for transparent dry-run output
+but is not the enforcement mechanism. The parameter name `partition` is
+reserved and rejected to prevent two conflicting sources of truth.
 
 ## Choose the source and upload boundary
 
@@ -139,6 +173,9 @@ JoyRun's isolated remote work directory. Replace only task-specific values:
 - `{{ .Name }}` — source work-directory name;
 - `{{ .TaskID }}` — JoyRun task ID;
 - `{{ .WorkDir }}` — absolute remote work directory;
+- `{{ .Partition.Name }}` — resolved allowed Slurm partition;
+- `{{ .Partition.CoresPerNode }}` — configured core fact, or zero if unknown;
+- `{{ .Partition.MemoryPerNode }}` — configured memory fact, or empty if unknown;
 - `{{ .Params.name }}` — resolved target parameter.
 
 JoyRun shell-quotes substitutions. Templates allow direct substitutions only;
@@ -150,20 +187,17 @@ Example adaptation:
 targets:
   para-amd/gaussian:
     cluster: para-amd
+    software:
+      name: gaussian
+    placement:
+      default_partition: normal
+      allowed_partitions: [normal, highio]
     source:
       kind: file
       patterns: ["*.gjf", "*.com"]
-    params:
-      partition:
-        type: string
-        default: normal
-        choices: [normal, highio]
-        description: Slurm partition used for Gaussian jobs.
-    status:
-      partition: "{{ .Params.partition }}"
     script: |
       #!/bin/bash
-      #SBATCH --partition={{ .Params.partition }}
+      #SBATCH --partition={{ .Partition.Name }}
       #SBATCH --job-name={{ .Stem }}
 
       module load gaussian
@@ -179,16 +213,27 @@ targets:
     logs: ["{{ .Stem }}.log"]
 ```
 
-Declare `status.partition` when the Target has a known Slurm partition. Use
-the same constrained parameter as the script when the software supports
-several approved partitions, or a fixed value when it supports only one:
+Record verified cluster facts once and constrain each Target separately:
 
 ```yaml
-status:
-  partition: amd_256
+clusters:
+  para-amd:
+    host: para-amd
+    scheduler: slurm
+    remote_root: /scratch/user/joyrun
+    partitions:
+      normal:
+        cores_per_node: 64
+        memory_per_node: 256GiB
+      highio:
+        cores_per_node: 64
 ```
 
-JoyRun never parses `#SBATCH` directives to infer this value.
+Omit unknown fields rather than estimating them. `software.name` identifies
+what the Target runs; it does not activate a built-in software parser.
+`placement.allowed_partitions` is authoritative, and
+`placement.default_partition` must be a member. JoyRun never parses `#SBATCH`
+directives or scientific inputs to infer these facts.
 
 Submit this target with a concrete file, not its containing directory:
 
@@ -231,11 +276,11 @@ When the user asks about current capacity, query the Target without submitting
 a job:
 
 ```bash
-joyrun target nodes TARGET --set partition=APPROVED_PARTITION --json
+joyrun target nodes TARGET --partition APPROVED_PARTITION --json
 ```
 
-Only use declared parameter choices. Treat the result as a timestamped Slurm
-observation, not a prediction that a job will start immediately.
+Only use `placement.allowed_partitions`. Treat the result as a timestamped
+Slurm observation, not a prediction that a job will start immediately.
 
 `doctor` performs connectivity and capability checks but does not submit a
 job. Treat failed checks as blocking; report actionable warnings without
@@ -248,6 +293,8 @@ In the dry-run result, verify:
 - exact included and ignored files;
 - file count and total size;
 - resolved parameters and rendered script;
+- software identity, selected partition, known hardware facts, and their
+  relationship to the rendered resource request;
 - target, cluster, and planned remote directory;
 - pull and log paths derived from the intended input.
 

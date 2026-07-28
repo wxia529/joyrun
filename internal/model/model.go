@@ -9,10 +9,22 @@ type Project struct {
 }
 
 type Cluster struct {
-	Host       string `yaml:"host" json:"host"`
-	Scheduler  string `yaml:"scheduler" json:"scheduler"`
-	RemoteRoot string `yaml:"remote_root" json:"remote_root"`
-	Transfer   string `yaml:"transfer,omitempty" json:"transfer,omitempty"`
+	Host       string               `yaml:"host" json:"host"`
+	Scheduler  string               `yaml:"scheduler" json:"scheduler"`
+	RemoteRoot string               `yaml:"remote_root" json:"remote_root"`
+	Transfer   string               `yaml:"transfer,omitempty" json:"transfer,omitempty"`
+	Partitions map[string]Partition `yaml:"partitions,omitempty" json:"partitions,omitempty"`
+}
+
+type Partition struct {
+	CoresPerNode  int    `yaml:"cores_per_node,omitempty" json:"cores_per_node,omitempty"`
+	MemoryPerNode string `yaml:"memory_per_node,omitempty" json:"memory_per_node,omitempty"`
+}
+
+type ResolvedPartition struct {
+	Name          string `json:"name"`
+	CoresPerNode  int    `json:"cores_per_node,omitempty"`
+	MemoryPerNode string `json:"memory_per_node,omitempty"`
 }
 
 type ParamSpec struct {
@@ -45,19 +57,26 @@ type SourcePolicy struct {
 	Patterns []string `yaml:"patterns,omitempty" json:"patterns,omitempty"`
 }
 
-type TargetStatus struct {
-	Partition string `yaml:"partition,omitempty" json:"partition,omitempty"`
+type Software struct {
+	Name    string `yaml:"name" json:"name"`
+	Version string `yaml:"version,omitempty" json:"version,omitempty"`
+}
+
+type Placement struct {
+	DefaultPartition  string   `yaml:"default_partition" json:"default_partition"`
+	AllowedPartitions []string `yaml:"allowed_partitions" json:"allowed_partitions"`
 }
 
 type Target struct {
-	Cluster string               `yaml:"cluster" json:"cluster"`
-	Source  SourcePolicy         `yaml:"source,omitempty" json:"source"`
-	Params  map[string]ParamSpec `yaml:"params,omitempty" json:"params,omitempty"`
-	Status  TargetStatus         `yaml:"status,omitempty" json:"status,omitempty"`
-	Script  string               `yaml:"script" json:"script"`
-	Push    PushPolicy           `yaml:"push" json:"push"`
-	Pull    FilePolicy           `yaml:"pull,omitempty" json:"pull,omitempty"`
-	Logs    []string             `yaml:"logs,omitempty" json:"logs,omitempty"`
+	Cluster   string               `yaml:"cluster" json:"cluster"`
+	Software  Software             `yaml:"software" json:"software"`
+	Placement Placement            `yaml:"placement" json:"placement"`
+	Source    SourcePolicy         `yaml:"source,omitempty" json:"source"`
+	Params    map[string]ParamSpec `yaml:"params,omitempty" json:"params,omitempty"`
+	Script    string               `yaml:"script" json:"script"`
+	Push      PushPolicy           `yaml:"push" json:"push"`
+	Pull      FilePolicy           `yaml:"pull,omitempty" json:"pull,omitempty"`
+	Logs      []string             `yaml:"logs,omitempty" json:"logs,omitempty"`
 }
 
 type Config struct {

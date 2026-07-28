@@ -30,13 +30,14 @@ func (r *recordingRunner) Exec(_ context.Context, _, command string, _ io.Reader
 func TestSubmitForcesJoyRunSchedulerLog(t *testing.T) {
 	runner := &recordingRunner{}
 	id, err := (Slurm{Runner: runner}).Submit(
-		context.Background(), "unused", "/remote/work", "jr_test")
+		context.Background(), "unused", "/remote/work", "jr_test", "community")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id != "12345" ||
 		!strings.Contains(runner.command, "--output=joyrun-slurm-%j.log") ||
-		!strings.Contains(runner.command, "--comment='joyrun:jr_test'") {
+		!strings.Contains(runner.command, "--comment='joyrun:jr_test'") ||
+		!strings.Contains(runner.command, "--partition='community'") {
 		t.Fatalf("unexpected submit command: %q", runner.command)
 	}
 }

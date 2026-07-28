@@ -9,10 +9,25 @@ clusters:
     remote_root: /scratch/your-user/joyrun
     # auto: Windows uses SFTP; Linux/macOS prefer rsync and fall back to SFTP.
     transfer: auto
+    # Hardware facts are optional. Omit values you have not verified.
+    partitions:
+      community:
+        cores_per_node: 64
+        memory_per_node: 256GiB
+      highio:
+        cores_per_node: 64
+        memory_per_node: 512GiB
 
 targets:
   gibbs/orca:
     cluster: gibbs
+    software:
+      name: orca
+    placement:
+      default_partition: community
+      allowed_partitions:
+        - community
+        - highio
 
     source:
       kind: file
@@ -30,21 +45,11 @@ targets:
         default: 150G
         description: Total Slurm memory request.
 
-      partition:
-        type: string
-        default: community
-        choices:
-          - community
-          - highio
-
-    status:
-      partition: "{{ .Params.partition }}"
-
     script: |
       #!/bin/bash
       #SBATCH --cpus-per-task={{ .Params.cpus }}
       #SBATCH --mem={{ .Params.memory }}
-      #SBATCH --partition={{ .Params.partition }}
+      #SBATCH --partition={{ .Partition.Name }}
       #SBATCH --job-name={{ .Stem }}
 
       /share/software/orca/orca {{ .Input }} > {{ .Stem }}.out
@@ -69,18 +74,18 @@ targets:
 
   gibbs/vasp:
     cluster: gibbs
+    software:
+      name: vasp
+    placement:
+      default_partition: community
+      allowed_partitions:
+        - community
+        - highio
 
     source:
       kind: directory
 
     params:
-      partition:
-        type: string
-        default: community
-        choices:
-          - community
-          - highio
-
       executable:
         type: string
         default: std
@@ -89,14 +94,11 @@ targets:
           - gam
           - ncl
 
-    status:
-      partition: "{{ .Params.partition }}"
-
     script: |
       #!/bin/bash
       #SBATCH --nodes=4
       #SBATCH --ntasks=96
-      #SBATCH --partition={{ .Params.partition }}
+      #SBATCH --partition={{ .Partition.Name }}
       #SBATCH --job-name={{ .Name }}
 
       module load vasp

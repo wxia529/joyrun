@@ -47,9 +47,10 @@ type NodesResult struct {
 	Nodes   []NodeInfo  `json:"nodes"`
 }
 
-func (s Slurm) Submit(ctx context.Context, host, workDir, taskID string) (string, error) {
+func (s Slurm) Submit(ctx context.Context, host, workDir, taskID, partition string) (string, error) {
 	command := "cd " + remote.Quote(workDir) +
 		" && jobid=$(sbatch --parsable --comment=" + remote.Quote("joyrun:"+taskID) +
+		" --partition=" + remote.Quote(partition) +
 		" --output=joyrun-slurm-%j.log joyrun-job.sh) && jobid=${jobid%%;*}" +
 		" && printf '%s\\n' \"$jobid\" > ../scheduler_id.tmp" +
 		" && mv ../scheduler_id.tmp ../scheduler_id && printf '%s\\n' \"$jobid\""

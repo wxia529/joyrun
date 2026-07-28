@@ -21,11 +21,15 @@ must match an uploaded file.
 including built-in `.joyrun/` and `.git/` rules. Optional file-count and
 total-size limits reject unexpectedly broad snapshots before SSH is used.
 
-Targets may declare `status.partition` as fixed text or a params-only template.
-This is explicit scheduler-observation metadata, not a resource DSL. JoyRun
-does not parse rendered SBATCH scripts to infer it. `target nodes` resolves
-the Target's normal parameter defaults and choices, queries only that Slurm
-partition, and never changes task state or selects a partition automatically.
+Clusters may record verified per-partition hardware facts. Targets separately
+declare opaque software identity and placement policy: one default partition
+and an allowlist. Submission can override the default only with
+`--partition`; JoyRun passes the result to `sbatch --partition`, and templates
+may consume the resolved `.Partition` object. `target nodes` queries that same
+partition. JoyRun does not parse scientific inputs,
+infer resource needs, choose a partition from live load, or validate resource
+compatibility. It exposes facts so the user or calling agent can perform that
+reasoning before submission.
 
 The project root is not a valid upload working directory by default, including
 when a file source lives directly beneath it. `--allow-project-root` is an

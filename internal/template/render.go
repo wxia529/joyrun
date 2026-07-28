@@ -38,28 +38,6 @@ func Validate(value string, params map[string]model.ParamSpec) error {
 	return nil
 }
 
-func ValidateParamsOnly(value string, params map[string]model.ParamSpec) error {
-	if err := Validate(value, params); err != nil {
-		return err
-	}
-	tmpl, err := texttemplate.New("params-only").Parse(value)
-	if err != nil || tmpl.Tree == nil || tmpl.Tree.Root == nil {
-		return err
-	}
-	for _, node := range tmpl.Tree.Root.Nodes {
-		action, ok := node.(*parse.ActionNode)
-		if !ok {
-			continue
-		}
-		field, ok := action.Pipe.Cmds[0].Args[0].(*parse.FieldNode)
-		if !ok || len(field.Ident) != 2 || field.Ident[0] != "Params" {
-			return fault.New("TARGET_INVALID",
-				"this template only supports .Params substitutions", false)
-		}
-	}
-	return nil
-}
-
 func UsesEntry(value string) bool {
 	tmpl, err := texttemplate.New("inspect").Parse(value)
 	if err != nil || tmpl.Tree == nil || tmpl.Tree.Root == nil {
@@ -106,16 +84,23 @@ func validateAction(action *parse.ActionNode, params map[string]model.ParamSpec)
 		}
 		return fault.New("TARGET_INVALID", "template refers to undeclared parameter "+field.Ident[1], false)
 	}
+	if len(field.Ident) == 2 && field.Ident[0] == "Partition" {
+		switch field.Ident[1] {
+		case "Name", "CoresPerNode", "MemoryPerNode":
+			return nil
+		}
+	}
 	return fault.New("TARGET_INVALID", "template refers to an unsupported variable", false)
 }
 
 type Data struct {
-	Input   string
-	Stem    string
-	Name    string
-	TaskID  string
-	WorkDir string
-	Params  map[string]any
+	Input     string
+	Stem      string
+	Name      string
+	TaskID    string
+	WorkDir   string
+	Params    map[string]any
+	Partition model.ResolvedPartition
 }
 
 func Values(source model.Source, taskID, remoteWorkDir, sourceName string, params map[string]any) Data {
@@ -158,6 +143,8 @@ func shellData(data Data) (Data, error) {
 	result.Name = shellQuote(data.Name)
 	result.TaskID = shellQuote(data.TaskID)
 	result.WorkDir = shellQuote(data.WorkDir)
+	result.Partition.Name = shellQuote(data.Partition.Name)
+	result.Partition.MemoryPerNode = shellQuote(data.Partition.MemoryPerNode)
 	result.Params = make(map[string]any, len(data.Params))
 	for key, value := range data.Params {
 		if text, ok := value.(string); ok {

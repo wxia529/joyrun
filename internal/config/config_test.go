@@ -38,9 +38,15 @@ clusters:
     host: gibbs
     scheduler: slurm
     remote_root: /scratch/user/joyrun
+    partitions:
+      community: {cores_per_node: 32, memory_per_node: 240GiB}
 targets:
   gibbs/orca:
     cluster: gibbs
+    software: {name: orca, version: "6.1.1"}
+    placement:
+      default_partition: community
+      allowed_partitions: [community]
     source:
       kind: file
       patterns: ["*.inp"]
@@ -53,14 +59,9 @@ targets:
         type: string
         default: std
         choices: [std, gam]
-      partition:
-        type: string
-        default: community
-        choices: [community, highio]
-    status:
-      partition: "{{ .Params.partition }}"
     script: |
       #SBATCH -c {{ .Params.cpus }}
+      #SBATCH -p {{ .Partition.Name }}
       orca_{{ .Params.executable }} {{ .Input }}
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -76,8 +77,8 @@ targets:
 	if cfg.Targets["gibbs/orca"].Source.Kind != "file" {
 		t.Fatalf("unexpected source policy: %#v", cfg.Targets["gibbs/orca"].Source)
 	}
-	if cfg.Targets["gibbs/orca"].Status.Partition != "{{ .Params.partition }}" {
-		t.Fatalf("unexpected target status: %#v", cfg.Targets["gibbs/orca"].Status)
+	if cfg.Targets["gibbs/orca"].Placement.DefaultPartition != "community" {
+		t.Fatalf("unexpected target placement: %#v", cfg.Targets["gibbs/orca"].Placement)
 	}
 	values, sources, err := ResolveParams(cfg.Targets["gibbs/orca"], []string{"cpus=64"})
 	if err != nil {
@@ -89,26 +90,81 @@ targets:
 	if sources["cpus"] != "cli" || sources["executable"] != "target_default" {
 		t.Fatalf("unexpected sources: %#v", sources)
 	}
+	partition, source, err := ResolvePartition(
+		cfg.Clusters["gibbs"], cfg.Targets["gibbs/orca"], "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partition.Name != "community" || partition.CoresPerNode != 32 ||
+		partition.MemoryPerNode != "240GiB" || source != "target_default" {
+		t.Fatalf("unexpected partition resolution: %#v source=%q", partition, source)
+	}
 }
 
-func TestLoadRejectsRuntimeValuesInStatusPartition(t *testing.T) {
+func TestLoadRejectsUnknownAllowedPartition(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := `version: 1
 clusters:
-  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun, partitions: {p: {cores_per_node: 1}}}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: missing, allowed_partitions: [missing]}
     source: {kind: file}
     push: {mode: entry}
-    status: {partition: "{{ .Input }}"}
     script: "run {{ .Input }}"
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Load(path); err == nil {
-		t.Fatal("expected status.partition runtime value to be rejected")
+		t.Fatal("expected unknown placement partition to be rejected")
+	}
+}
+
+func TestLoadRejectsUnsafePartitionName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `version: 1
+clusters:
+  c:
+    host: c
+    scheduler: slurm
+    remote_root: /tmp/joyrun
+    partitions:
+      "bad partition": {cores_per_node: 1}
+targets: {}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected unsafe partition name to be rejected")
+	}
+}
+
+func TestLoadRejectsPartitionAsTargetParameter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `version: 1
+clusters:
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun, partitions: {p: {}}}
+targets:
+  c/run:
+    cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
+    source: {kind: file}
+    push: {mode: entry}
+    params:
+      partition: {type: string, default: p}
+    script: "run {{ .Input }}"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected partition target parameter to be rejected")
 	}
 }
 
@@ -116,10 +172,12 @@ func TestLoadRequiresExplicitSourceContract(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := `version: 1
 clusters:
-  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun, partitions: {p: {cores_per_node: 1}}}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
     script: "run {{ .Input }} > {{ .Stem }}.out"
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -134,10 +192,12 @@ func TestLoadRejectsDirectoryTargetUsingEntryVariables(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := `version: 1
 clusters:
-  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun, partitions: {p: {cores_per_node: 1}}}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
     source: {kind: directory}
     push: {mode: workdir}
     script: "run {{ .Input }}"
@@ -169,10 +229,12 @@ func TestResolveParamsRejectsUnknownAndInvalidChoice(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := `version: 1
 clusters:
-  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun, partitions: {p: {cores_per_node: 1}}}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
     source: {kind: either}
     push: {mode: workdir}
     params:
@@ -206,10 +268,14 @@ func TestLoadRejectsTemplateControlFlow(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	content := `version: 1
 clusters:
-  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun, partitions: {p: {cores_per_node: 1}}}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
+    source: {kind: file}
+    push: {mode: entry}
     script: '{{ if .Input }}run{{ end }}'
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -233,10 +299,12 @@ func TestLoadRequiresSafePushMode(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.yaml")
 			content := `version: 1
 clusters:
-  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun}
+  c: {host: c, scheduler: slurm, remote_root: /tmp/joyrun, partitions: {p: {cores_per_node: 1}}}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
     source: {kind: directory}
     ` + test.push + `
     script: "true"
@@ -255,6 +323,7 @@ func TestParseByteSize(t *testing.T) {
 	tests := map[string]int64{
 		"2GB":    2_000_000_000,
 		"2GiB":   2 * (1 << 30),
+		"2G":     2 * (1 << 30),
 		"512MiB": 512 * (1 << 20),
 	}
 	for raw, expected := range tests {

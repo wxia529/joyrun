@@ -18,11 +18,11 @@ import (
 
 func TestInterspersedCanonicalSubmitSyntax(t *testing.T) {
 	got := interspersed(
-		[]string{"task01/eg.inp", "-t", "gibbs/orca", "--set", "cpus=64", "--include", "coords.xyz", "--dry-run"},
-		map[string]bool{"--target": true, "-t": true, "--set": true, "--include": true},
+		[]string{"task01/eg.inp", "-t", "gibbs/orca", "--partition", "community", "--set", "cpus=64", "--include", "coords.xyz", "--dry-run"},
+		map[string]bool{"--target": true, "-t": true, "--set": true, "--include": true, "--partition": true},
 		map[string]bool{"--dry-run": true},
 	)
-	want := []string{"-t", "gibbs/orca", "--set", "cpus=64", "--include", "coords.xyz", "--dry-run", "task01/eg.inp"}
+	want := []string{"-t", "gibbs/orca", "--partition", "community", "--set", "cpus=64", "--include", "coords.xyz", "--dry-run", "task01/eg.inp"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
@@ -115,18 +115,25 @@ func TestTargetParamsAndNodesCommands(t *testing.T) {
 	application := &app.App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{
-				"c": {Host: "c", Scheduler: "slurm"},
+				"c": {
+					Host: "c", Scheduler: "slurm",
+					Partitions: map[string]model.Partition{
+						"small":     {CoresPerNode: 32},
+						"community": {CoresPerNode: 64},
+					},
+				},
 			},
 			Targets: map[string]model.Target{
 				"c/run": {
 					Cluster: "c",
 					Params: map[string]model.ParamSpec{
-						"partition": {
-							Type: "string", Default: "small",
-							Choices: []any{"small", "community"},
-						},
+						"cpus": {Type: "int", Default: 32},
 					},
-					Status: model.TargetStatus{Partition: "{{ .Params.partition }}"},
+					Software: model.Software{Name: "run"},
+					Placement: model.Placement{
+						DefaultPartition:  "small",
+						AllowedPartitions: []string{"small", "community"},
+					},
 				},
 			},
 		},
@@ -139,18 +146,18 @@ func TestTargetParamsAndNodesCommands(t *testing.T) {
 	if err := c.target(application, []string{"params", "c/run"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "partition") {
+	if !strings.Contains(stdout.String(), "cpus") {
 		t.Fatalf("parameter output is incomplete: %q", stdout.String())
 	}
 
 	stdout.Reset()
 	c.json = true
 	if err := c.target(application, []string{
-		"nodes", "c/run", "--set", "partition=community",
+		"nodes", "c/run", "--partition", "community",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{`"partition":"community"`, `"idle":1`, `"node01"`} {
+	for _, expected := range []string{`"partition":{"name":"community"`, `"idle":1`, `"node01"`} {
 		if !strings.Contains(stdout.String(), expected) {
 			t.Fatalf("node JSON is missing %q: %s", expected, stdout.String())
 		}
@@ -198,9 +205,13 @@ clusters:
     host: c
     scheduler: slurm
     remote_root: /tmp/joyrun
+    partitions:
+      p: {cores_per_node: 1}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
     source:
       kind: directory
     push:
@@ -239,9 +250,13 @@ clusters:
     host: c
     scheduler: slurm
     remote_root: /tmp/joyrun
+    partitions:
+      p: {cores_per_node: 1}
 targets:
   c/run:
     cluster: c
+    software: {name: run}
+    placement: {default_partition: p, allowed_partitions: [p]}
     source:
       kind: file
     push:

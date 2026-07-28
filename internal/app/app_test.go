@@ -251,7 +251,7 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 		Store: s, Runner: runner, Transfer: xfer,
 	}
 	result, err := application.Submit(
-		ctx, root, "task01/eg.inp", "gibbs/orca", []string{"cpus=64"}, nil, false,
+		ctx, root, "task01/eg.inp", "gibbs/orca", []string{"cpus=64"}, nil, "", false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -464,7 +464,7 @@ func TestPreviewRejectsDirectoryForFileTarget(t *testing.T) {
 		},
 		Store: s,
 	}
-	_, _, _, err = application.Preview(ctx, root, "benzene", "mindu/gaussian", nil, nil, false)
+	_, _, _, err = application.Preview(ctx, root, "benzene", "mindu/gaussian", nil, nil, "", false)
 	if fault.As(err).Code != "SOURCE_KIND_MISMATCH" {
 		t.Fatalf("expected source kind mismatch, got %v", err)
 	}
@@ -525,16 +525,61 @@ func TestPreviewRejectsProjectRootWithoutExplicitOverride(t *testing.T) {
 		},
 	}}
 	if _, _, _, err := application.Preview(
-		ctx, root, "job.inp", "c/run", nil, nil, false,
+		ctx, root, "job.inp", "c/run", nil, nil, "", false,
 	); fault.As(err).Code != "PROJECT_ROOT_UPLOAD_FORBIDDEN" {
 		t.Fatalf("expected project-root upload rejection, got %v", err)
 	}
-	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, true)
+	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(preview.InputManifest) != 1 || preview.InputManifest[0].Path != "job.inp" {
 		t.Fatalf("unexpected explicitly allowed snapshot: %#v", preview.InputManifest)
+	}
+}
+
+func TestPreviewExposesAndRendersResolvedPartitionFacts(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{Config: model.Config{
+		Clusters: map[string]model.Cluster{"c": {
+			Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun",
+			Partitions: map[string]model.Partition{
+				"normal": {CoresPerNode: 32},
+				"highio": {CoresPerNode: 64, MemoryPerNode: "512GiB"},
+			},
+		}},
+		Targets: map[string]model.Target{"c/run": {
+			Cluster: "c", Software: model.Software{Name: "run"},
+			Placement: model.Placement{
+				DefaultPartition:  "normal",
+				AllowedPartitions: []string{"normal", "highio"},
+			},
+			Source: model.SourcePolicy{Kind: "file"},
+			Push:   model.PushPolicy{Mode: "entry"},
+			Script: "#SBATCH -p {{ .Partition.Name }}\n# {{ .Partition.CoresPerNode }}",
+		}},
+	}}
+	preview, task, _, err := application.Preview(
+		ctx, root, "job.inp", "c/run", nil, nil, "highio", true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Partition.Name != "highio" || preview.PartitionSource != "cli" ||
+		preview.Partition.MemoryPerNode != "512GiB" ||
+		!strings.Contains(preview.RenderedScript, "#SBATCH -p 'highio'") {
+		t.Fatalf("unexpected partition preview: %#v", preview)
+	}
+	if task.Metadata["partition"] != "highio" ||
+		task.Metadata["software_name"] != "run" {
+		t.Fatalf("task did not snapshot execution facts: %#v", task.Metadata)
 	}
 }
 
@@ -582,7 +627,7 @@ func TestPreviewAddsOnlyExplicitEntryDependencies(t *testing.T) {
 	}}
 
 	preview, _, _, err := application.Preview(
-		ctx, root, "task/job.inp", "c/run", nil, []string{"coords.xyz"}, false,
+		ctx, root, "task/job.inp", "c/run", nil, []string{"coords.xyz"}, "", false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -602,22 +647,22 @@ func TestPreviewAddsOnlyExplicitEntryDependencies(t *testing.T) {
 	}
 
 	if _, _, _, err := application.Preview(
-		ctx, root, "task/job.inp", "c/run", nil, []string{"missing.gbw"}, false,
+		ctx, root, "task/job.inp", "c/run", nil, []string{"missing.gbw"}, "", false,
 	); fault.As(err).Code != "SOURCE_DEPENDENCY_NOT_FOUND" {
 		t.Fatalf("expected missing dependency rejection, got %v", err)
 	}
 	if _, _, _, err := application.Preview(
-		ctx, root, "task/job.inp", "c/excluding", nil, []string{"restart.gbw"}, false,
+		ctx, root, "task/job.inp", "c/excluding", nil, []string{"restart.gbw"}, "", false,
 	); fault.As(err).Code != "SOURCE_DEPENDENCY_NOT_FOUND" {
 		t.Fatalf("expected excluded dependency rejection, got %v", err)
 	}
 	if _, _, _, err := application.Preview(
-		ctx, root, "task/job.inp", "c/run", nil, []string{"["}, false,
+		ctx, root, "task/job.inp", "c/run", nil, []string{"["}, "", false,
 	); fault.As(err).Code != "INVALID_ARGUMENT" {
 		t.Fatalf("expected invalid include rejection, got %v", err)
 	}
 	if _, _, _, err := application.Preview(
-		ctx, root, "task", "c/workdir", nil, []string{"coords.xyz"}, false,
+		ctx, root, "task", "c/workdir", nil, []string{"coords.xyz"}, "", false,
 	); fault.As(err).Code != "INVALID_ARGUMENT" {
 		t.Fatalf("expected workdir include rejection, got %v", err)
 	}
@@ -739,7 +784,7 @@ func TestDryRunMakesNoTaskRecord(t *testing.T) {
 		},
 		Store: s,
 	}
-	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, true)
+	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,7 +820,7 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 		},
 		Store: s, Runner: runner, Transfer: &fakeTransfer{},
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, true)
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
 	if err != nil {
 		t.Fatalf("submission should remain successful after metadata refresh failure: %v", err)
 	}
@@ -836,7 +881,7 @@ func TestSubmitReconcilesAcceptedJobAfterSSHDisconnect(t *testing.T) {
 		},
 		Store: s, Runner: runner, Transfer: &fakeTransfer{},
 	}
-	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, true)
+	result, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +923,7 @@ func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 		Store: s, Runner: &fakeRunner{}, Transfer: xfer,
 	}
 	result, err := application.Submit(
-		ctx, root, "job.inp", "c/run", nil, []string{"restart.gbw"}, true,
+		ctx, root, "job.inp", "c/run", nil, []string{"restart.gbw"}, "", true,
 	)
 	if err != nil {
 		t.Fatal(err)

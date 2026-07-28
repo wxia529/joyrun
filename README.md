@@ -30,7 +30,8 @@ JoyRun is an execution and transport layer. It is responsible for:
 
 The user or calling agent is responsible for:
 
-- choosing the target, resources, software environment, and artifact policy;
+- comparing the scientific input with the selected software, partition facts,
+  rendered resource requests, and artifact policy;
 - providing a correct job script;
 - interpreting scientific output;
 - deciding whether and how to modify, restart, or resubmit a calculation.
@@ -183,6 +184,12 @@ clusters:
     scheduler: slurm
     remote_root: /scratch/your-user/joyrun
     transfer: auto
+    partitions:
+      community:
+        cores_per_node: 64
+        memory_per_node: 256GiB
+      highio:
+        cores_per_node: 64
 ```
 
 `host` is an OpenSSH alias, so existing keys, `ssh-agent`, `ProxyJump`,
@@ -206,6 +213,12 @@ A target describes one way to run software on a cluster:
 targets:
   gibbs/orca:
     cluster: gibbs
+    software:
+      name: orca
+      version: "6.1.1"
+    placement:
+      default_partition: community
+      allowed_partitions: [community, highio]
     source:
       kind: file
       patterns: ["*.inp"]
@@ -213,16 +226,10 @@ targets:
       cpus:
         type: int
         default: 32
-      partition:
-        type: string
-        default: community
-        choices: [community, highio]
-    status:
-      partition: "{{ .Params.partition }}"
     script: |
       #!/bin/bash
       #SBATCH --cpus-per-task={{ .Params.cpus }}
-      #SBATCH --partition={{ .Params.partition }}
+      #SBATCH --partition={{ .Partition.Name }}
       #SBATCH --job-name={{ .Stem }}
       orca {{ .Input }} > {{ .Stem }}.out
     push:
@@ -248,6 +255,17 @@ an actionable command that names the sole matching candidate when possible.
 Every target must declare `source.kind` explicitly. JoyRun does not infer an
 input contract from the script.
 
+`clusters.*.partitions` records verified hardware facts. Omit unknown values
+rather than estimating them. `software` is descriptive identity, while
+`placement` is policy: submission may select only an allowed partition and
+uses the default when `--partition` is absent. Templates can read
+`.Partition.Name`, `.Partition.CoresPerNode`, and
+`.Partition.MemoryPerNode`. JoyRun also passes the resolved name directly to
+`sbatch --partition`, so the placement policy remains authoritative even if a
+script omits the optional template value. JoyRun exposes these facts but does
+not decide whether a scientific input's requested cores or memory are
+appropriate.
+
 Every target must also declare an upload boundary:
 
 - `push.mode: entry` uploads only the selected source file, target-level
@@ -261,6 +279,7 @@ Every target must also declare an upload boundary:
 `.git/` rules take precedence over inclusion. Optional
 `push.limits.max_files` and `push.limits.max_total_size` reject unexpectedly
 large snapshots locally. Size values accept units such as `2GB` and `2GiB`.
+HPC-style binary suffixes such as `180G` are also accepted.
 Reserve target-level `push.include` for dependencies required by every run.
 Select optional coordinates or restart files by exact name for one task:
 
@@ -288,6 +307,9 @@ Public template values are:
 - `{{ .Name }}` — source working-directory name
 - `{{ .TaskID }}` — JoyRun task ID
 - `{{ .WorkDir }}` — absolute remote working directory
+- `{{ .Partition.Name }}` — resolved allowed Slurm partition
+- `{{ .Partition.CoresPerNode }}` — configured cores per node, or `0`
+- `{{ .Partition.MemoryPerNode }}` — configured memory per node, or empty
 - `{{ .Params.name }}` — resolved target parameter
 
 Script substitutions are POSIX-shell quoted automatically. Templates
@@ -326,10 +348,19 @@ record:
 joyrun submit task01/eg.inp -t gibbs/orca --dry-run
 ```
 
-It shows source kind, work directory, entry file, resolved template values and
-parameters, the upload snapshot, planned remote directory, and rendered
-script. A source-contract mismatch is a hard preview error rather than a
-script containing empty `.Input` or `.Stem` values.
+It shows source kind, software identity, selected partition and known hardware
+facts, work directory, entry file, resolved template values and parameters,
+the upload snapshot, planned remote directory, and rendered script. A
+source-contract mismatch is a hard preview error rather than a script
+containing empty `.Input` or `.Stem` values.
+
+JoyRun deliberately does not parse ORCA, Gaussian, VASP, or other application
+inputs. Before submission, a user or agent should compare explicit
+application-level core and memory directives with the dry-run's rendered
+allocation and partition facts. A known conflict is blocking; a missing
+hardware fact is unknown, not invalid. The supplied [JoyRun skill](SKILL.md)
+defines this Agent review workflow without moving scientific policy into the
+runner.
 
 ## Commands
 
@@ -342,10 +373,11 @@ joyrun target list
 joyrun target show gibbs/orca
 joyrun target params gibbs/orca
 joyrun target nodes gibbs/orca
-joyrun target nodes gibbs/orca --set partition=highio
+joyrun target nodes gibbs/orca --partition highio
 joyrun doctor gibbs/orca
 
 joyrun submit task01/eg.inp -t gibbs/orca
+joyrun submit task01/eg.inp -t gibbs/orca --partition highio
 joyrun status task01/eg.inp
 joyrun status --all
 joyrun list [task01/eg.inp]
@@ -359,12 +391,11 @@ joyrun pull jr_TASK_ID --dry-run
 joyrun cancel jr_TASK_ID
 ```
 
-`status.partition` declares the Slurm partition associated with a computation
-Target. It may be fixed text or a direct `.Params.*` substitution. `target
-nodes` resolves the same defaults, choices, and `--set` overrides used by
-submission, then queries only that partition. It reports a timestamped
-observation; idle nodes do not guarantee that Slurm will start a job
-immediately.
+`target nodes` queries the Target's default partition, or an explicitly
+selected allowed partition. It reports configured hardware facts together
+with a timestamped Slurm observation; idle nodes do not guarantee that Slurm
+will start a job immediately. JoyRun never chooses a partition from current
+load and never validates application-specific resource directives.
 
 JoyRun reserves `joyrun-slurm-<jobid>.log` for scheduler diagnostics. `logs`
 first reads the first configured application log that exists, then falls back

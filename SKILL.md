@@ -109,10 +109,15 @@ When the user asks about available nodes or current capacity, use:
 joyrun target nodes TARGET --json
 ```
 
-If the Target declares an approved partition parameter, a declared choice may
-be selected with `--set partition=VALUE`. Never invent a partition, parse the
-SBATCH script to bypass Target policy, automatically change a submission, or
-promise that idle nodes guarantee immediate scheduling.
+Select another declared placement only when needed:
+
+```bash
+joyrun target nodes TARGET --partition APPROVED_PARTITION --json
+```
+
+Never invent a partition, bypass `placement.allowed_partitions`,
+automatically change a submission, or promise that idle nodes guarantee
+immediate scheduling.
 
 ## Check and upgrade JoyRun
 
@@ -161,6 +166,7 @@ Inspect:
 
 - resolved source kind, work directory, and entry file;
 - resolved `.Input`, `.Stem`, `.Name`, and `.WorkDir` values;
+- declared software identity and resolved partition facts;
 - files included in the upload snapshot;
 - ignored files;
 - `push.mode`, explicit dependency patterns, and upload limits;
@@ -194,6 +200,32 @@ file is part of the task. Never add
 `--allow-project-root` merely to bypass `PROJECT_ROOT_UPLOAD_FORBIDDEN`; use it
 only when the user explicitly intends to upload from the complete project
 root.
+
+## Review scientific resource consistency
+
+JoyRun exposes facts; it does not interpret scientific input or decide resource
+fitness. Before a real submission, the agent must:
+
+1. read `joyrun target show TARGET --json` and `target params`;
+2. read the selected scientific input and identify only explicit
+   software-specific core, process, thread, and memory directives;
+3. inspect `submit --dry-run --json`, including `software`, `partition`,
+   resolved params, upload manifest, and rendered `#SBATCH` requests;
+4. compare the input directives with the rendered allocation and configured
+   partition facts.
+
+Stop before submission when the software identity is inconsistent, an explicit
+input request exceeds the rendered allocation, or the rendered request cannot
+fit a known per-node fact. Report the exact conflict and ask the user whether
+to change the input, Target params, or partition. Never silently edit input or
+resource parameters.
+
+Missing facts mean **unknown**, not invalid. If `memory_per_node` is absent,
+state that memory compatibility could not be verified; do not invent a machine
+value or a per-software memory estimate. A plausible but inefficient allocation
+is a warning, not a JoyRun error. Query `target nodes` only when the user asks
+about current capacity or when choosing among already allowed partitions is
+part of the request; live idleness is not resource validation.
 
 Before the first real use of a target on the current machine, run:
 

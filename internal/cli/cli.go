@@ -232,18 +232,18 @@ func (c *command) target(application *app.App, args []string) error {
 	}
 	if len(args) >= 1 && args[0] == "nodes" {
 		flags := newFlags("target nodes", c.stderr)
-		var sets stringList
-		flags.Var(&sets, "set", "target parameter key=value")
+		var partition string
+		flags.StringVar(&partition, "partition", "", "allowed target partition")
 		if err := flags.Parse(interspersed(
-			args[1:], map[string]bool{"--set": true}, map[string]bool{},
+			args[1:], map[string]bool{"--partition": true}, map[string]bool{},
 		)); err != nil {
 			return fault.Wrap("INVALID_ARGUMENT", "invalid target nodes arguments", false, err)
 		}
 		if flags.NArg() != 1 {
 			return fault.New("INVALID_ARGUMENT",
-				"usage: joyrun target nodes <target> [--set key=value]", false)
+				"usage: joyrun target nodes <target> [--partition name]", false)
 		}
-		result, err := application.TargetNodes(c.ctx, flags.Arg(0), sets)
+		result, err := application.TargetNodes(c.ctx, flags.Arg(0), partition)
 		if err != nil {
 			return err
 		}
@@ -252,7 +252,7 @@ func (c *command) target(application *app.App, args []string) error {
 	}
 	if len(args) != 2 || (args[0] != "show" && args[0] != "params") {
 		return fault.New("INVALID_ARGUMENT",
-			"usage: joyrun target <list|show TARGET|params TARGET|nodes TARGET [--set key=value]>", false)
+			"usage: joyrun target <list|show TARGET|params TARGET|nodes TARGET [--partition name]>", false)
 	}
 	target, ok := application.Config.Targets[args[1]]
 	if !ok {
@@ -263,9 +263,9 @@ func (c *command) target(application *app.App, args []string) error {
 		return nil
 	}
 	c.write(map[string]any{"name": args[1], "target": target},
-		fmt.Sprintf("Target: %s\nCluster: %s\nSource: %s\nPartition: %s\nPush mode: %s\nPush include: %s\nPull: %s\n\nParameters:\n%s",
-			args[1], target.Cluster, target.Source.Kind,
-			displayEmpty(target.Status.Partition),
+		fmt.Sprintf("Target: %s\nCluster: %s\nSoftware: %s %s\nSource: %s\nDefault partition: %s\nAllowed partitions: %s\nPush mode: %s\nPush include: %s\nPull: %s\n\nParameters:\n%s",
+			args[1], target.Cluster, target.Software.Name, target.Software.Version, target.Source.Kind,
+			target.Placement.DefaultPartition, displayList(target.Placement.AllowedPartitions),
 			target.Push.Mode, displayList(target.Push.Include),
 			strings.Join(target.Pull.Default, ", "), formatParams(target)))
 	return nil
@@ -276,27 +276,29 @@ func (c *command) submit(application *app.App, args []string) error {
 	var target string
 	var sets stringList
 	var includes stringList
+	var partition string
 	var dryRun bool
 	var allowProjectRoot bool
 	flags.StringVar(&target, "target", "", "execution target")
 	flags.StringVar(&target, "t", "", "execution target")
 	flags.Var(&sets, "set", "target parameter key=value")
 	flags.Var(&includes, "include", "additional input dependency glob (repeatable; entry-mode targets only)")
+	flags.StringVar(&partition, "partition", "", "allowed target partition")
 	flags.BoolVar(&dryRun, "dry-run", false, "preview without remote changes")
 	flags.BoolVar(&allowProjectRoot, "allow-project-root", false, "explicitly allow uploading from the project root")
 	if err := flags.Parse(interspersed(args,
-		map[string]bool{"--target": true, "-t": true, "--set": true, "--include": true},
+		map[string]bool{"--target": true, "-t": true, "--set": true, "--include": true, "--partition": true},
 		map[string]bool{"--dry-run": true, "--allow-project-root": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid submit arguments", false, err)
 	}
 	if flags.NArg() != 1 || target == "" {
 		return fault.New("INVALID_ARGUMENT",
-			"usage: joyrun submit <source> -t <target> [--set key=value] [--include glob] [--dry-run] [--allow-project-root]", false)
+			"usage: joyrun submit <source> -t <target> [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]", false)
 	}
 	cwd, _ := os.Getwd()
 	if dryRun {
 		preview, _, _, err := application.Preview(
-			c.ctx, cwd, flags.Arg(0), target, sets, includes, allowProjectRoot,
+			c.ctx, cwd, flags.Arg(0), target, sets, includes, partition, allowProjectRoot,
 		)
 		if err != nil {
 			return err
@@ -306,7 +308,7 @@ func (c *command) submit(application *app.App, args []string) error {
 	}
 	fmt.Fprintln(c.stderr, "Preparing immutable input snapshot and uploading task...")
 	result, err := application.Submit(
-		c.ctx, cwd, flags.Arg(0), target, sets, includes, allowProjectRoot,
+		c.ctx, cwd, flags.Arg(0), target, sets, includes, partition, allowProjectRoot,
 	)
 	if err != nil {
 		return err
@@ -660,7 +662,7 @@ func (c *command) usage() {
 Usage:
   joyrun config <path|init|validate>
   joyrun init [directory]
-  joyrun submit <source> -t <target> [--set key=value] [--include glob] [--dry-run] [--allow-project-root]
+  joyrun submit <source> -t <target> [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]
   joyrun status <source|task-id>
   joyrun status --all
   joyrun list [source]
@@ -673,7 +675,7 @@ Usage:
   joyrun target list
   joyrun target show <target>
   joyrun target params <target>
-  joyrun target nodes <target> [--set key=value]
+  joyrun target nodes <target> [--partition name]
   joyrun doctor <target>
   joyrun recover <task-id> -t <target>
   joyrun recover --scan -t <target>
@@ -688,7 +690,7 @@ func (c *command) commandUsage(name string) bool {
 	usage := map[string]string{
 		"config":  "Usage: joyrun config <path|init|validate>\n",
 		"init":    "Usage: joyrun init [directory]\n",
-		"submit":  "Usage: joyrun submit <source> -t <target> [--set key=value] [--include glob] [--dry-run] [--allow-project-root]\n",
+		"submit":  "Usage: joyrun submit <source> -t <target> [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]\n",
 		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
 		"list":    "Usage: joyrun list [source]\n",
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
@@ -696,7 +698,7 @@ func (c *command) commandUsage(name string) bool {
 		"files":   "Usage: joyrun files <source|task-id>\n",
 		"pull":    "Usage: joyrun pull <source|task-id> [--all|--include glob] [--live] [--dry-run]\n",
 		"cancel":  "Usage: joyrun cancel <task-id>\n",
-		"target":  "Usage: joyrun target <list|show TARGET|params TARGET|nodes TARGET [--set key=value]>\n",
+		"target":  "Usage: joyrun target <list|show TARGET|params TARGET|nodes TARGET [--partition name]>\n",
 		"doctor":  "Usage: joyrun doctor <target>\n",
 		"recover": "Usage: joyrun recover <task-id> -t <target> | joyrun recover --scan -t <target>\n",
 		"version": "Usage: joyrun version\n",
@@ -775,6 +777,14 @@ func formatInspect(task model.Task) string {
 		task.ID, task.ProjectID, task.SourcePath, task.TargetName, task.ClusterName)
 	fmt.Fprintf(&builder, "Compute state: %s\nPull state:    %s\nScheduler:     %s\nRemote:        %s\n",
 		task.ComputeState, task.PullState, task.SchedulerID, task.RemoteDir)
+	if task.Metadata["software_name"] != "" || task.Metadata["partition"] != "" {
+		software := strings.TrimSpace(task.Metadata["software_name"] + " " + task.Metadata["software_version"])
+		fmt.Fprintf(&builder,
+			"Software:      %s\nPartition:     %s\nCores/node:    %s\nMemory/node:   %s\n",
+			displayEmpty(software), displayEmpty(task.Metadata["partition"]),
+			displayEmpty(task.Metadata["cores_per_node"]),
+			displayEmpty(task.Metadata["memory_per_node"]))
+	}
 	if task.SchedulerState != "" || task.SchedulerReason != "" ||
 		task.Elapsed != "" || task.ExitCode != "" ||
 		task.SchedulerStart != "" || task.SchedulerEnd != "" {
@@ -834,10 +844,14 @@ func formatParams(target model.Target) string {
 func formatTargetNodes(result app.TargetNodesResult) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder,
-		"Target: %s\nCluster: %s\nPartition: %s\nObserved: %s\n\n"+
+		"Target: %s\nCluster: %s\nSoftware: %s %s\nPartition: %s (%s)\n"+
+			"Cores/node: %s\nMemory/node: %s\nObserved: %s\n\n"+
 			"TOTAL  IDLE  MIXED  ALLOCATED  UNAVAILABLE\n"+
 			"%-6d %-5d %-6d %-11d %d\n",
-		result.Target, result.Cluster, result.Partition,
+		result.Target, result.Cluster, result.Software.Name, result.Software.Version,
+		result.Partition.Name, result.PartitionSource,
+		displayPositive(result.Partition.CoresPerNode),
+		displayEmpty(result.Partition.MemoryPerNode),
 		result.ObservedAt.Local().Format(time.RFC3339),
 		result.Summary.Total, result.Summary.Idle, result.Summary.Mixed,
 		result.Summary.Allocated, result.Summary.Unavailable,
@@ -859,9 +873,12 @@ func formatPreview(preview app.Preview) string {
 	if preview.Source.Entry != nil {
 		entry = *preview.Source.Entry
 	}
-	fmt.Fprintf(&builder, "Task: %s\nTarget: %s\nCluster: %s\nRemote: %s\nScheduler log: %s\n\nSource:\n  Path:     %s\n  Kind:     %s\n  WorkDir:  %s\n  Entry:    %s\n\nUpload policy:\n  Mode:           %s\n  Include:        %s\n  Max files:      %s\n  Max total size: %s\n\nTemplate values:\n  Input:    %s\n  Stem:     %s\n  Name:     %s\n  WorkDir:  %s\n\nParameters:\n",
-		preview.TaskID, preview.Target, preview.Cluster, preview.RemoteDir,
-		preview.SchedulerLog,
+	fmt.Fprintf(&builder, "Task: %s\nTarget: %s\nCluster: %s\nSoftware: %s %s\nPartition: %s (%s)\nCores/node: %s\nMemory/node: %s\nRemote: %s\nScheduler log: %s\n\nSource:\n  Path:     %s\n  Kind:     %s\n  WorkDir:  %s\n  Entry:    %s\n\nUpload policy:\n  Mode:           %s\n  Include:        %s\n  Max files:      %s\n  Max total size: %s\n\nTemplate values:\n  Input:    %s\n  Stem:     %s\n  Name:     %s\n  WorkDir:  %s\n\nParameters:\n",
+		preview.TaskID, preview.Target, preview.Cluster,
+		preview.Software.Name, preview.Software.Version,
+		displayEmpty(preview.Partition.Name), displayEmpty(preview.PartitionSource),
+		displayPositive(preview.Partition.CoresPerNode), displayEmpty(preview.Partition.MemoryPerNode),
+		preview.RemoteDir, preview.SchedulerLog,
 		preview.Source.RelativePath, preview.Source.Kind, preview.Source.WorkDir, entry,
 		preview.Push.Mode, displayList(preview.Push.Include),
 		displayLimit(preview.Push.Limits.MaxFiles), displayEmpty(preview.Push.Limits.MaxTotalSize),
@@ -908,6 +925,13 @@ func displayList(values []string) string {
 func displayLimit(value int) string {
 	if value == 0 {
 		return "<unlimited>"
+	}
+	return strconv.Itoa(value)
+}
+
+func displayPositive(value int) string {
+	if value <= 0 {
+		return "<unknown>"
 	}
 	return strconv.Itoa(value)
 }

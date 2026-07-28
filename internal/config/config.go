@@ -20,7 +20,8 @@ import (
 )
 
 var paramName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
-var byteSize = regexp.MustCompile(`(?i)^([1-9][0-9]*)(B|KB|MB|GB|TB|KIB|MIB|GIB|TIB)?$`)
+var partitionName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var byteSize = regexp.MustCompile(`(?i)^([1-9][0-9]*)(B|K|M|G|T|KB|MB|GB|TB|KIB|MIB|GIB|TIB)?$`)
 
 const starter = `# JoyRun user configuration.
 # Add clusters and execution targets, then run:
@@ -34,10 +35,19 @@ const starter = `# JoyRun user configuration.
 #     scheduler: slurm
 #     remote_root: /scratch/your-user/joyrun
 #     transfer: auto
+#     partitions:
+#       compute:
+#         cores_per_node: 64
+#         memory_per_node: 240GiB
 #
 # targets:
 #   mycluster/program:
 #     cluster: mycluster
+#     software:
+#       name: program
+#     placement:
+#       default_partition: compute
+#       allowed_partitions: [compute]
 #     source:
 #       kind: file
 #       patterns: ["*.inp"]
@@ -46,10 +56,9 @@ const starter = `# JoyRun user configuration.
 #       limits:
 #         max_files: 20
 #         max_total_size: 2GiB
-#     status:
-#       partition: community
 #     script: |
 #       #!/bin/bash
+#       #SBATCH --partition={{ .Partition.Name }}
 #       #SBATCH --job-name={{ .Stem }}
 #       program {{ .Input }} > {{ .Stem }}.out
 #     pull:
@@ -128,16 +137,65 @@ func Load(path string) (model.Config, error) {
 		default:
 			return model.Config{}, fault.New("CONFIG_INVALID", fmt.Sprintf("cluster %q has unsupported transfer %q", name, cluster.Transfer), false)
 		}
+		for partitionKey, partition := range cluster.Partitions {
+			if !partitionName.MatchString(partitionKey) {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("cluster %q has invalid partition name %q", name, partitionKey), false)
+			}
+			if partition.CoresPerNode < 0 {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("cluster %q partition %q cores_per_node cannot be negative", name, partitionKey), false)
+			}
+			if partition.MemoryPerNode != "" {
+				if _, err := ParseByteSize(partition.MemoryPerNode); err != nil {
+					return model.Config{}, fault.Wrap("CONFIG_INVALID",
+						fmt.Sprintf("cluster %q partition %q has invalid memory_per_node", name, partitionKey), false, err)
+				}
+			}
+		}
 		cfg.Clusters[name] = cluster
 	}
 	for name, target := range cfg.Targets {
-		if _, ok := cfg.Clusters[target.Cluster]; !ok {
+		cluster, ok := cfg.Clusters[target.Cluster]
+		if !ok {
 			return model.Config{}, fault.New("CONFIG_INVALID", fmt.Sprintf("target %q refers to unknown cluster %q", name, target.Cluster), false)
+		}
+		if strings.TrimSpace(target.Software.Name) == "" {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q requires software.name", name), false)
+		}
+		if target.Placement.DefaultPartition == "" {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q requires placement.default_partition", name), false)
+		}
+		if len(target.Placement.AllowedPartitions) == 0 {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q requires placement.allowed_partitions", name), false)
+		}
+		allowed := map[string]bool{}
+		for _, partitionName := range target.Placement.AllowedPartitions {
+			if allowed[partitionName] {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("target %q repeats allowed partition %q", name, partitionName), false)
+			}
+			if _, ok := cluster.Partitions[partitionName]; !ok {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("target %q allows unknown cluster partition %q", name, partitionName), false)
+			}
+			allowed[partitionName] = true
+		}
+		if !allowed[target.Placement.DefaultPartition] {
+			return model.Config{}, fault.New("CONFIG_INVALID",
+				fmt.Sprintf("target %q default partition %q is not allowed", name, target.Placement.DefaultPartition), false)
 		}
 		if target.Script == "" {
 			return model.Config{}, fault.New("CONFIG_INVALID", fmt.Sprintf("target %q requires script", name), false)
 		}
 		for key, spec := range target.Params {
+			if key == "partition" {
+				return model.Config{}, fault.New("CONFIG_INVALID",
+					fmt.Sprintf("target %q parameter %q is reserved; use placement and --partition", name, key), false)
+			}
 			if !paramName.MatchString(key) {
 				return model.Config{}, fault.New("CONFIG_INVALID", fmt.Sprintf("parameter %q must use lowercase_snake_case", key), false)
 			}
@@ -147,16 +205,6 @@ func Load(path string) (model.Config, error) {
 		}
 		if err := jtemplate.Validate(target.Script, target.Params); err != nil {
 			return model.Config{}, fault.Wrap("CONFIG_INVALID", fmt.Sprintf("target %q has an invalid script", name), false, err)
-		}
-		if target.Status.Partition != "" {
-			if strings.TrimSpace(target.Status.Partition) == "" {
-				return model.Config{}, fault.New("CONFIG_INVALID",
-					fmt.Sprintf("target %q status.partition cannot be blank", name), false)
-			}
-			if err := jtemplate.ValidateParamsOnly(target.Status.Partition, target.Params); err != nil {
-				return model.Config{}, fault.Wrap("CONFIG_INVALID",
-					fmt.Sprintf("target %q has an invalid status.partition template", name), false, err)
-			}
 		}
 		for _, logPath := range target.Logs {
 			if err := jtemplate.Validate(logPath, target.Params); err != nil {
@@ -235,7 +283,7 @@ func Load(path string) (model.Config, error) {
 func ParseByteSize(raw string) (int64, error) {
 	match := byteSize.FindStringSubmatch(strings.TrimSpace(raw))
 	if match == nil {
-		return 0, fmt.Errorf("size %q must be a positive integer followed by B, KB, MB, GB, TB, KiB, MiB, GiB, or TiB", raw)
+		return 0, fmt.Errorf("size %q must be a positive integer followed by B, K, M, G, T, KB, MB, GB, TB, KiB, MiB, GiB, or TiB", raw)
 	}
 	value, err := strconv.ParseInt(match[1], 10, 64)
 	if err != nil {
@@ -243,6 +291,7 @@ func ParseByteSize(raw string) (int64, error) {
 	}
 	multipliers := map[string]int64{
 		"": 1, "B": 1,
+		"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40,
 		"KB": 1000, "MB": 1000 * 1000, "GB": 1000 * 1000 * 1000, "TB": 1000 * 1000 * 1000 * 1000,
 		"KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40,
 	}
@@ -317,6 +366,51 @@ func ResolveParams(target model.Target, sets []string) (map[string]any, map[stri
 		}
 	}
 	return values, sources, nil
+}
+
+func ResolvePartition(
+	cluster model.Cluster,
+	target model.Target,
+	override string,
+) (model.ResolvedPartition, string, error) {
+	name := target.Placement.DefaultPartition
+	source := "target_default"
+	if override != "" {
+		name = override
+		source = "cli"
+	}
+	if name == "" {
+		if override != "" {
+			return model.ResolvedPartition{}, "", fault.New(
+				"INVALID_PARTITION", fmt.Sprintf("partition %q is not available for this target", override), false,
+			)
+		}
+		return model.ResolvedPartition{}, "", nil
+	}
+	allowed := false
+	for _, candidate := range target.Placement.AllowedPartitions {
+		if candidate == name {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return model.ResolvedPartition{}, "", fault.New(
+			"INVALID_PARTITION",
+			fmt.Sprintf("partition %q is not allowed for this target", name), false,
+		).WithAction("choose one of: " + strings.Join(target.Placement.AllowedPartitions, ", "))
+	}
+	partition, ok := cluster.Partitions[name]
+	if !ok {
+		return model.ResolvedPartition{}, "", fault.New(
+			"TARGET_INVALID",
+			fmt.Sprintf("partition %q is not declared by cluster %q", name, target.Cluster), false,
+		)
+	}
+	return model.ResolvedPartition{
+		Name: name, CoresPerNode: partition.CoresPerNode,
+		MemoryPerNode: partition.MemoryPerNode,
+	}, source, nil
 }
 
 func convert(kind, raw string) (any, error) {

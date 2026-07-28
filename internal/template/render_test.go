@@ -49,3 +49,17 @@ func TestRenderRejectsLineBreaks(t *testing.T) {
 		t.Fatal("expected line-breaking parameter to be rejected")
 	}
 }
+
+func TestRenderQuotesResolvedPartitionFacts(t *testing.T) {
+	rendered, err := Render(model.Target{
+		Script: "#SBATCH -p {{ .Partition.Name }}\n# {{ .Partition.CoresPerNode }} {{ .Partition.MemoryPerNode }}",
+	}, Data{Partition: model.ResolvedPartition{
+		Name: "high io", CoresPerNode: 64, MemoryPerNode: "256GiB",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered != "#SBATCH -p 'high io'\n# 64 '256GiB'" {
+		t.Fatalf("unexpected rendered partition facts: %q", rendered)
+	}
+}
