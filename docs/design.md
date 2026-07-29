@@ -137,8 +137,12 @@ JoyRun keeps transfer policy behind one interface:
 - SFTP is carried through the system OpenSSH client with
   `ssh <host> -s sftp`. This retains OpenSSH config, agent, known-host and
   ProxyJump behavior without implementing authentication inside JoyRun.
-- `auto` selects SFTP on Windows. On Linux and macOS it selects rsync only when
-  the executable is available locally and remotely, otherwise it selects SFTP.
+- `auto` selects SFTP on Windows. On Linux and macOS it starts with rsync when
+  available locally, without an extra SSH probe, and retries with SFTP if
+  rsync fails. `doctor` performs the explicit remote backend check.
+
+OpenSSH operations use bounded connection setup and server keepalives. rsync
+uses a 90-second inactivity timeout rather than a total-duration limit.
 
 SFTP writes uploads and downloads to same-directory temporary files before
 renaming them. Windows-specific pull validation rejects paths that NTFS cannot

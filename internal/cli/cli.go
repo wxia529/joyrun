@@ -116,6 +116,7 @@ func (c *command) execute(name string, args []string) error {
 	application := &app.App{
 		Config: cfg, Runner: runner,
 		Transfer: transfer.Manager{Stderr: c.stderr, Runner: runner},
+		Progress: c.stderr,
 	}
 	if name == "target" {
 		return c.target(application, args)

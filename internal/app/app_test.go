@@ -34,9 +34,14 @@ type fakeRunner struct {
 	findOutput         *string
 	recoveryScanOutput string
 	commandWarning     string
+	blockCommand       string
 }
 
-func (f *fakeRunner) Exec(_ context.Context, _, command string, stdin io.Reader) (string, string, error) {
+func (f *fakeRunner) Exec(ctx context.Context, _, command string, stdin io.Reader) (string, string, error) {
+	if f.blockCommand != "" && strings.Contains(command, f.blockCommand) {
+		<-ctx.Done()
+		return "", "", ctx.Err()
+	}
 	switch {
 	case strings.Contains(command, "sbatch --parsable"):
 		f.schedulerID = "12345"
@@ -175,21 +180,27 @@ func TestDoctorDoesNotTreatSuccessfulCommandWarningAsFailureDetail(t *testing.T)
 }
 
 type fakeTransfer struct {
-	pushed     bool
-	pushedFrom string
-	pushedData []byte
-	beforePush func()
-	pulled     []string
-	pullErr    error
+	pushed       bool
+	pushedFrom   string
+	pushedData   []byte
+	pushedScript []byte
+	beforePush   func()
+	pushErr      error
+	pulled       []string
+	pullErr      error
 }
 
 func (f *fakeTransfer) Push(_ context.Context, _ model.Cluster, localDir, _ string, _ []string) error {
 	if f.beforePush != nil {
 		f.beforePush()
 	}
+	if f.pushErr != nil {
+		return f.pushErr
+	}
 	f.pushed = true
 	f.pushedFrom = localDir
 	f.pushedData, _ = os.ReadFile(filepath.Join(localDir, "job.inp"))
+	f.pushedScript, _ = os.ReadFile(filepath.Join(localDir, "joyrun-job.sh"))
 	return nil
 }
 
@@ -325,7 +336,8 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 		eventTypes = append(eventTypes, event.Type)
 	}
 	for _, expected := range []string{
-		"TASK_CREATED", "UPLOAD_STARTED", "UPLOAD_COMPLETED", "SUBMIT_STARTED",
+		"TASK_CREATED", "UPLOAD_STARTED", "REMOTE_DIR_CREATED", "METADATA_WRITTEN",
+		"SNAPSHOT_UPLOADED", "SCRIPT_UPLOADED", "UPLOAD_COMPLETED", "SUBMIT_STARTED",
 		"SCHEDULER_ACCEPTED", "COMPUTE_STATE_CHANGED", "PULL_STARTED", "PULL_COMPLETED",
 	} {
 		if !contains(eventTypes, expected) {
@@ -890,6 +902,140 @@ func TestSubmitReconcilesAcceptedJobAfterSSHDisconnect(t *testing.T) {
 	}
 }
 
+func TestSubmitRemoteTimeoutPersistsFailureWithDetachedContext(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{
+				"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+			},
+			Targets: map[string]model.Target{
+				"c/run": {
+					Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+				},
+			},
+		},
+		Store: s, Runner: &fakeRunner{blockCommand: "metadata.json.joyrun-tmp"},
+		Transfer: &fakeTransfer{}, RemoteTimeout: 10 * time.Millisecond,
+	}
+	_, err = application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
+	if fault.As(err).Code != "SSH_TIMEOUT" {
+		t.Fatalf("expected SSH_TIMEOUT, got %v", err)
+	}
+	tasks, err := s.ListTasks(ctx, p.ProjectID)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("cannot read timed-out task: %#v, %v", tasks, err)
+	}
+	if tasks[0].ComputeState != model.ComputeSubmissionFailed ||
+		tasks[0].Metadata["error_stage"] != "metadata" {
+		t.Fatalf("timeout state was not persisted: %#v", tasks[0])
+	}
+}
+
+func TestSubmitTimeoutAfterSbatchIsMarkedUncertain(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	runner := &fakeRunner{
+		blockCommand: "sbatch --parsable", markerMissing: true,
+	}
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{
+				"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+			},
+			Targets: map[string]model.Target{
+				"c/run": {
+					Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+				},
+			},
+		},
+		Store: s, Runner: runner, Transfer: &fakeTransfer{},
+		SubmitTimeout: 10 * time.Millisecond, RecoveryTimeout: time.Second,
+	}
+	_, err = application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
+	if fault.As(err).Code != "SUBMISSION_UNCERTAIN" {
+		t.Fatalf("expected SUBMISSION_UNCERTAIN, got %v", err)
+	}
+	tasks, err := s.ListTasks(ctx, p.ProjectID)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("cannot read uncertain task: %#v, %v", tasks, err)
+	}
+	if tasks[0].ComputeState != model.ComputeSubmissionUncertain {
+		t.Fatalf("uncertain state was not persisted: %#v", tasks[0])
+	}
+}
+
+func TestSubmitCancellationDuringTransferPersistsFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	xfer := &fakeTransfer{
+		beforePush: cancel,
+		pushErr:    context.Canceled,
+	}
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{
+				"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+			},
+			Targets: map[string]model.Target{
+				"c/run": {
+					Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+				},
+			},
+		},
+		Store: s, Runner: &fakeRunner{}, Transfer: xfer,
+	}
+	_, err = application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
+	if fault.As(err).Code != "SUBMISSION_CANCELLED" {
+		t.Fatalf("expected SUBMISSION_CANCELLED, got %v", err)
+	}
+	tasks, err := s.ListTasks(context.Background(), p.ProjectID)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("cannot read cancelled task: %#v, %v", tasks, err)
+	}
+	if tasks[0].ComputeState != model.ComputeSubmissionFailed ||
+		tasks[0].Metadata["error_stage"] != "snapshot" {
+		t.Fatalf("cancelled state was not persisted: %#v", tasks[0])
+	}
+}
+
 func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -931,6 +1077,9 @@ func TestSubmitUploadsManifestSnapshot(t *testing.T) {
 	uploaded := xfer.pushedData
 	if string(uploaded) != "version one" {
 		t.Fatalf("upload did not use immutable snapshot: %q", uploaded)
+	}
+	if string(xfer.pushedScript) != "run 'job.inp'" {
+		t.Fatalf("rendered script was not uploaded with the snapshot: %q", xfer.pushedScript)
 	}
 	sum := sha256.Sum256(uploaded)
 	if got := result.Task.InputManifest[0].SHA256; got != hex.EncodeToString(sum[:]) {

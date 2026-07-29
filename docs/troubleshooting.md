@@ -27,12 +27,23 @@ action. Do not blindly repeat `submit`: Slurm may already have accepted it.
 
 - `SSH_FAILED`: verify `ssh HOST` using the same OpenSSH alias. JoyRun does not
   store credentials or bypass host-key verification.
+- `SSH_TIMEOUT`, `UPLOAD_TIMEOUT`, or `PULL_TIMEOUT`: JoyRun bounded an
+  unresponsive SSH or transfer operation. Inspect
+  `joyrun inspect TASK --events`; retry the failed stage instead of creating
+  another Task.
 - `doctor` `WARN` for `remote_root`: the root is absent but a writable ancestor
   can create it. `FAIL` means no usable writable path was established.
 - `SUBMIT_FAILED`: inspect the task before retrying. JoyRun attempts recovery
   through the remote scheduler marker and immutable Slurm comment.
+- `SUBMISSION_UNCERTAIN`: Slurm may already have accepted the task. Run
+  `joyrun status TASK` until the scheduler ID is recovered or investigate the
+  immutable `joyrun:TASK` Slurm comment. Do not run `submit` again.
 - `LOG_NOT_READY`: no configured application or scheduler log exists yet.
   Retry later or inspect the candidate paths reported by the error.
+
+JoyRun applies OpenSSH connection and keepalive safeguards and a 90-second
+rsync inactivity timeout. This is an inactivity limit, not a total transfer
+duration, so large active transfers are not capped.
 
 ## Pull and recovery
 
@@ -44,4 +55,3 @@ action. Do not blindly repeat `submit`: Slurm may already have accepted it.
   only when replacement is explicitly intended.
 - Lost local database: initialize or enter the original project, run
   `recover --scan -t TARGET`, then import one selected Task ID.
-

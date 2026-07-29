@@ -16,6 +16,7 @@ import (
 	"github.com/pkg/sftp"
 	"github.com/wxia529/joyrun/internal/fault"
 	"github.com/wxia529/joyrun/internal/manifest"
+	"github.com/wxia529/joyrun/internal/remote"
 )
 
 type sftpConnect func(context.Context, string, io.Writer) (*sftp.Client, func() error, error)
@@ -340,7 +341,8 @@ func (s *SFTP) open(ctx context.Context, host string) (*sftp.Client, func() erro
 }
 
 func connectOpenSSH(ctx context.Context, host string, diagnostic io.Writer) (*sftp.Client, func() error, error) {
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", host, "-s", "sftp")
+	args := append(remote.OpenSSHOptions(), host, "-s", "sftp")
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, fault.Wrap("SFTP_FAILED", "cannot open OpenSSH stdin", false, err)

@@ -35,10 +35,22 @@ func TestSubmitForcesJoyRunSchedulerLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	if id != "12345" ||
+		!strings.Contains(runner.command, "chmod 700 joyrun-job.sh") ||
 		!strings.Contains(runner.command, "--output=joyrun-slurm-%j.log") ||
 		!strings.Contains(runner.command, "--comment='joyrun:jr_test'") ||
 		!strings.Contains(runner.command, "--partition='community'") {
 		t.Fatalf("unexpected submit command: %q", runner.command)
+	}
+}
+
+func TestSubmissionDefinitelyRejectedDistinguishesSSHTransportFailure(t *testing.T) {
+	rejected := exec.Command("sh", "-c", "exit 1").Run()
+	transport := exec.Command("sh", "-c", "exit 255").Run()
+	if !SubmissionDefinitelyRejected(rejected) {
+		t.Fatal("remote command exit 1 should be a definitive rejection")
+	}
+	if SubmissionDefinitelyRejected(transport) {
+		t.Fatal("SSH-style exit 255 must remain uncertain")
 	}
 }
 

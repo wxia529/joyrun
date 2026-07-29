@@ -6,7 +6,6 @@ import (
 	"io"
 	"os/exec"
 	"runtime"
-	"strings"
 
 	"github.com/wxia529/joyrun/internal/fault"
 	"github.com/wxia529/joyrun/internal/model"
@@ -28,7 +27,14 @@ func (m Manager) Push(ctx context.Context, cluster model.Cluster, localDir, remo
 	}
 	switch backend {
 	case "rsync":
-		return (Rsync{Stderr: m.Stderr}).Push(ctx, cluster.Host, localDir, remoteDir, excludes)
+		err := (Rsync{Stderr: m.Stderr}).Push(ctx, cluster.Host, localDir, remoteDir, excludes)
+		if err == nil || !autoTransfer(cluster) || ctx.Err() != nil {
+			return err
+		}
+		if m.Stderr != nil {
+			fmt.Fprintln(m.Stderr, "rsync failed; retrying upload with OpenSSH SFTP...")
+		}
+		return m.sftp().Push(ctx, cluster.Host, localDir, remoteDir, excludes)
 	case "sftp":
 		return m.sftp().Push(ctx, cluster.Host, localDir, remoteDir, excludes)
 	default:
@@ -43,12 +49,23 @@ func (m Manager) Pull(ctx context.Context, cluster model.Cluster, remoteDir, loc
 	}
 	switch backend {
 	case "rsync":
-		return (Rsync{Stderr: m.Stderr}).Pull(ctx, cluster.Host, remoteDir, localDir, files)
+		err := (Rsync{Stderr: m.Stderr}).Pull(ctx, cluster.Host, remoteDir, localDir, files)
+		if err == nil || !autoTransfer(cluster) || ctx.Err() != nil {
+			return err
+		}
+		if m.Stderr != nil {
+			fmt.Fprintln(m.Stderr, "rsync failed; retrying download with OpenSSH SFTP...")
+		}
+		return m.sftp().Pull(ctx, cluster.Host, remoteDir, localDir, files)
 	case "sftp":
 		return m.sftp().Pull(ctx, cluster.Host, remoteDir, localDir, files)
 	default:
 		panic("unreachable transfer backend")
 	}
+}
+
+func autoTransfer(cluster model.Cluster) bool {
+	return cluster.Transfer == "" || cluster.Transfer == "auto"
 }
 
 func (m Manager) Check(ctx context.Context, cluster model.Cluster) (string, error) {
@@ -76,17 +93,9 @@ func (m Manager) backend(ctx context.Context, cluster model.Cluster) (string, er
 	case "auto":
 		if m.goos() != "windows" {
 			if _, err := m.lookPath()("rsync"); err == nil {
-				if m.Runner == nil {
-					return "rsync", nil
-				}
-				stdout, stderr, err := m.Runner.Exec(ctx, cluster.Host,
-					"if command -v rsync >/dev/null 2>&1; then printf yes; else printf no; fi", nil)
-				if err != nil {
-					return "", fault.Wrap("TRANSFER_DETECTION_FAILED", withDetail("cannot detect the remote transfer backend", stderr), true, err)
-				}
-				if strings.TrimSpace(stdout) == "yes" {
-					return "rsync", nil
-				}
+				// Normal submit and pull operations must not spend an extra SSH
+				// round trip probing rsync. Doctor performs the remote check.
+				return "rsync", nil
 			}
 		}
 		if _, err := m.lookPath()("ssh"); err != nil {

@@ -41,6 +41,12 @@ test project and run `joyrun doctor TARGET` before the scenarios below.
   partial local file is exposed.
 - Disconnect SSH immediately after `sbatch`; status recovers the Slurm ID from
   the remote marker or `joyrun:<task-id>` comment.
+- Stall each submission stage in a fake runner. The command must exit within
+  its deadline, persist the exact failure stage after cancellation, and mark
+  an unresolved `sbatch` attempt as `submission_uncertain`.
+- Submit five rounds of three strictly serial smoke tasks. No operation may
+  hang indefinitely, and every failed attempt must retain a diagnostic event
+  and non-`created` state.
 - Submit the same source twice and confirm isolated remote directories.
 - Move the local project and confirm source lookup still works.
 - Delete or redirect the SQLite database, run `recover --scan`, recover one

@@ -174,14 +174,15 @@ func SummarizeTask(task Task) TaskSummary {
 }
 
 const (
-	ComputeCreated          = "created"
-	ComputeSubmissionFailed = "submission_failed"
-	ComputeQueued           = "queued"
-	ComputeRunning          = "running"
-	ComputeCompleted        = "completed"
-	ComputeFailed           = "failed"
-	ComputeCancelled        = "cancelled"
-	ComputeUnknown          = "unknown"
+	ComputeCreated             = "created"
+	ComputeSubmissionFailed    = "submission_failed"
+	ComputeSubmissionUncertain = "submission_uncertain"
+	ComputeQueued              = "queued"
+	ComputeRunning             = "running"
+	ComputeCompleted           = "completed"
+	ComputeFailed              = "failed"
+	ComputeCancelled           = "cancelled"
+	ComputeUnknown             = "unknown"
 )
 
 const (

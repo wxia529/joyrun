@@ -7,6 +7,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/wxia529/joyrun/internal/fault"
 )
@@ -16,17 +17,42 @@ type Runner interface {
 }
 
 type SSH struct {
-	Stderr io.Writer
+	Stderr  io.Writer
+	Timeout time.Duration
 }
 
 func (s SSH) Exec(ctx context.Context, host, command string, stdin io.Reader) (string, string, error) {
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "BatchMode=yes", host, command)
+	timeout := s.Timeout
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	args := append(OpenSSHOptions(), host, command)
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdin = stdin
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = io.MultiWriter(&stderr, writerOrDiscard(s.Stderr))
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
+}
+
+func OpenSSHOptions() []string {
+	return []string{
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=15",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+	}
+}
+
+func OpenSSHShell() string {
+	return "ssh -o BatchMode=yes -o ConnectTimeout=15 " +
+		"-o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 }
 
 func Check(ctx context.Context, runner Runner, host string) error {

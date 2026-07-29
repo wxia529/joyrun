@@ -5,6 +5,17 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.5] - 2026-07-29
+
+### Fixed
+
+- Bounded stalled OpenSSH commands and idle rsync transfers with explicit
+  connection and keepalive safeguards.
+- Persisted submission failures after cancellation and distinguished
+  uncertain Slurm acceptance from confirmed submission failure.
+- Recorded precise upload stages and reduced normal submit SSH round trips by
+  uploading the rendered script with the immutable input snapshot.
+
 ## [v0.1.4] - 2026-07-28
 
 ### Changed
@@ -78,7 +89,8 @@ The SQLite schema remains `stable/stable-1`.
 - First public release with asynchronous Slurm submission, status, logs,
   bounded pull, global SQLite state, Project identity, and remote recovery.
 
-[Unreleased]: https://github.com/wxia529/joyrun/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/wxia529/joyrun/compare/v0.1.5...HEAD
+[v0.1.5]: https://github.com/wxia529/joyrun/compare/v0.1.4...v0.1.5
 [v0.1.4]: https://github.com/wxia529/joyrun/compare/v0.1.3...v0.1.4
 [v0.1.3]: https://github.com/wxia529/joyrun/compare/v0.1.2...v0.1.3
 [v0.1.2]: https://github.com/wxia529/joyrun/compare/v0.1.1...v0.1.2

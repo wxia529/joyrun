@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,10 +29,15 @@ import (
 )
 
 type App struct {
-	Config   model.Config
-	Store    *store.Store
-	Runner   remote.Runner
-	Transfer Transfer
+	Config             model.Config
+	Store              *store.Store
+	Runner             remote.Runner
+	Transfer           Transfer
+	Progress           io.Writer
+	RemoteTimeout      time.Duration
+	SubmitTimeout      time.Duration
+	RecoveryTimeout    time.Duration
+	PersistenceTimeout time.Duration
 }
 
 type Transfer interface {
@@ -490,45 +496,76 @@ func (a *App) Submit(
 	}
 	cluster := a.Config.Clusters[task.ClusterName]
 	workDir := path.Join(task.RemoteDir, "work")
-	task.UpdatedAt = time.Now().UTC()
-	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "UPLOAD_STARTED", "upload",
-		"Uploading immutable input snapshot", nil)); err != nil {
+	if err := a.recordStage(ctx, &task, "UPLOAD_STARTED", "upload",
+		"Uploading immutable input snapshot"); err != nil {
 		return SubmitResult{}, err
 	}
-	if _, stderr, err := a.Runner.Exec(ctx, cluster.Host, "mkdir -p "+remote.Quote(workDir), nil); err != nil {
-		return SubmitResult{}, a.failSubmission(ctx, &task, "SSH_FAILED", "upload",
-			message("cannot create remote task directory", stderr), true, err)
-	}
-	if err := a.writeMetadata(ctx, cluster, task); err != nil {
-		return SubmitResult{}, a.failSubmission(ctx, &task, "REMOTE_METADATA_FAILED", "upload",
+	a.progress("Creating remote task and uploading recovery metadata...")
+	remoteCtx, cancelRemote := a.remoteContext(ctx)
+	err = a.writeMetadata(remoteCtx, cluster, task)
+	remoteFailure := operationFailure(remoteCtx, "REMOTE_METADATA_FAILED", "SSH_TIMEOUT")
+	cancelRemote()
+	if err != nil {
+		return SubmitResult{}, a.failSubmission(ctx, &task, remoteFailure, "metadata",
 			"cannot write recovery metadata", true, err)
 	}
+	if err := a.recordStage(ctx, &task, "REMOTE_DIR_CREATED", "remote_directory",
+		"Remote task directory created"); err != nil {
+		return SubmitResult{}, err
+	}
+	if err := a.recordStage(ctx, &task, "METADATA_WRITTEN", "metadata",
+		"Recovery metadata uploaded"); err != nil {
+		return SubmitResult{}, err
+	}
+	if err := os.WriteFile(filepath.Join(snapshotDir, "joyrun-job.sh"),
+		[]byte(task.RenderedScript), 0o700); err != nil {
+		return SubmitResult{}, a.failSubmission(ctx, &task, "SNAPSHOT_PREPARE_FAILED", "script",
+			"cannot add rendered job script to immutable snapshot", false, err)
+	}
+	a.progress("Uploading %d input file(s) and the rendered job script...", len(inputManifest))
 	if err := a.Transfer.Push(ctx, cluster, snapshotDir, workDir, nil); err != nil {
-		return SubmitResult{}, a.failSubmission(ctx, &task, "UPLOAD_FAILED", "upload",
+		return SubmitResult{}, a.failSubmission(ctx, &task, transferFailure(ctx, err), "snapshot",
 			"cannot upload task files", true, err)
 	}
-	if err := remote.WriteFile(ctx, a.Runner, cluster.Host, path.Join(workDir, "joyrun-job.sh"), []byte(task.RenderedScript), "700"); err != nil {
-		return SubmitResult{}, a.failSubmission(ctx, &task, "UPLOAD_FAILED", "upload",
-			"cannot upload rendered job script", true, err)
-	}
-	task.UpdatedAt = time.Now().UTC()
-	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "UPLOAD_COMPLETED", "upload",
-		"Input snapshot and rendered script uploaded", nil)); err != nil {
+	if err := a.recordStage(ctx, &task, "SNAPSHOT_UPLOADED", "snapshot",
+		"Immutable input snapshot uploaded"); err != nil {
 		return SubmitResult{}, err
 	}
-	if err := a.Store.AppendEvent(ctx, taskEvent(task, "SUBMIT_STARTED", "submit",
-		"Submitting task to scheduler", nil)); err != nil {
+	if err := a.recordStage(ctx, &task, "SCRIPT_UPLOADED", "script",
+		"Rendered job script uploaded with immutable snapshot"); err != nil {
 		return SubmitResult{}, err
 	}
+	if err := a.recordStage(ctx, &task, "UPLOAD_COMPLETED", "upload",
+		"Input snapshot and rendered script uploaded"); err != nil {
+		return SubmitResult{}, err
+	}
+	if err := a.recordStage(ctx, &task, "SUBMIT_STARTED", "submit",
+		"Submitting task to scheduler"); err != nil {
+		return SubmitResult{}, err
+	}
+	a.progress("Submitting task to Slurm...")
 	slurm := scheduler.Slurm{Runner: a.Runner}
+	submitCtx, cancelSubmit := a.submitContext(ctx)
 	schedulerID, err := slurm.Submit(
-		ctx, cluster.Host, workDir, task.ID, task.Metadata["partition"],
+		submitCtx, cluster.Host, workDir, task.ID, task.Metadata["partition"],
 	)
+	submitUncertain := submitCtx.Err() != nil
+	cancelSubmit()
 	if err != nil {
+		if scheduler.SubmissionDefinitelyRejected(err) {
+			return SubmitResult{}, a.failSubmission(ctx, &task, "SUBMIT_FAILED", "submit",
+				"Slurm rejected the task before accepting a job", false, err)
+		}
 		// Submission may have succeeded even if the SSH connection dropped before
 		// stdout arrived. Recover from the marker or the immutable Slurm comment.
-		recoveredID, recoveryErr := a.recoverSchedulerID(ctx, cluster, task)
+		recoveryCtx, cancelRecovery := a.recoveryContext(ctx)
+		recoveredID, recoveryErr := a.recoverSchedulerID(recoveryCtx, cluster, task)
+		cancelRecovery()
 		if recoveryErr != nil || recoveredID == "" {
+			if submitUncertain || recoveryErr != nil {
+				return SubmitResult{}, a.failSubmissionUncertain(ctx, &task, "submit",
+					"Slurm submission may have succeeded, but its scheduler ID could not be recovered", err)
+			}
 			return SubmitResult{}, a.failSubmission(ctx, &task, "SUBMIT_FAILED", "submit",
 				"cannot submit task to Slurm", true, err)
 		}
@@ -539,21 +576,31 @@ func (a *App) Submit(
 	task.ComputeState = model.ComputeQueued
 	task.SubmittedAt = &now
 	task.UpdatedAt = now
-	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "SCHEDULER_ACCEPTED", "submit",
-		"Scheduler accepted task", map[string]string{"scheduler_id": schedulerID})); err != nil {
+	persistCtx, cancelPersist := a.persistenceContext(ctx)
+	err = a.Store.UpdateTaskWithEvent(persistCtx, &task, taskEvent(task, "SCHEDULER_ACCEPTED", "submit",
+		"Scheduler accepted task", map[string]string{"scheduler_id": schedulerID}))
+	cancelPersist()
+	if err != nil {
 		// The scheduler accepted the job. Preserve the complete recovery record
 		// remotely even when local persistence is unavailable.
-		_ = a.writeMetadata(ctx, cluster, task)
+		recoveryCtx, cancelRecovery := a.recoveryContext(ctx)
+		_ = a.writeMetadata(recoveryCtx, cluster, task)
+		cancelRecovery()
 		return SubmitResult{}, err
 	}
-	if err := a.writeMetadata(ctx, cluster, task); err != nil {
+	remoteCtx, cancelRemote = a.remoteContext(ctx)
+	err = a.writeMetadata(remoteCtx, cluster, task)
+	cancelRemote()
+	if err != nil {
 		if task.Metadata == nil {
 			task.Metadata = map[string]string{}
 		}
 		task.Metadata["remote_metadata_error"] = err.Error()
 		task.UpdatedAt = time.Now().UTC()
-		_ = a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "REMOTE_METADATA_WARNING", "recovery",
+		persistCtx, cancelPersist = a.persistenceContext(ctx)
+		_ = a.Store.UpdateTaskWithEvent(persistCtx, &task, taskEvent(task, "REMOTE_METADATA_WARNING", "recovery",
 			"Scheduler accepted task but metadata refresh failed", map[string]string{"error": err.Error()}))
+		cancelPersist()
 	}
 	return SubmitResult{Task: task}, nil
 }
@@ -936,8 +983,11 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	}
 	task.PullState = model.PullInProgress
 	task.UpdatedAt = time.Now().UTC()
-	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "PULL_STARTED", "pull",
-		"Selected file transfer started", map[string]string{"destination": destination})); err != nil {
+	persistCtx, cancelPersist := a.persistenceContext(ctx)
+	err = a.Store.UpdateTaskWithEvent(persistCtx, &task, taskEvent(task, "PULL_STARTED", "pull",
+		"Selected file transfer started", map[string]string{"destination": destination}))
+	cancelPersist()
+	if err != nil {
 		return PullResult{}, err
 	}
 	if err := a.Transfer.Pull(ctx, cluster, workDir, destination, files); err != nil {
@@ -950,11 +1000,16 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	} else {
 		task.PullState = model.PullPartial
 	}
-	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "PULL_COMPLETED", "pull",
-		"Selected file transfer completed", map[string]string{"files": fmt.Sprintf("%d", len(files))})); err != nil {
+	persistCtx, cancelPersist = a.persistenceContext(ctx)
+	err = a.Store.UpdateTaskWithEvent(persistCtx, &task, taskEvent(task, "PULL_COMPLETED", "pull",
+		"Selected file transfer completed", map[string]string{"files": fmt.Sprintf("%d", len(files))}))
+	cancelPersist()
+	if err != nil {
 		return PullResult{}, err
 	}
-	_ = a.writeMetadata(ctx, cluster, task)
+	remoteCtx, cancelRemote := a.remoteContext(ctx)
+	_ = a.writeMetadata(remoteCtx, cluster, task)
+	cancelRemote()
 	return PullResult{
 		Task: task, Files: files, Destination: destination,
 		TotalBytes: totalBytes,
@@ -1223,7 +1278,9 @@ func (a *App) Recover(ctx context.Context, cwd, taskID, targetName string) (mode
 				task.ComputeState, task.PullState)
 		}
 		if task.SchedulerID != "" &&
-			(task.ComputeState == model.ComputeCreated || task.ComputeState == model.ComputeSubmissionFailed) {
+			(task.ComputeState == model.ComputeCreated ||
+				task.ComputeState == model.ComputeSubmissionFailed ||
+				task.ComputeState == model.ComputeSubmissionUncertain) {
 			task.ComputeState = model.ComputeQueued
 		}
 	}
@@ -1327,10 +1384,45 @@ func (a *App) failSubmission(
 	task.Metadata["error_code"] = code
 	task.Metadata["error"] = cause.Error()
 	task.Metadata["error_stage"] = stage
-	_ = a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(*task, "SUBMISSION_FAILED", stage,
+	persistCtx, cancel := a.persistenceContext(ctx)
+	defer cancel()
+	_ = a.Store.UpdateTaskWithEvent(persistCtx, task, taskEvent(*task, "SUBMISSION_FAILED", stage,
 		msg, map[string]string{"code": code, "error": cause.Error()}))
 	return fault.Wrap(code, msg, retryable, cause).
 		WithTask(stage, "joyrun status "+task.ID, task.ComputeState, task.PullState)
+}
+
+func (a *App) failSubmissionUncertain(
+	ctx context.Context,
+	task *model.Task,
+	stage, msg string,
+	cause error,
+) error {
+	task.ComputeState = model.ComputeSubmissionUncertain
+	task.UpdatedAt = time.Now().UTC()
+	if task.Metadata == nil {
+		task.Metadata = map[string]string{}
+	}
+	task.Metadata["error_code"] = "SUBMISSION_UNCERTAIN"
+	task.Metadata["error"] = cause.Error()
+	task.Metadata["error_stage"] = stage
+	persistCtx, cancel := a.persistenceContext(ctx)
+	defer cancel()
+	_ = a.Store.UpdateTaskWithEvent(persistCtx, task, taskEvent(*task, "SUBMISSION_UNCERTAIN", stage,
+		msg, map[string]string{"code": "SUBMISSION_UNCERTAIN", "error": cause.Error()}))
+	return fault.Wrap("SUBMISSION_UNCERTAIN", msg, true, cause).
+		WithTask(stage, "joyrun status "+task.ID, task.ComputeState, task.PullState)
+}
+
+func (a *App) recordStage(
+	ctx context.Context,
+	task *model.Task,
+	eventType, stage, msg string,
+) error {
+	task.UpdatedAt = time.Now().UTC()
+	persistCtx, cancel := a.persistenceContext(ctx)
+	defer cancel()
+	return a.Store.UpdateTaskWithEvent(persistCtx, task, taskEvent(*task, eventType, stage, msg, nil))
 }
 
 func (a *App) failPull(
@@ -1339,17 +1431,26 @@ func (a *App) failPull(
 	stage, msg string,
 	cause error,
 ) error {
+	code := "PULL_FAILED"
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+		fault.As(cause).Code == "PULL_TIMEOUT" {
+		code = "PULL_TIMEOUT"
+	} else if errors.Is(ctx.Err(), context.Canceled) {
+		code = "PULL_CANCELLED"
+	}
 	task.PullState = model.PullFailed
 	task.UpdatedAt = time.Now().UTC()
 	if task.Metadata == nil {
 		task.Metadata = map[string]string{}
 	}
-	task.Metadata["error_code"] = "PULL_FAILED"
+	task.Metadata["error_code"] = code
 	task.Metadata["error"] = cause.Error()
 	task.Metadata["error_stage"] = stage
-	_ = a.Store.UpdateTaskWithEvent(ctx, task, taskEvent(*task, "PULL_FAILED", "pull",
-		msg, map[string]string{"stage": stage, "error": cause.Error()}))
-	return fault.Wrap("PULL_FAILED", msg, true, cause).
+	persistCtx, cancel := a.persistenceContext(ctx)
+	defer cancel()
+	_ = a.Store.UpdateTaskWithEvent(persistCtx, task, taskEvent(*task, "PULL_FAILED", "pull",
+		msg, map[string]string{"code": code, "stage": stage, "error": cause.Error()}))
+	return fault.Wrap(code, msg, true, cause).
 		WithTask("pull", "joyrun pull "+task.ID, task.ComputeState, task.PullState)
 }
 
@@ -1369,9 +1470,71 @@ func terminalComputeState(state string) bool {
 func refreshableComputeState(state string) bool {
 	return state == model.ComputeCreated ||
 		state == model.ComputeSubmissionFailed ||
+		state == model.ComputeSubmissionUncertain ||
 		state == model.ComputeQueued ||
 		state == model.ComputeRunning ||
 		state == model.ComputeUnknown
+}
+
+func (a *App) remoteContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := a.RemoteTimeout
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func (a *App) submitContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := a.SubmitTimeout
+	if timeout <= 0 {
+		timeout = 45 * time.Second
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func (a *App) recoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := a.RecoveryTimeout
+	if timeout <= 0 {
+		timeout = 90 * time.Second
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+}
+
+func (a *App) persistenceContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := a.PersistenceTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+}
+
+func (a *App) progress(format string, args ...any) {
+	if a.Progress != nil {
+		fmt.Fprintf(a.Progress, format+"\n", args...)
+	}
+}
+
+func operationFailure(ctx context.Context, fallback, timeout string) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return timeout
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "SUBMISSION_CANCELLED"
+	}
+	return fallback
+}
+
+func transferFailure(ctx context.Context, err error) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "UPLOAD_TIMEOUT"
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "SUBMISSION_CANCELLED"
+	}
+	if fault.As(err).Code == "UPLOAD_TIMEOUT" {
+		return "UPLOAD_TIMEOUT"
+	}
+	return "UPLOAD_FAILED"
 }
 
 func message(prefix, detail string) string {

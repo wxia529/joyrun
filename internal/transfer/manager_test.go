@@ -56,7 +56,7 @@ func TestExplicitMissingBackendFails(t *testing.T) {
 	}
 }
 
-func TestAutoFallsBackWhenRemoteRsyncIsMissing(t *testing.T) {
+func TestAutoSelectionDoesNotProbeRemoteRsync(t *testing.T) {
 	manager := Manager{
 		GOOS:     "linux",
 		LookPath: func(name string) (string, error) { return "/bin/" + name, nil },
@@ -66,19 +66,8 @@ func TestAutoFallsBackWhenRemoteRsyncIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "sftp" {
-		t.Fatalf("want sftp fallback, got %s", got)
-	}
-}
-
-func TestAutoPropagatesRemoteDetectionFailure(t *testing.T) {
-	manager := Manager{
-		GOOS:     "linux",
-		LookPath: func(name string) (string, error) { return "/bin/" + name, nil },
-		Runner:   staticCommandRunner{err: errors.New("connection failed")},
-	}
-	if _, err := manager.backend(context.Background(), model.Cluster{Host: "cluster", Transfer: "auto"}); err == nil {
-		t.Fatal("expected remote detection failure")
+	if got != "rsync" {
+		t.Fatalf("want rsync without a remote probe, got %s", got)
 	}
 }
 

@@ -301,6 +301,9 @@ Interpret `compute_state`:
 - `created`: local task exists but scheduler acceptance is not confirmed;
 - `submission_failed`: submission pipeline failed; check status before considering
   another submission;
+- `submission_uncertain`: `sbatch` may have succeeded but its scheduler ID was
+  not recovered; query the exact Task with `status` and never resubmit it
+  blindly;
 - `queued`: accepted and waiting for resources;
 - `running`: executing remotely;
 - `completed`: computation finished and normal pull is allowed;

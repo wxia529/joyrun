@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"syscall"
 
 	"github.com/wxia529/joyrun/internal/cli"
 )
@@ -11,7 +13,10 @@ import (
 var version = "dev"
 
 func main() {
-	os.Exit(cli.Run(context.Background(), os.Args[1:], resolvedVersion()))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	exitCode := cli.Run(ctx, os.Args[1:], resolvedVersion())
+	stop()
+	os.Exit(exitCode)
 }
 
 func resolvedVersion() string {

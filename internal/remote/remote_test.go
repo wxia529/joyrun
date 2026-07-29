@@ -31,3 +31,17 @@ func TestWriteFileUsesAtomicReplacement(t *testing.T) {
 		t.Fatalf("remote file was not written atomically: %q", runner.command)
 	}
 }
+
+func TestOpenSSHOptionsBoundConnectionStalls(t *testing.T) {
+	options := strings.Join(OpenSSHOptions(), " ")
+	for _, expected := range []string{
+		"BatchMode=yes",
+		"ConnectTimeout=15",
+		"ServerAliveInterval=15",
+		"ServerAliveCountMax=3",
+	} {
+		if !strings.Contains(options, expected) {
+			t.Fatalf("missing OpenSSH safeguard %q in %q", expected, options)
+		}
+	}
+}

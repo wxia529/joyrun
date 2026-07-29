@@ -230,9 +230,14 @@ retry `pull`, not the calculation.
 JoyRun tracks computation and pull progress independently:
 
 ```text
-compute_state: created -> queued -> running -> completed|failed|cancelled
+compute_state: created -> submission_failed|submission_uncertain
+                       -> queued -> running -> completed|failed|cancelled
 pull_state:    not_pulled -> pulling -> pulled|partial|failed
 ```
+
+`submission_uncertain` means the `sbatch` connection ended before JoyRun could
+prove whether Slurm accepted the job. Run `status` on that exact Task ID;
+never repeat `submit` until reconciliation is complete.
 
 `status --all` refreshes non-terminal tasks without resubmitting.
 `inspect --events` returns the immutable submission snapshot and append-only

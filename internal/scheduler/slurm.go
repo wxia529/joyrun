@@ -2,7 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +51,7 @@ type NodesResult struct {
 
 func (s Slurm) Submit(ctx context.Context, host, workDir, taskID, partition string) (string, error) {
 	command := "cd " + remote.Quote(workDir) +
+		" && chmod 700 joyrun-job.sh" +
 		" && jobid=$(sbatch --parsable --comment=" + remote.Quote("joyrun:"+taskID) +
 		" --partition=" + remote.Quote(partition) +
 		" --output=joyrun-slurm-%j.log joyrun-job.sh) && jobid=${jobid%%;*}" +
@@ -69,6 +72,15 @@ func (s Slurm) Submit(ctx context.Context, host, workDir, taskID, partition stri
 		return "", fault.Wrap("SUBMIT_FAILED", fmt.Sprintf("unexpected sbatch output %q", id), false, err)
 	}
 	return id, nil
+}
+
+func SubmissionDefinitelyRejected(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	code := exitErr.ExitCode()
+	return code >= 0 && code != 255
 }
 
 func (s Slurm) FindByTaskID(ctx context.Context, host, taskID string, since time.Time) (string, error) {
