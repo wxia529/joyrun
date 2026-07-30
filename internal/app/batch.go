@@ -40,8 +40,7 @@ type SubmitManyResult struct {
 
 type PullManyOptions struct {
 	PullOptions
-	Finished bool
-	BatchID  string
+	BatchID string
 }
 
 type PullManyItem struct {
@@ -314,26 +313,7 @@ func (a *App) PullMany(
 		return PullManyResult{}, err
 	}
 	var tasks []model.Task
-	var selectionFailures []BatchFailure
-	if options.Finished {
-		status := a.StatusAll(ctx, cwd)
-		for _, failure := range status.Failures {
-			selectionFailures = append(selectionFailures, BatchFailure{
-				TaskID: failure.TaskID, Error: failure.Error,
-			})
-		}
-		seenSources := map[string]bool{}
-		for _, task := range status.Tasks {
-			if seenSources[task.SourcePath] {
-				continue
-			}
-			seenSources[task.SourcePath] = true
-			if terminalComputeState(task.ComputeState) &&
-				task.PullState != model.PullSucceeded {
-				tasks = append(tasks, task)
-			}
-		}
-	} else if options.BatchID != "" {
+	if options.BatchID != "" {
 		indexed, err := a.Store.ListTasks(ctx, p.ProjectID)
 		if err != nil {
 			return PullManyResult{}, err
@@ -365,12 +345,6 @@ func (a *App) PullMany(
 		}
 	}
 	if len(tasks) == 0 {
-		if len(selectionFailures) > 0 {
-			return PullManyResult{
-				PullID: pullID, SourceBatchID: options.BatchID,
-				Failures: selectionFailures, DryRun: options.DryRun,
-			}, nil
-		}
 		return PullManyResult{}, fault.New("NO_TASKS_MATCHED",
 			"no tasks matched the batch pull selection", false)
 	}
@@ -448,7 +422,7 @@ func (a *App) PullMany(
 	}
 	result := PullManyResult{
 		PullID: pullID, SourceBatchID: options.BatchID,
-		Failures: selectionFailures, DryRun: options.DryRun,
+		DryRun: options.DryRun,
 	}
 	if options.DryRun {
 		for _, plan := range plans {

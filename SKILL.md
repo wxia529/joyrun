@@ -99,9 +99,9 @@ Use the same public commands for one or many objects:
 - `submit` primarily accepts positional Source paths with unrelated names. Use
   `--glob` only for a verified pattern and `--from` for a reviewed list. One
   Source uses the single path; 2–100 preserve independent Tasks in one batch.
-- `pull` accepts explicit Task IDs or Sources, or exactly one of `--batch` and
-  `--finished`. One explicit Task uses the single path; multiple Tasks use one
-  transfer per cluster. Never combine selector modes.
+- `pull` accepts explicit Task IDs or Sources, or `--batch` for one known
+  submission. One explicit Task uses the single path; multiple Tasks use one
+  transfer per cluster. Never use a project-wide implicit selection.
 - Quote `--glob` for cross-platform expansion. A `--from` file contains one
   path or ID per line, ignores blanks and `#` comments, and resolves from cwd.
 - All Sources in one submission share the Target, parameter overrides,
@@ -385,13 +385,11 @@ For several Tasks, preview and use the native batch transfer:
 ```bash
 joyrun pull jr_TASK1 jr_TASK2 --dry-run --json
 joyrun pull --batch jb_BATCH_ID --dry-run --json
-joyrun pull --finished --json
 ```
 
-`--finished` selects the newest terminal, not-yet-pulled Task per Source. Use
-explicit IDs when remote post-processing created files for an already pulled
-Task. On `BATCH_LOCAL_CONFLICT`, separate the conflicting Tasks rather than
-choosing an arbitrary overwrite order.
+Use exact IDs when remote post-processing created files for an already pulled
+Task. Never infer a project-wide result set. On `BATCH_LOCAL_CONFLICT`,
+separate the conflicting Tasks rather than choosing an overwrite order.
 
 Inspect remote paths and preview the exact pull first when file sizes or
 artifact selection are uncertain:

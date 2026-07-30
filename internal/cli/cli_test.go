@@ -77,6 +77,20 @@ func TestCommandHelpDoesNotNeedConfiguration(t *testing.T) {
 	}
 }
 
+func TestPullRejectsRemovedFinishedSelector(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	c := &command{
+		ctx: context.Background(), stdout: &stdout, stderr: &stderr,
+	}
+	err := c.pull(&app.App{}, []string{"--finished"})
+	if fault.As(err).Code != "INVALID_ARGUMENT" {
+		t.Fatalf("expected INVALID_ARGUMENT, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "flag provided but not defined: -finished") {
+		t.Fatalf("unexpected removed-selector error: %v", err)
+	}
+}
+
 func TestHumanErrorShowsRecoveryContext(t *testing.T) {
 	var stderr bytes.Buffer
 	c := &command{stderr: &stderr}

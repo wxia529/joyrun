@@ -591,7 +591,6 @@ func (c *command) pull(application *app.App, args []string) error {
 	flags.BoolVar(&options.OverwriteInputs, "overwrite-inputs", false, "allow submitted inputs to be overwritten")
 	flags.BoolVar(&options.Live, "live", false, "pull files while tasks are not complete")
 	flags.BoolVar(&options.DryRun, "dry-run", false, "preview selected files")
-	flags.BoolVar(&options.Finished, "finished", false, "select all locally known finished tasks")
 	flags.StringVar(&batchID, "batch", "", "select tasks from a submit batch ID")
 	flags.Var(&includes, "include", "include glob (repeatable)")
 	flags.Var(&globs, "glob", "source glob expanded by JoyRun")
@@ -602,7 +601,7 @@ func (c *command) pull(application *app.App, args []string) error {
 		},
 		map[string]bool{
 			"--all": true, "--overwrite-inputs": true, "--live": true,
-			"--dry-run": true, "--finished": true,
+			"--dry-run": true,
 		})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid pull arguments", false, err)
 	}
@@ -616,9 +615,6 @@ func (c *command) pull(application *app.App, args []string) error {
 		return err
 	}
 	selectors := 0
-	if options.Finished {
-		selectors++
-	}
 	if options.BatchID != "" {
 		selectors++
 	}
@@ -627,14 +623,14 @@ func (c *command) pull(application *app.App, args []string) error {
 	}
 	if selectors > 1 {
 		return fault.New("INVALID_ARGUMENT",
-			"--finished, --batch, and explicit selectors are mutually exclusive", false)
+			"--batch and explicit selectors are mutually exclusive", false)
 	}
 	if selectors == 0 {
 		return fault.New("INVALID_ARGUMENT",
-			"usage: joyrun pull TASK_OR_SOURCE... | --batch BATCH_ID | --finished", false)
+			"usage: joyrun pull TASK_OR_SOURCE... | --batch BATCH_ID", false)
 	}
 	cwd, _ := os.Getwd()
-	if len(identifiers) == 1 && options.BatchID == "" && !options.Finished {
+	if len(identifiers) == 1 && options.BatchID == "" {
 		if options.DryRun {
 			fmt.Fprintln(c.stderr, "Selecting remote files without downloading...")
 		} else {
@@ -867,7 +863,7 @@ Usage:
   joyrun inspect <source|task-id> --events
   joyrun logs <source|task-id> [--lines N] [--file PATH]
   joyrun files <source|task-id>
-  joyrun pull <source|task-id>... [--glob pattern] [--from file] [--batch id|--finished] [--all|--include glob] [--live] [--dry-run]
+  joyrun pull <source|task-id>... [--glob pattern] [--from file] [--batch id] [--all|--include glob] [--live] [--dry-run]
   joyrun cancel <task-id>
   joyrun target list
   joyrun target show <target>
@@ -900,7 +896,7 @@ Use --glob for a reliable shared pattern or --from for a reviewed source list.
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
 		"logs":    "Usage: joyrun logs <source|task-id> [--lines N] [--file PATH]\n",
 		"files":   "Usage: joyrun files <source|task-id>\n",
-		"pull":    "Usage: joyrun pull <source|task-id>... [--glob pattern] [--from file] [--batch id|--finished] [--all|--include glob] [--live] [--dry-run]\n",
+		"pull":    "Usage: joyrun pull <source|task-id>... [--glob pattern] [--from file] [--batch id] [--all|--include glob] [--live] [--dry-run]\n",
 		"cancel":  "Usage: joyrun cancel <task-id>\n",
 		"target":  "Usage: joyrun target <list|show TARGET|params TARGET|nodes TARGET [--partition name]>\n",
 		"doctor":  "Usage: joyrun doctor <target>\n",

@@ -256,14 +256,13 @@ joyrun pull jr_TASK1 jr_TASK2 --dry-run
 joyrun pull jr_TASK1 jr_TASK2 --json
 joyrun pull --batch jb_BATCH_ID --json
 joyrun pull --glob "task*/*.inp" --json
-joyrun pull --finished --json
 ```
 
 `--batch` selects the independent Tasks created by one multi-source `submit`.
-`--finished` selects only the newest terminal, not-yet-pulled Task for each
-Source. Explicit IDs can resynchronize older or already-pulled results. These
-selection modes are mutually exclusive. One batch accepts at most 100 Tasks.
-Paths in a `--from` file are resolved from the current working directory.
+Use explicit Task IDs or Source paths for deliberate selections, including
+resynchronizing older or already-pulled results. `--batch` and explicit
+selectors are mutually exclusive. One pull accepts at most 100 Tasks. Paths
+in a `--from` file resolve from the current working directory.
 
 Successful non-preview `submit` and all `pull` results return arrays named
 `tasks` and `failures` in JSON, even when only one Task is selected.

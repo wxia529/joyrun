@@ -5,6 +5,13 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.8] - 2026-07-30
+
+### Removed
+
+- Removed the project-wide `pull --finished` selector. Pull now requires exact
+  Task/Source selectors or the ID of one known submission batch.
+
 ## [v0.1.7] - 2026-07-30
 
 ### Changed

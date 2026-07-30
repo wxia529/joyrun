@@ -82,16 +82,15 @@ joyrun pull SOURCE_OR_TASK --all
 joyrun pull SOURCE_OR_TASK --live --include GLOB
 joyrun pull SOURCE_OR_TASK... [--glob GLOB] [--from FILE] [--dry-run]
 joyrun pull --batch BATCH_ID [--dry-run]
-joyrun pull --finished [--dry-run]
 ```
 
 Default patterns are frozen in the Task at submission. Submitted inputs are
 protected even with `--all`; `--overwrite-inputs` is required to replace them.
 Use `--live` only for deliberate diagnostics before computation completes.
 Batch pull detects two Tasks writing the same local path before transfer.
-`--batch` selects all Tasks from one multi-source submission. `--finished`
-selects the newest terminal, not-yet-pulled Task per Source. Selector modes
-are mutually exclusive. A batch contains at most 100 Tasks.
+`--batch` selects all Tasks from one multi-source submission. Otherwise select
+Task IDs or Source paths explicitly. `--batch` and explicit selectors are
+mutually exclusive. A batch contains at most 100 Tasks.
 
 In JSON mode, successful non-preview submission and pull results expose
 `tasks` and `failures` arrays. Submit preview exposes `previews`; a total
