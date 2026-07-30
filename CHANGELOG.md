@@ -5,6 +5,13 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.10] - 2026-07-30
+
+### Changed
+
+- Refined Agent resource guidance to separate reasoned node counts from
+  generous use of available per-node memory.
+
 ## [v0.1.9] - 2026-07-30
 
 ### Changed
