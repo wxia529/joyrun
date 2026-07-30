@@ -5,6 +5,13 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.11] - 2026-07-30
+
+### Changed
+
+- Added a hard Project ID safety boundary for operations on tasks, requiring
+  repeated explicit confirmation before any out-of-project mutation.
+
 ## [v0.1.10] - 2026-07-30
 
 ### Changed
