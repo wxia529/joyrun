@@ -16,6 +16,16 @@ Run from the JoyRun project root or a descendant. Use `--config PATH` only
 when the user identifies an alternate configuration. Use `--json` for
 programmatic output; treat stdout as JSON and stderr as diagnostics.
 
+## Project safety boundary
+
+Treat the current Project ID as a hard boundary. Never cancel, recover, pull,
+overwrite, delete, clean, or otherwise mutate another person's or an
+out-of-project JoyRun Task. Read-only inspection is allowed only when explicitly
+requested. If the user asks to mutate such a Task, show the exact Task ID,
+Project ID, remote path, local destination, and operation; require two separate
+explicit confirmations, including a final confirmation after that impact
+summary. Never infer either confirmation from a broad request or conversation.
+
 ## Establish context
 
 1. Confirm that `joyrun` is available:
@@ -254,11 +264,12 @@ is a warning, not a JoyRun error. Query `target nodes` only when the user asks
 about current capacity or when choosing among already allowed partitions is
 part of the request; live idleness is not resource validation.
 
-When autonomously selecting resources for tasks, err on the side of generosity
-with CPU cores and memory. Over-provisioning ensures efficient computation and
-avoids resource contention, while under-provisioning can lead to failed jobs or
-excessive runtime. Prefer allocating more resources than strictly necessary
-rather than risking insufficient allocation.
+When autonomously selecting resources, allocate generously within the target's
+limits. Choose the node count from the task's parallel scale, software behavior,
+and target partition; do not add nodes without a scaling reason. Once nodes are
+selected, use their available memory generously rather than minimizing the
+request to save unused capacity. Stay within each node's declared memory limit,
+and leave only a deliberate safety margin when the target requires one.
 
 Before the first real use of a target on the current machine, run:
 
@@ -274,10 +285,11 @@ non-blocking; `fail` checks are blocking and make the command exit nonzero.
 Submit only after preview succeeds. Supply declared parameters and optional
 dependencies with repeatable flags:
 
-When autonomously selecting tasks for submission, do not be stingy with CPU
-cores and memory. Allocate generous resources to ensure efficient computation
-and avoid resource contention. Prefer over-provisioning rather than risking
-insufficient resources that could lead to failed jobs or excessive runtime.
+When selecting submission parameters, use a generous allocation within target
+limits. Choose nodes according to the software's parallel scaling and task
+size, then use the selected nodes' memory generously. Do not reduce memory just
+to avoid reserving capacity that the task can use; keep it within per-node
+capacity and apply only the safety margin required by the target.
 
 ```bash
 joyrun submit SOURCE -t TARGET \
@@ -389,44 +401,23 @@ task because its outputs may be incomplete. Use the target's default patterns:
 
 ```bash
 joyrun pull jr_TASK_ID --json
-```
-
-For several Tasks, preview and use the native batch transfer:
-
-```bash
 joyrun pull jr_TASK1 jr_TASK2 --dry-run --json
 joyrun pull --batch jb_BATCH_ID --dry-run --json
+joyrun files jr_TASK_ID --json
+joyrun pull jr_TASK_ID --dry-run --json
+joyrun pull jr_TASK_ID --include "*.out" --include "*.xyz" --json
+joyrun pull jr_TASK_ID --all --json
+joyrun pull jr_TASK_ID --live --include "partial.log" --json
 ```
 
 Use exact IDs when remote post-processing created files for an already pulled
-Task. Never infer a project-wide result set. On `BATCH_LOCAL_CONFLICT`,
-separate the conflicting Tasks rather than choosing an overwrite order.
-
-Inspect remote paths and preview the exact pull first when file sizes or
-artifact selection are uncertain:
-
-```bash
-joyrun files jr_TASK_ID --json
-joyrun pull jr_TASK_ID --dry-run --json
-```
-
-Prefer explicit subsets when only particular outputs are required:
-
-```bash
-joyrun pull jr_TASK_ID \
-  --include "*.out" \
-  --include "*.xyz" \
-  --json
-```
+Task. Never infer a project-wide result set. Preview uncertain paths or large
+transfers first; on `BATCH_LOCAL_CONFLICT`, separate the conflicting Tasks.
 
 `--include` and `--all` are mutually exclusive.
 
 Use `--all` only when the user needs every generated file; HPC outputs can be
 very large:
-
-```bash
-joyrun pull jr_TASK_ID --all --json
-```
 
 Submitted input files are protected by default. Never use
 `--overwrite-inputs` unless the user explicitly requests restoring or
@@ -436,11 +427,7 @@ newer results, inspect `files`, run `pull --dry-run`, and confirm that replacing
 those outputs matches the user's intent.
 
 Use `--live` only for deliberate diagnostic retrieval from a task that has not
-completed:
-
-```bash
-joyrun pull jr_TASK_ID --live --include "partial.log" --json
-```
+completed.
 
 A transfer failure does not imply computation failure. Retry `pull`; do not
 resubmit the calculation.
