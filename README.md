@@ -211,19 +211,32 @@ joyrun status jr_TASK_ID --json
 joyrun logs jr_TASK_ID --lines 200 --json
 ```
 
-Submit differently named sources as one efficient batch while preserving one
-independent Task and Slurm job per source:
+The primary way to submit multiple jobs is to list every Source path directly.
+The paths do not need to share a directory, filename, or naming pattern:
 
 ```bash
-joyrun submit task01/benzene.inp task02/water.inp -t gibbs/orca --dry-run
+joyrun submit \
+  benzene/opt.inp \
+  water/frequency.inp \
+  methane/single-point.inp \
+  -t gibbs/orca \
+  --dry-run
+```
+
+Use `--glob` only when the desired Sources follow a reliable pattern, or
+`--from` when a reviewed text file contains one Source path per line:
+
+```bash
 joyrun submit --glob "task*/*.inp" -t gibbs/orca --json
 joyrun submit --from sources.txt -t gibbs/orca --json
 ```
 
-Batch submission validates every source locally, uploads once, and opens one
-remote Slurm submission session. Partial failures are reported per Task.
-One batch accepts at most 100 distinct sources; split larger campaigns into
-deliberate groups so failures and scheduler load remain reviewable.
+All three forms create the same kind of batch. JoyRun validates every Source
+locally, uploads once, and opens one remote Slurm submission session while
+preserving one independent Task and Slurm job per Source. Every Source in the
+command shares the Target, partition, parameter overrides, and dependency
+includes. Partial failures are reported per Task. One batch accepts at most
+100 distinct Sources.
 
 A source path resolves to its newest task. Use an exact Task ID for
 cancellation, recovery, and other mutations.

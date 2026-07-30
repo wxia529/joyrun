@@ -64,8 +64,16 @@ func TestCommandHelpDoesNotNeedConfiguration(t *testing.T) {
 	if !c.commandUsage("submit") {
 		t.Fatal("submit help was not recognized")
 	}
-	if !strings.Contains(stdout.String(), "joyrun submit") {
-		t.Fatalf("unexpected command help: %q", stdout.String())
+	help := stdout.String()
+	for _, expected := range []string{
+		"joyrun submit <source> [<source>...]",
+		"do not need matching filenames",
+		"Use --glob",
+		"--from for a reviewed source list",
+	} {
+		if !strings.Contains(help, expected) {
+			t.Fatalf("submit help is missing %q:\n%s", expected, help)
+		}
 	}
 }
 

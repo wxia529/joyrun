@@ -48,11 +48,26 @@ joyrun cancel TASK_ID
 Always preview a new source/target combination. A source path resolves to its
 newest task; use the exact `jr_...` ID for cancellation and other mutations.
 Submission is asynchronous and returns after Slurm acceptance is recorded.
+
+List multiple Source paths directly as the primary batch interface. They may
+have unrelated directories and filenames:
+
+```bash
+joyrun submit \
+  benzene/opt.inp \
+  water/frequency.inp \
+  methane/single-point.inp \
+  -t TARGET \
+  --dry-run
+```
+
+Use `--glob` only for Sources with a reliable shared pattern. Use `--from` for
+a reviewed list containing one Source path per line; blank lines and `#`
+comments are ignored, and paths resolve from the current working directory.
 One resolved Source uses the single-task path; 2–100 Sources use transport
-batching. Batch submission validates all sources before SSH and preserves one
-independent Task and Slurm job for each source.
-`--from` reads one source per line, ignores blank lines and `#` comments, and
-resolves paths from the current working directory.
+batching. All Sources share the Target, partition, parameters, and includes.
+JoyRun validates all Sources before SSH and preserves one independent Task and
+Slurm job for each Source.
 `status --all` batches active scheduler IDs by cluster. Use exact
 `status TASK_ID` when a task has no scheduler ID and needs reconciliation.
 

@@ -5,6 +5,14 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.7] - 2026-07-30
+
+### Changed
+
+- Clarified across CLI help, user documentation, and the Agent Skill that
+  listing multiple Source paths directly is the primary batch-submission
+  interface; `--glob` and `--from` are optional convenience selectors.
+
 ## [v0.1.6] - 2026-07-30
 
 ### Changed

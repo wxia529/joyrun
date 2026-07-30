@@ -96,15 +96,14 @@ programmatic output; treat stdout as JSON and stderr as diagnostics.
 
 Use the same public commands for one or many objects:
 
-- `submit` resolves positional Sources plus repeatable `--glob` and `--from`
-  selectors. One distinct Source uses the single-task path; 2–100 Sources use
-  one batch transport while preserving independent Tasks and Slurm jobs.
+- `submit` primarily accepts positional Source paths with unrelated names. Use
+  `--glob` only for a verified pattern and `--from` for a reviewed list. One
+  Source uses the single path; 2–100 preserve independent Tasks in one batch.
 - `pull` accepts explicit Task IDs or Sources, or exactly one of `--batch` and
-  `--finished`. One explicit Task uses the single-task path; multiple Tasks use
-  one transfer per cluster. Never combine these selector modes.
-- Quote `--glob` values so JoyRun expands them consistently across platforms.
-  A `--from` file contains one path or ID per line; blank lines and lines
-  beginning with `#` are ignored. Values resolve from the current directory.
+  `--finished`. One explicit Task uses the single path; multiple Tasks use one
+  transfer per cluster. Never combine selector modes.
+- Quote `--glob` for cross-platform expansion. A `--from` file contains one
+  path or ID per line, ignores blanks and `#` comments, and resolves from cwd.
 - All Sources in one submission share the Target, parameter overrides,
   partition, and dependency includes. Split the submission if those differ.
 
@@ -115,8 +114,7 @@ Keep the identifiers distinct:
   `pull --batch`;
 - `jp_...` correlates one batch pull operation and is not a selector.
 
-For successful non-preview submit and pull commands, parse
-`result.tasks` and `result.failures` even when only one Task was selected.
+For successful non-preview submit and pull commands, parse `result.tasks` and `result.failures` even for one Task.
 Submit preview uses `result.previews`; multi-source submit also returns
 `result.batch_id`. A batch can partially succeed: JoyRun then emits a valid
 JSON result, records accepted Tasks, and exits nonzero because `failures` is
@@ -291,10 +289,15 @@ to bypass automatically.
 Submission is asynchronous. Return control after JoyRun returns the task ID.
 Do not keep a terminal occupied waiting for a long computation.
 
-For two or more sources using the same Target, prefer native batching:
+For two or more Sources using the same Target, list the paths directly. This
+is the primary batch interface and does not require matching filenames:
 
 ```bash
-joyrun submit path/a.inp other/different-name.inp -t TARGET --dry-run --json
+joyrun submit benzene/opt.inp water/frequency.inp methane/sp.inp \
+  -t TARGET --dry-run --json
+```
+
+```bash
 joyrun submit --glob "task*/*.inp" -t TARGET --json
 joyrun submit --from sources.txt -t TARGET --json
 ```

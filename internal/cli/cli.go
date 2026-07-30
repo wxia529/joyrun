@@ -885,9 +885,16 @@ Global options:
 
 func (c *command) commandUsage(name string) bool {
 	usage := map[string]string{
-		"config":  "Usage: joyrun config <path|init|validate>\n",
-		"init":    "Usage: joyrun init [directory]\n",
-		"submit":  "Usage: joyrun submit <source>... -t <target> [--glob pattern] [--from file] [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]\n",
+		"config": "Usage: joyrun config <path|init|validate>\n",
+		"init":   "Usage: joyrun init [directory]\n",
+		"submit": `Usage:
+  joyrun submit <source> [<source>...] -t <target> [options]
+  joyrun submit --glob <pattern> -t <target> [options]
+  joyrun submit --from <file> -t <target> [options]
+
+List multiple source paths directly; they do not need matching filenames.
+Use --glob for a reliable shared pattern or --from for a reviewed source list.
+`,
 		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
 		"list":    "Usage: joyrun list [source]\n",
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
