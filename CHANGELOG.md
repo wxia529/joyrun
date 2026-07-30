@@ -5,6 +5,12 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.9] - 2026-07-30
+
+### Changed
+
+- Updated the Agent Skill guidance for autonomous CPU and memory selection.
+
 ## [v0.1.8] - 2026-07-30
 
 ### Removed

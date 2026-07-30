@@ -254,6 +254,12 @@ is a warning, not a JoyRun error. Query `target nodes` only when the user asks
 about current capacity or when choosing among already allowed partitions is
 part of the request; live idleness is not resource validation.
 
+When autonomously selecting resources for tasks, err on the side of generosity
+with CPU cores and memory. Over-provisioning ensures efficient computation and
+avoids resource contention, while under-provisioning can lead to failed jobs or
+excessive runtime. Prefer allocating more resources than strictly necessary
+rather than risking insufficient allocation.
+
 Before the first real use of a target on the current machine, run:
 
 ```bash
@@ -267,6 +273,11 @@ non-blocking; `fail` checks are blocking and make the command exit nonzero.
 
 Submit only after preview succeeds. Supply declared parameters and optional
 dependencies with repeatable flags:
+
+When autonomously selecting tasks for submission, do not be stingy with CPU
+cores and memory. Allocate generous resources to ensure efficient computation
+and avoid resource contention. Prefer over-provisioning rather than risking
+insufficient resources that could lead to failed jobs or excessive runtime.
 
 ```bash
 joyrun submit SOURCE -t TARGET \
