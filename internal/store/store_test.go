@@ -258,3 +258,81 @@ func TestRejectsNonStableDatabaseMarker(t *testing.T) {
 		t.Fatalf("expected non-stable database to be rejected, got %v", err)
 	}
 }
+
+func TestCreateTasksIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p := model.Project{ProjectID: "pj_batch", Root: t.TempDir()}
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	first := &model.Task{
+		ID: "jr_duplicate", ProjectID: p.ProjectID, SourcePath: "one",
+		SourceWorkDir: ".", TargetName: "c/run", ClusterName: "c",
+		RemoteDir: "/tmp/jr_duplicate", ComputeState: model.ComputeCreated,
+		PullState: model.PullNotPulled, CreatedAt: now, UpdatedAt: now,
+	}
+	second := *first
+	second.SourcePath = "two"
+	if err := s.CreateTasks(ctx, []*model.Task{first, &second}); err == nil {
+		t.Fatal("expected duplicate task ID to fail the batch")
+	}
+	if _, err := s.GetTask(ctx, first.ID); fault.As(err).Code != "TASK_NOT_FOUND" {
+		t.Fatalf("partial batch task was committed: %v", err)
+	}
+}
+
+func TestUpdateTasksWithEventsIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p := model.Project{ProjectID: "pj_batch_update", Root: t.TempDir()}
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tasks := []*model.Task{
+		{
+			ID: "jr_batch_update_one", ProjectID: p.ProjectID, SourcePath: "one",
+			SourceWorkDir: ".", TargetName: "c/run", ClusterName: "c",
+			RemoteDir: "/tmp/jr_batch_update_one", ComputeState: model.ComputeCompleted,
+			PullState: model.PullNotPulled, CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "jr_batch_update_two", ProjectID: p.ProjectID, SourcePath: "two",
+			SourceWorkDir: ".", TargetName: "c/run", ClusterName: "c",
+			RemoteDir: "/tmp/jr_batch_update_two", ComputeState: model.ComputeCompleted,
+			PullState: model.PullNotPulled, CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	if err := s.CreateTasks(ctx, tasks); err != nil {
+		t.Fatal(err)
+	}
+	tasks[0].PullState = model.PullInProgress
+	tasks[1].PullState = model.PullInProgress
+	tasks[1].Revision--
+	events := []model.TaskEvent{
+		{Type: "PULL_STARTED", Stage: "pull"},
+		{Type: "PULL_STARTED", Stage: "pull"},
+	}
+	if err := s.UpdateTasksWithEvents(ctx, tasks, events); fault.As(err).Code != "DATABASE_CONFLICT" {
+		t.Fatalf("expected atomic batch conflict, got %v", err)
+	}
+	for _, task := range tasks {
+		stored, err := s.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.PullState != model.PullNotPulled || stored.Revision != 1 {
+			t.Fatalf("partial batch update was committed: %#v", stored)
+		}
+	}
+}

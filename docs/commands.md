@@ -33,8 +33,10 @@ prediction. An override must appear in `placement.allowed_partitions`.
 ## Submit and monitor
 
 ```bash
-joyrun submit SOURCE -t TARGET [--partition NAME] [--set KEY=VALUE]
-joyrun submit SOURCE -t TARGET [--include GLOB] --dry-run
+joyrun submit SOURCE... -t TARGET [--partition NAME] [--set KEY=VALUE]
+joyrun submit SOURCE... -t TARGET [--include GLOB] --dry-run
+joyrun submit --glob GLOB -t TARGET
+joyrun submit --from FILE -t TARGET
 joyrun status SOURCE_OR_TASK
 joyrun status --all
 joyrun list [SOURCE]
@@ -46,6 +48,13 @@ joyrun cancel TASK_ID
 Always preview a new source/target combination. A source path resolves to its
 newest task; use the exact `jr_...` ID for cancellation and other mutations.
 Submission is asynchronous and returns after Slurm acceptance is recorded.
+One resolved Source uses the single-task path; 2–100 Sources use transport
+batching. Batch submission validates all sources before SSH and preserves one
+independent Task and Slurm job for each source.
+`--from` reads one source per line, ignores blank lines and `#` comments, and
+resolves paths from the current working directory.
+`status --all` batches active scheduler IDs by cluster. Use exact
+`status TASK_ID` when a task has no scheduler ID and needs reconciliation.
 
 ## Inspect and pull files
 
@@ -56,11 +65,23 @@ joyrun pull SOURCE_OR_TASK
 joyrun pull SOURCE_OR_TASK --include GLOB
 joyrun pull SOURCE_OR_TASK --all
 joyrun pull SOURCE_OR_TASK --live --include GLOB
+joyrun pull SOURCE_OR_TASK... [--glob GLOB] [--from FILE] [--dry-run]
+joyrun pull --batch BATCH_ID [--dry-run]
+joyrun pull --finished [--dry-run]
 ```
 
 Default patterns are frozen in the Task at submission. Submitted inputs are
 protected even with `--all`; `--overwrite-inputs` is required to replace them.
 Use `--live` only for deliberate diagnostics before computation completes.
+Batch pull detects two Tasks writing the same local path before transfer.
+`--batch` selects all Tasks from one multi-source submission. `--finished`
+selects the newest terminal, not-yet-pulled Task per Source. Selector modes
+are mutually exclusive. A batch contains at most 100 Tasks.
+
+In JSON mode, successful non-preview submission and pull results expose
+`tasks` and `failures` arrays. Submit preview exposes `previews`; a total
+command failure uses the top-level error envelope. `submit` adds `batch_id`
+only when multiple Sources are submitted.
 
 ## Recovery
 
@@ -72,4 +93,3 @@ joyrun recover TASK_ID -t TARGET
 Scanning finds remote metadata matching the current Project ID and never
 imports automatically. Recover imports one selected task into the global
 SQLite index; it does not resubmit computation.
-

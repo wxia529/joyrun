@@ -211,6 +211,20 @@ joyrun status jr_TASK_ID --json
 joyrun logs jr_TASK_ID --lines 200 --json
 ```
 
+Submit differently named sources as one efficient batch while preserving one
+independent Task and Slurm job per source:
+
+```bash
+joyrun submit task01/benzene.inp task02/water.inp -t gibbs/orca --dry-run
+joyrun submit --glob "task*/*.inp" -t gibbs/orca --json
+joyrun submit --from sources.txt -t gibbs/orca --json
+```
+
+Batch submission validates every source locally, uploads once, and opens one
+remote Slurm submission session. Partial failures are reported per Task.
+One batch accepts at most 100 distinct sources; split larger campaigns into
+deliberate groups so failures and scheduler load remain reviewable.
+
 A source path resolves to its newest task. Use an exact Task ID for
 cancellation, recovery, and other mutations.
 
@@ -221,6 +235,28 @@ joyrun files jr_TASK_ID
 joyrun pull jr_TASK_ID --dry-run
 joyrun pull jr_TASK_ID
 ```
+
+Pull several independent tasks with one transfer per cluster:
+
+```bash
+joyrun pull jr_TASK1 jr_TASK2 --dry-run
+joyrun pull jr_TASK1 jr_TASK2 --json
+joyrun pull --batch jb_BATCH_ID --json
+joyrun pull --glob "task*/*.inp" --json
+joyrun pull --finished --json
+```
+
+`--batch` selects the independent Tasks created by one multi-source `submit`.
+`--finished` selects only the newest terminal, not-yet-pulled Task for each
+Source. Explicit IDs can resynchronize older or already-pulled results. These
+selection modes are mutually exclusive. One batch accepts at most 100 Tasks.
+Paths in a `--from` file are resolved from the current working directory.
+
+Successful non-preview `submit` and all `pull` results return arrays named
+`tasks` and `failures` in JSON, even when only one Task is selected.
+Multi-source submission additionally returns `batch_id`; submit preview
+returns a `previews` array. A total command failure uses the normal top-level
+`error` response.
 
 Default pull patterns are frozen at submission. Submitted inputs remain
 protected even with `--all`; replacing them requires
@@ -239,7 +275,9 @@ pull_state:    not_pulled -> pulling -> pulled|partial|failed
 prove whether Slurm accepted the job. Run `status` on that exact Task ID;
 never repeat `submit` until reconciliation is complete.
 
-`status --all` refreshes non-terminal tasks without resubmitting.
+`status --all` batches active jobs into one Slurm query per cluster. Records
+without a scheduler ID remain local; reconcile one explicitly with
+`status jr_TASK_ID`. Status never resubmits.
 `inspect --events` returns the immutable submission snapshot and append-only
 lifecycle events. If the local index is lost, remote `metadata.json` can be
 discovered with `recover --scan` and imported one task at a time.

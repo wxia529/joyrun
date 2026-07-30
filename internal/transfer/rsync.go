@@ -21,6 +21,7 @@ type Rsync struct {
 
 func (r Rsync) Push(ctx context.Context, host, localDir, remoteDir string, excludes []string) error {
 	args := baseArgs()
+	args = append(args, "--rsync-path", "mkdir -p "+remote.Quote(remoteDir)+" && rsync")
 	for _, pattern := range excludes {
 		args = append(args, "--exclude", pattern)
 	}

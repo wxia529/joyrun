@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,14 +36,23 @@ type fakeRunner struct {
 	recoveryScanOutput string
 	commandWarning     string
 	blockCommand       string
+	execCalls          int
 }
 
 func (f *fakeRunner) Exec(ctx context.Context, _, command string, stdin io.Reader) (string, string, error) {
+	f.execCalls++
 	if f.blockCommand != "" && strings.Contains(command, f.blockCommand) {
 		<-ctx.Done()
 		return "", "", ctx.Err()
 	}
 	switch {
+	case strings.Contains(command, "JOYRUN_DOCTOR"):
+		root := f.rootResult
+		if root == "" {
+			root = "pass"
+		}
+		return "remote_root|" + root + "\n" +
+			"sbatch|pass\nsqueue|pass\nsacct|pass\nscancel|pass\nrsync|pass\n", "", nil
 	case strings.Contains(command, "sbatch --parsable"):
 		f.schedulerID = "12345"
 		if f.reconcileTaskID == "" {
@@ -65,6 +75,8 @@ func (f *fakeRunner) Exec(ctx context.Context, _, command string, stdin io.Reade
 		return "", "", nil
 	case strings.Contains(command, "sacct -n -X --starttime"):
 		return "", "", nil
+	case strings.Contains(command, "account_output=$(sacct"):
+		return f.state, "", nil
 	case strings.Contains(command, "squeue -h"):
 		return f.state, "", nil
 	case strings.Contains(command, "find . -type f"):
@@ -75,12 +87,11 @@ func (f *fakeRunner) Exec(ctx context.Context, _, command string, stdin io.Reade
 	case strings.Contains(command, "-name metadata.json"):
 		return f.recoveryScanOutput, "", nil
 	case strings.Contains(command, "tail -n"):
-		for _, name := range f.missingLogs {
-			if strings.Contains(command, name) {
-				return "MISSING\n", "", nil
-			}
+		count := strings.Count(command, "JOYRUN_LOG_FOUND|")
+		if len(f.missingLogs) < count {
+			return "JOYRUN_LOG_FOUND|" + strconv.Itoa(len(f.missingLogs)) + "\ncalculation output\n", "", nil
 		}
-		return "FOUND\ncalculation output\n", "", nil
+		return "JOYRUN_LOG_MISSING\n", "", nil
 	case strings.Contains(command, "root=") && strings.Contains(command, "creatable:"):
 		return f.rootResult, "", nil
 	case strings.HasPrefix(command, "command -v "):
@@ -108,6 +119,7 @@ func (f *fakeRunner) Exec(ctx context.Context, _, command string, stdin io.Reade
 }
 
 func TestDoctorTreatsCreatableRemoteRootAsWarning(t *testing.T) {
+	runner := &fakeRunner{rootResult: "creatable:/home/user"}
 	application := &App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{"mindu": {
@@ -115,7 +127,7 @@ func TestDoctorTreatsCreatableRemoteRootAsWarning(t *testing.T) {
 			}},
 			Targets: map[string]model.Target{"mindu/run": {Cluster: "mindu", Script: "run"}},
 		},
-		Runner:   &fakeRunner{rootResult: "creatable:/home/user"},
+		Runner:   runner,
 		Transfer: &fakeTransfer{},
 	}
 	result := application.Doctor(context.Background(), "mindu/run")
@@ -130,6 +142,9 @@ func TestDoctorTreatsCreatableRemoteRootAsWarning(t *testing.T) {
 	}
 	if root.Status != "warn" || !root.OK || root.Blocking {
 		t.Fatalf("unexpected remote root warning: %#v", root)
+	}
+	if runner.execCalls != 1 {
+		t.Fatalf("doctor used %d remote calls, want 1", runner.execCalls)
 	}
 }
 
@@ -724,6 +739,9 @@ func TestLogsFallBackToJoyRunSchedulerLog(t *testing.T) {
 	if result.Kind != "scheduler" || result.Path != "joyrun-slurm-12345.log" {
 		t.Fatalf("unexpected fallback: %#v", result)
 	}
+	if runner.execCalls != 1 {
+		t.Fatalf("log fallback used %d remote calls, want 1", runner.execCalls)
+	}
 }
 
 func TestLogsSupportLegacySchedulerOutput(t *testing.T) {
@@ -770,6 +788,9 @@ func TestLogsSupportLegacySchedulerOutput(t *testing.T) {
 	if result.Kind != "scheduler_legacy" || result.Path != "slurm-9876.out" {
 		t.Fatalf("unexpected legacy fallback: %#v", result)
 	}
+	if runner.execCalls != 1 {
+		t.Fatalf("legacy log fallback used %d remote calls, want 1", runner.execCalls)
+	}
 }
 
 func TestDryRunMakesNoTaskRecord(t *testing.T) {
@@ -808,7 +829,7 @@ func TestDryRunMakesNoTaskRecord(t *testing.T) {
 	}
 }
 
-func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
+func TestSubmitRecoveryUsesImmutableMetadataAndSchedulerMarker(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	if _, err := project.Init(root); err != nil {
@@ -822,7 +843,7 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	runner := &fakeRunner{failMetadataWrite: 2, state: "PENDING"}
+	runner := &fakeRunner{state: "PENDING"}
 	application := &App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
@@ -843,8 +864,8 @@ func TestSubmitPersistsSchedulerIDBeforeMetadataRefresh(t *testing.T) {
 	if stored.SchedulerID != "12345" || stored.ComputeState != model.ComputeQueued {
 		t.Fatalf("scheduler identity was not persisted: %#v", stored)
 	}
-	if stored.Metadata["remote_metadata_error"] == "" {
-		t.Fatalf("metadata refresh failure was not recorded: %#v", stored.Metadata)
+	if runner.metadataWriteCount != 1 {
+		t.Fatalf("submit wrote remote metadata %d times, want 1", runner.metadataWriteCount)
 	}
 	recoveryStore, err := store.Open(filepath.Join(t.TempDir(), "recovered.db"))
 	if err != nil {
@@ -1137,6 +1158,75 @@ func TestStatusReconcilesSchedulerIDWhenMarkerIsMissing(t *testing.T) {
 	}
 }
 
+func TestStatusAllBatchesActiveJobsAndSkipsLegacyMissingSchedulerID(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tasks := []model.Task{
+		{
+			ID: "jr_batch_1", ProjectID: p.ProjectID, SourcePath: "one.inp",
+			TargetName: "c/run", ClusterName: "c", SchedulerID: "111",
+			ComputeState: model.ComputeQueued, PullState: model.PullNotPulled,
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "jr_batch_2", ProjectID: p.ProjectID, SourcePath: "two.inp",
+			TargetName: "c/run", ClusterName: "c", SchedulerID: "222",
+			ComputeState: model.ComputeRunning, PullState: model.PullNotPulled,
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "jr_legacy_failed", ProjectID: p.ProjectID, SourcePath: "old.inp",
+			TargetName: "c/run", ClusterName: "c",
+			ComputeState: model.ComputeSubmissionFailed, PullState: model.PullNotPulled,
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	for i := range tasks {
+		if err := s.CreateTask(ctx, &tasks[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &fakeRunner{state: strings.Join([]string{
+		"Q|111|RUNNING|00:01:00||node01|2026-07-29T10:00:00|N/A",
+		"A|222|COMPLETED|00:02:00|0:0|None|2026-07-29T09:58:00|2026-07-29T10:00:00",
+	}, "\n")}
+	application := &App{
+		Config: model.Config{Clusters: map[string]model.Cluster{
+			"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"},
+		}},
+		Store: s, Runner: runner,
+	}
+	result := application.StatusAll(ctx, root)
+	if len(result.Failures) != 0 || len(result.Tasks) != 3 {
+		t.Fatalf("unexpected bulk result: %#v", result)
+	}
+	if runner.execCalls != 1 {
+		t.Fatalf("status --all used %d remote calls, want 1", runner.execCalls)
+	}
+	states := map[string]string{}
+	for _, task := range result.Tasks {
+		states[task.ID] = task.ComputeState
+	}
+	if states["jr_batch_1"] != model.ComputeRunning ||
+		states["jr_batch_2"] != model.ComputeCompleted ||
+		states["jr_legacy_failed"] != model.ComputeSubmissionFailed {
+		t.Fatalf("unexpected bulk states: %#v", states)
+	}
+}
+
 func TestRecoverRejectsMetadataOutsideExpectedTaskDirectory(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -1276,8 +1366,7 @@ func TestRecoveryScanFindsCurrentProjectTasksWithoutDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{
-		metadata:           metadata,
-		recoveryScanOutput: "/tmp/joyrun/jr_scan_test\x00",
+		recoveryScanOutput: "/tmp/joyrun/jr_scan_test\x00" + string(metadata) + "\x00",
 	}
 	application := &App{
 		Config: model.Config{
@@ -1295,5 +1384,8 @@ func TestRecoveryScanFindsCurrentProjectTasksWithoutDatabase(t *testing.T) {
 	}
 	if len(candidates) != 1 || candidates[0].TaskID != task.ID {
 		t.Fatalf("unexpected recovery candidates: %#v", candidates)
+	}
+	if runner.execCalls != 1 {
+		t.Fatalf("recovery scan used %d remote calls, want 1", runner.execCalls)
 	}
 }

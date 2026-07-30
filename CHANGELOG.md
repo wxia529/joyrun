@@ -5,6 +5,29 @@ version tags, while the SQLite schema is versioned independently.
 
 ## [Unreleased]
 
+## [v0.1.6] - 2026-07-30
+
+### Changed
+
+- Batched `status --all` into one Slurm query per cluster and stopped probing
+  legacy records without scheduler IDs during bulk refresh.
+- Collapsed application/scheduler log fallback, recovery metadata scans, and
+  rsync-based doctor checks into single remote invocations.
+- Reused cached terminal compute state during pull and removed routine remote
+  metadata writes from status and pull bookkeeping.
+- Reduced a successful submission to three remote operations by relying on the
+  immutable recovery metadata plus the atomically written scheduler marker.
+
+### Added
+
+- Extended `submit` to accept one or many Sources with cross-platform glob
+  expansion, manifest files, one batch upload, and one remote Slurm session.
+- Extended `pull` to accept one or many Tasks with per-cluster transfer,
+  selecting the single-task or batch path from the resolved Task count.
+- Added batch pull with project-local
+  staging, per-Task results, destination-conflict protection, and selection
+  by the `jb_...` ID returned from multi-source `submit`.
+
 ## [v0.1.5] - 2026-07-29
 
 ### Fixed

@@ -35,6 +35,8 @@ func TestUsageExposesCompressedCommandSurface(t *testing.T) {
 	help := output.String()
 	for _, expected := range []string{
 		"joyrun target list",
+		"joyrun submit <source>...",
+		"joyrun pull <source|task-id>...",
 		"joyrun list [source]",
 		"joyrun status --all",
 		"joyrun inspect <source|task-id> --events",
@@ -239,6 +241,9 @@ func TestDryRunDoesNotRequireTaskDatabase(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "input.dat"), []byte("input"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(root, "input-two.dat"), []byte("input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "dependency.dat"), []byte("dependency"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -286,5 +291,64 @@ targets:
 	}
 	if !bytes.Contains(stdout.Bytes(), []byte("dependency.dat")) {
 		t.Fatalf("dry-run omitted explicit dependency: %q", stdout.String())
+	}
+	stdout.Reset()
+	if err := c.execute("submit", []string{
+		"input.dat", "input-two.dat", "-t", "c/run", "--dry-run", "--allow-project-root",
+	}); err != nil {
+		t.Fatalf("batch dry-run unexpectedly required the task database: %v", err)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("Batch preview: 2 task(s)")) {
+		t.Fatalf("unexpected batch preview: %q", stdout.String())
+	}
+	stdout.Reset()
+	c.json = true
+	if err := c.execute("submit", []string{
+		"input.dat", "-t", "c/run", "--dry-run", "--allow-project-root",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{`"previews":[`, `"failures":[]`} {
+		if !bytes.Contains(stdout.Bytes(), []byte(expected)) {
+			t.Fatalf("unified submit JSON omitted %s: %q", expected, stdout.String())
+		}
+	}
+}
+
+func TestCollectBatchValuesSupportsDifferentNamesGlobAndManifest(t *testing.T) {
+	root := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(old)
+	for _, name := range []string{"task01/benzene.inp", "task02/water.inp"} {
+		if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte("input"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile("sources.txt", []byte(
+		"# extra source\nspecial/optimization.gjf\n\ntask01/benzene.inp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	values, err := collectBatchValues(
+		[]string{"explicit/different.in"}, []string{"task*/*.inp"}, []string{"sources.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		filepath.Clean("explicit/different.in"),
+		filepath.Clean("task01/benzene.inp"),
+		filepath.Clean("task02/water.inp"),
+		filepath.Clean("special/optimization.gjf"),
+	}
+	if strings.Join(values, "|") != strings.Join(want, "|") {
+		t.Fatalf("unexpected batch selection: got %#v want %#v", values, want)
 	}
 }

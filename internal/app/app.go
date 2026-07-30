@@ -581,26 +581,9 @@ func (a *App) Submit(
 		"Scheduler accepted task", map[string]string{"scheduler_id": schedulerID}))
 	cancelPersist()
 	if err != nil {
-		// The scheduler accepted the job. Preserve the complete recovery record
-		// remotely even when local persistence is unavailable.
-		recoveryCtx, cancelRecovery := a.recoveryContext(ctx)
-		_ = a.writeMetadata(recoveryCtx, cluster, task)
-		cancelRecovery()
+		// The immutable metadata written before upload plus scheduler_id written
+		// atomically by the submit command are sufficient for recovery.
 		return SubmitResult{}, err
-	}
-	remoteCtx, cancelRemote = a.remoteContext(ctx)
-	err = a.writeMetadata(remoteCtx, cluster, task)
-	cancelRemote()
-	if err != nil {
-		if task.Metadata == nil {
-			task.Metadata = map[string]string{}
-		}
-		task.Metadata["remote_metadata_error"] = err.Error()
-		task.UpdatedAt = time.Now().UTC()
-		persistCtx, cancelPersist = a.persistenceContext(ctx)
-		_ = a.Store.UpdateTaskWithEvent(persistCtx, &task, taskEvent(task, "REMOTE_METADATA_WARNING", "recovery",
-			"Scheduler accepted task but metadata refresh failed", map[string]string{"error": err.Error()}))
-		cancelPersist()
 	}
 	return SubmitResult{Task: task}, nil
 }
@@ -664,20 +647,67 @@ func (a *App) StatusAll(ctx context.Context, cwd string) StatusAllResult {
 	if err != nil {
 		return StatusAllResult{Failures: []StatusFailure{{Error: fault.As(err)}}}
 	}
-	result := StatusAllResult{}
+	result := StatusAllResult{Tasks: make([]model.Task, 0, len(tasks))}
+	resolved := make(map[string]model.Task, len(tasks))
+	type clusterBatch struct {
+		cluster model.Cluster
+		tasks   []model.Task
+	}
+	batches := map[string]*clusterBatch{}
 	for _, task := range tasks {
-		if !refreshableComputeState(task.ComputeState) {
-			result.Tasks = append(result.Tasks, task)
+		// A missing scheduler ID requires reconciliation, which can be
+		// expensive and ambiguous for legacy failed records. Keep bulk status
+		// bounded; exact `status TASK` remains the recovery path.
+		if !bulkRefreshableComputeState(task.ComputeState) || task.SchedulerID == "" {
+			resolved[task.ID] = task
 			continue
 		}
-		updated, err := a.refreshTask(ctx, task)
-		if err != nil {
+		cluster, ok := a.Config.Clusters[task.ClusterName]
+		if !ok {
 			result.Failures = append(result.Failures, StatusFailure{
-				TaskID: task.ID, Error: fault.As(err),
+				TaskID: task.ID,
+				Error: fault.New("CLUSTER_NOT_FOUND",
+					fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false),
 			})
 			continue
 		}
-		result.Tasks = append(result.Tasks, updated)
+		batch := batches[task.ClusterName]
+		if batch == nil {
+			batch = &clusterBatch{cluster: cluster}
+			batches[task.ClusterName] = batch
+		}
+		batch.tasks = append(batch.tasks, task)
+	}
+	for _, batch := range batches {
+		ids := make([]string, 0, len(batch.tasks))
+		for _, task := range batch.tasks {
+			ids = append(ids, task.SchedulerID)
+		}
+		statuses, err := (scheduler.Slurm{Runner: a.Runner}).Statuses(
+			ctx, batch.cluster.Host, ids)
+		if err != nil {
+			for _, task := range batch.tasks {
+				result.Failures = append(result.Failures, StatusFailure{
+					TaskID: task.ID, Error: fault.As(err),
+				})
+			}
+			continue
+		}
+		for _, task := range batch.tasks {
+			updated, err := a.applySchedulerStatus(ctx, task, statuses[task.SchedulerID])
+			if err != nil {
+				result.Failures = append(result.Failures, StatusFailure{
+					TaskID: task.ID, Error: fault.As(err),
+				})
+				continue
+			}
+			resolved[task.ID] = updated
+		}
+	}
+	for _, task := range tasks {
+		if updated, ok := resolved[task.ID]; ok {
+			result.Tasks = append(result.Tasks, updated)
+		}
 	}
 	return result
 }
@@ -721,6 +751,14 @@ func (a *App) refreshTask(ctx context.Context, task model.Task) (model.Task, err
 		return task, fault.As(err).
 			WithTask("status", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 	}
+	return a.applySchedulerStatus(ctx, task, status)
+}
+
+func (a *App) applySchedulerStatus(
+	ctx context.Context,
+	task model.Task,
+	status scheduler.JobStatus,
+) (model.Task, error) {
 	previousCompute := task.ComputeState
 	previousRaw := task.SchedulerState
 	previousReason, previousElapsed, previousExitCode :=
@@ -777,7 +815,6 @@ func (a *App) refreshTask(ctx context.Context, task model.Task) (model.Task, err
 	if err := a.Store.UpdateTaskWithEvent(ctx, &task, event); err != nil {
 		return task, err
 	}
-	_ = a.writeMetadata(ctx, cluster, task)
 	return task, nil
 }
 
@@ -879,29 +916,41 @@ func (a *App) Logs(ctx context.Context, cwd, identifier string, lines int, reque
 	}
 	checked := make([]string, 0, len(candidates))
 	workDir := path.Join(task.RemoteDir, "work")
+	var command strings.Builder
+	command.WriteString("cd ")
+	command.WriteString(remote.Quote(workDir))
+	command.WriteString(" || exit 1; ")
 	for _, item := range candidates {
 		checked = append(checked, item.path)
-		command := fmt.Sprintf("cd %s && if test -f %s; then printf 'FOUND\\n'; tail -n %d -- %s; else printf 'MISSING\\n'; fi",
-			remote.Quote(workDir), remote.Quote(item.path), lines, remote.Quote(item.path))
-		stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
-		if err != nil {
-			return LogResult{}, fault.Wrap("LOG_FAILED",
-				message("cannot inspect remote log "+item.path, stderr), true, err).
-				WithTask("logs", "joyrun logs "+task.ID, task.ComputeState, task.PullState)
-		}
-		status, content, _ := strings.Cut(stdout, "\n")
-		if status == "FOUND" {
-			return LogResult{TaskID: task.ID, Path: item.path, Kind: item.kind, Content: content}, nil
-		}
-		if status != "MISSING" {
-			return LogResult{}, fault.New("LOG_FAILED",
-				"unexpected response while inspecting remote log "+item.path, true).
-				WithTask("logs", "joyrun logs "+task.ID, task.ComputeState, task.PullState)
-		}
 	}
 	if len(checked) == 0 {
 		return LogResult{}, fault.New("LOG_NOT_READY", "task has no application or scheduler log candidates yet", true).
 			WithTask("logs", "joyrun status "+task.ID, task.ComputeState, task.PullState)
+	}
+	for index, item := range candidates {
+		fmt.Fprintf(&command,
+			"if test -f %s; then printf 'JOYRUN_LOG_FOUND|%d\\n'; tail -n %d -- %s; exit 0; fi; ",
+			remote.Quote(item.path), index, lines, remote.Quote(item.path))
+	}
+	command.WriteString("printf 'JOYRUN_LOG_MISSING\\n'")
+	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command.String(), nil)
+	if err != nil {
+		return LogResult{}, fault.Wrap("LOG_FAILED",
+			message("cannot inspect remote logs", stderr), true, err).
+			WithTask("logs", "joyrun logs "+task.ID, task.ComputeState, task.PullState)
+	}
+	status, content, _ := strings.Cut(stdout, "\n")
+	if strings.HasPrefix(status, "JOYRUN_LOG_FOUND|") {
+		index, parseErr := strconv.Atoi(strings.TrimPrefix(status, "JOYRUN_LOG_FOUND|"))
+		if parseErr == nil && index >= 0 && index < len(candidates) {
+			item := candidates[index]
+			return LogResult{TaskID: task.ID, Path: item.path, Kind: item.kind, Content: content}, nil
+		}
+	}
+	if status != "JOYRUN_LOG_MISSING" {
+		return LogResult{}, fault.New("LOG_FAILED",
+			"unexpected response while inspecting remote logs", true).
+			WithTask("logs", "joyrun logs "+task.ID, task.ComputeState, task.PullState)
 	}
 	return LogResult{}, fault.New("LOG_NOT_READY",
 		"none of the expected remote logs exist yet; checked: "+strings.Join(checked, ", "), true).
@@ -913,7 +962,7 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	if err != nil {
 		return PullResult{}, err
 	}
-	if !options.Live {
+	if !options.Live && !terminalComputeState(task.ComputeState) {
 		task, err = a.Status(ctx, cwd, task.ID)
 		if err != nil {
 			return PullResult{}, err
@@ -1007,9 +1056,6 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	if err != nil {
 		return PullResult{}, err
 	}
-	remoteCtx, cancelRemote := a.remoteContext(ctx)
-	_ = a.writeMetadata(remoteCtx, cluster, task)
-	cancelRemote()
 	return PullResult{
 		Task: task, Files: files, Destination: destination,
 		TotalBytes: totalBytes,
@@ -1112,9 +1158,36 @@ func (a *App) Doctor(ctx context.Context, targetName string) DoctorResult {
 	if !ok {
 		return doctorResult(checks)
 	}
-	if err := remote.Check(ctx, a.Runner, cluster.Host); err != nil {
+	backend := ""
+	var backendErr error
+	if resolver, ok := a.Transfer.(interface {
+		Backend(model.Cluster) (string, error)
+	}); ok {
+		backend, backendErr = resolver.Backend(cluster)
+	}
+	executables := []string{"sbatch", "squeue", "sacct", "scancel"}
+	if backend == "rsync" {
+		executables = append(executables, "rsync")
+	}
+	command := ": JOYRUN_DOCTOR; root=" + remote.Quote(cluster.RemoteRoot) + "; " +
+		"if [ -d \"$root\" ]; then " +
+		"if [ -w \"$root\" ]; then root_result=pass; else root_result=not_writable; fi; " +
+		"elif [ -e \"$root\" ]; then root_result=not_directory; " +
+		"else ancestor=$(dirname -- \"$root\"); " +
+		"while [ ! -e \"$ancestor\" ] && [ \"$ancestor\" != / ]; do ancestor=$(dirname -- \"$ancestor\"); done; " +
+		"if [ -d \"$ancestor\" ] && [ -w \"$ancestor\" ]; then root_result=creatable:$ancestor; " +
+		"else root_result=not_creatable:$ancestor; fi; fi; " +
+		"printf 'remote_root|%s\\n' \"$root_result\"; "
+	for _, executable := range executables {
+		command += "if command -v " + executable + " >/dev/null 2>&1; then " +
+			"printf " + remote.Quote(executable+"|pass\n") + "; else " +
+			"printf " + remote.Quote(executable+"|missing\n") + "; fi; "
+	}
+	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
+	if err != nil {
 		checks = append(checks, DoctorCheck{
-			Name: "ssh", Status: "fail", OK: false, Blocking: true, Message: err.Error(),
+			Name: "ssh", Status: "fail", OK: false, Blocking: true,
+			Message:         message("cannot run remote checks", stderr),
 			SuggestedAction: "verify that `ssh " + cluster.Host + "` works non-interactively",
 		})
 		return doctorResult(checks)
@@ -1122,47 +1195,46 @@ func (a *App) Doctor(ctx context.Context, targetName string) DoctorResult {
 	checks = append(checks, DoctorCheck{
 		Name: "ssh", Status: "pass", OK: true, Message: cluster.Host,
 	})
-	checks = append(checks, a.checkRemoteRoot(ctx, target.Cluster, cluster))
-	for _, executable := range []string{"sbatch", "squeue", "sacct", "scancel"} {
-		_, stderr, err := a.Runner.Exec(ctx, cluster.Host, "command -v "+executable, nil)
-		detail := "available"
-		if err != nil {
-			detail = strings.TrimSpace(stderr)
-			if detail == "" {
-				detail = executable + " was not found on " + cluster.Host
-			}
+	remoteChecks := map[string]string{}
+	for _, line := range strings.Split(stdout, "\n") {
+		name, value, ok := strings.Cut(strings.TrimSpace(line), "|")
+		if ok {
+			remoteChecks[name] = value
 		}
-		checks = append(checks, doctorCheck(executable, err == nil, detail,
+	}
+	checks = append(checks, remoteRootDoctorCheck(
+		target.Cluster, cluster, remoteChecks["remote_root"]))
+	for _, executable := range []string{"sbatch", "squeue", "sacct", "scancel"} {
+		available := remoteChecks[executable] == "pass"
+		detail := "available"
+		if !available {
+			detail = executable + " was not found on " + cluster.Host
+		}
+		checks = append(checks, doctorCheck(executable, available, detail,
 			"load or install Slurm so `command -v "+executable+"` succeeds"))
 	}
-	backend, err := a.Transfer.Check(ctx, cluster)
-	detail := errorMessage(err)
+	var transferErr error
+	if backendErr != nil {
+		transferErr = backendErr
+	} else if backend == "rsync" {
+		if remoteChecks["rsync"] != "pass" {
+			transferErr = fault.New("TRANSFER_UNAVAILABLE",
+				"rsync is not installed on the remote cluster", false)
+		}
+	} else {
+		backend, transferErr = a.Transfer.Check(ctx, cluster)
+	}
+	detail := errorMessage(transferErr)
 	if detail == "" {
 		detail = backend + " is available"
 	}
-	checks = append(checks, doctorCheck("transfer_"+backend, err == nil, detail,
+	checks = append(checks, doctorCheck("transfer_"+backend, transferErr == nil, detail,
 		"install/configure the selected transfer backend or use transfer: auto"))
 	return doctorResult(checks)
 }
 
-func (a *App) checkRemoteRoot(ctx context.Context, clusterName string, cluster model.Cluster) DoctorCheck {
-	command := "root=" + remote.Quote(cluster.RemoteRoot) + "; " +
-		"if [ -d \"$root\" ]; then " +
-		"if [ -w \"$root\" ]; then printf 'pass'; else printf 'not_writable'; fi; " +
-		"elif [ -e \"$root\" ]; then printf 'not_directory'; " +
-		"else ancestor=$(dirname -- \"$root\"); " +
-		"while [ ! -e \"$ancestor\" ] && [ \"$ancestor\" != / ]; do ancestor=$(dirname -- \"$ancestor\"); done; " +
-		"if [ -d \"$ancestor\" ] && [ -w \"$ancestor\" ]; then printf 'creatable:%s' \"$ancestor\"; " +
-		"else printf 'not_creatable:%s' \"$ancestor\"; fi; fi"
-	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
-	if err != nil {
-		return DoctorCheck{
-			Name: "remote_root", Status: "fail", OK: false, Blocking: true,
-			Message:         message("cannot inspect remote_root "+cluster.RemoteRoot, stderr),
-			SuggestedAction: "verify the path and permissions on " + cluster.Host,
-		}
-	}
-	result := strings.TrimSpace(stdout)
+func remoteRootDoctorCheck(clusterName string, cluster model.Cluster, result string) DoctorCheck {
+	result = strings.TrimSpace(result)
 	switch {
 	case result == "pass":
 		return DoctorCheck{
@@ -1304,7 +1376,9 @@ func (a *App) RecoveryCandidates(
 	}
 	cluster := a.Config.Clusters[target.Cluster]
 	command := "find " + remote.Quote(cluster.RemoteRoot) +
-		" -mindepth 2 -maxdepth 2 -type f -name metadata.json -printf '%h\\0'"
+		" -mindepth 2 -maxdepth 2 -type f -name metadata.json -exec sh -c " +
+		remote.Quote("for file do directory=${file%/metadata.json}; printf '%s\\0' \"$directory\"; cat -- \"$file\"; printf '\\0'; done") +
+		" joyrun-recovery {} +"
 	stdout, stderr, err := a.Runner.Exec(ctx, cluster.Host, command, nil)
 	if err != nil {
 		return nil, fault.Wrap("RECOVERY_SCAN_FAILED",
@@ -1312,17 +1386,15 @@ func (a *App) RecoveryCandidates(
 	}
 	seen := map[string]bool{}
 	var candidates []RecoveryCandidate
-	for _, directory := range strings.Split(stdout, "\x00") {
+	records := strings.Split(stdout, "\x00")
+	for index := 0; index+1 < len(records); index += 2 {
+		directory := records[index]
+		data := []byte(records[index+1])
 		taskID := path.Base(directory)
 		if taskID == "" || !strings.HasPrefix(taskID, "jr_") || seen[taskID] {
 			continue
 		}
 		seen[taskID] = true
-		data, err := remote.ReadFile(ctx, a.Runner, cluster.Host,
-			path.Join(cluster.RemoteRoot, taskID, "metadata.json"))
-		if err != nil {
-			continue
-		}
 		var task model.Task
 		if json.Unmarshal(data, &task) != nil ||
 			task.ID != taskID ||
@@ -1470,6 +1542,14 @@ func terminalComputeState(state string) bool {
 func refreshableComputeState(state string) bool {
 	return state == model.ComputeCreated ||
 		state == model.ComputeSubmissionFailed ||
+		state == model.ComputeSubmissionUncertain ||
+		state == model.ComputeQueued ||
+		state == model.ComputeRunning ||
+		state == model.ComputeUnknown
+}
+
+func bulkRefreshableComputeState(state string) bool {
+	return state == model.ComputeCreated ||
 		state == model.ComputeSubmissionUncertain ||
 		state == model.ComputeQueued ||
 		state == model.ComputeRunning ||

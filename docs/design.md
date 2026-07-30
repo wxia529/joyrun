@@ -49,9 +49,11 @@ Pre-release `development/dev-3` databases are rejected rather than migrated;
 remote metadata remains available for deliberate recovery. Future stable
 schema changes require explicit, tested migrations.
 
-Every remote task directory also contains `metadata.json`. It is updated after
-submission and status changes. If the local database is lost, a known task can
-be imported with:
+Every remote task directory also contains immutable submission
+`metadata.json`; the atomically written `scheduler_id` marker completes its
+recovery identity after Slurm acceptance. Routine status and pull state remain
+in SQLite rather than causing additional SSH writes. If the local database is
+lost, a known task can be imported with:
 
 ```bash
 joyrun recover jr_TASK_ID -t cluster/target
@@ -61,6 +63,25 @@ The target identifies the cluster from which metadata must be read.
 `joyrun recover --scan -t cluster/target` discovers compatible metadata for
 the current Project ID without opening the local database; it never imports
 candidates automatically.
+
+## Batch operations
+
+Multi-source `submit` is transport batching, not a new scheduler abstraction.
+All sources use one Target and pass local validation before remote changes.
+JoyRun uploads isolated `jr_...` directories once and submits their independent
+scripts through one remote shell. Each accepted job writes its own scheduler
+marker, so partial success remains recoverable.
+
+Multi-Task `pull` groups Tasks by cluster, lists files in one command, downloads into
+project-local staging once, then installs files into each Source directory.
+Input protection still applies. Tasks mapping to the same local result path
+fail preflight with `BATCH_LOCAL_CONFLICT`.
+
+The `jb_...` batch ID is stored in Task metadata rather than as a second job
+object. It selects the original group for `pull --batch`; every `jr_...`
+Task remains independently inspectable and retryable. A separate ephemeral
+`jp_...` pull ID correlates the events from one batch transfer and is never a
+Task selector.
 
 ## Compute state, pull progress, and events
 
@@ -85,12 +106,18 @@ State changes and operational milestones are appended to `task_events`.
 is the efficient materialized view; events are not replayed to derive normal
 command results.
 
-`joyrun status --all` refreshes non-terminal tasks. It recovers a scheduler ID
-from the remote marker when available, queries Slurm, and records an event only
-when observable state changes. It never retries or resubmits a task.
+`joyrun status --all` refreshes active tasks with known scheduler IDs in one
+Slurm query per configured cluster, then records an event only when observable
+state changes. Records without a scheduler ID stay local during bulk refresh
+so old failed submissions cannot cause an SSH operation per record. Use
+`joyrun status TASK` for explicit scheduler-ID reconciliation. Neither command
+retries or resubmits a task.
 
 Status snapshots also retain Slurm's raw state, elapsed duration, reason, and
 exit code. These are scheduler diagnostics, not scientific interpretation.
+Remote recovery metadata preserves submission identity; routine status and
+pull bookkeeping is authoritative in the local SQLite index and does not cause
+an extra metadata SSH write.
 
 ## Remote layout
 

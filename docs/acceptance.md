@@ -47,6 +47,12 @@ test project and run `joyrun doctor TARGET` before the scenarios below.
 - Submit five rounds of three strictly serial smoke tasks. No operation may
   hang indefinitely, and every failed attempt must retain a diagnostic event
   and non-`created` state.
+- Submit at least three differently named sources with one `submit`; verify
+  one batch upload, one remote submission session, distinct Task/Slurm IDs,
+  and per-Task reporting after one deliberate `sbatch` rejection.
+- Pull those Tasks with `pull --batch jb_...`; verify one listing and
+  transfer per cluster, input protection, and rejection before transfer when
+  two Tasks map to the same local result path.
 - Submit the same source twice and confirm isolated remote directories.
 - Move the local project and confirm source lookup still works.
 - Delete or redirect the SQLite database, run `recover --scan`, recover one

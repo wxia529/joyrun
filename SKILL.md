@@ -1,6 +1,6 @@
 ---
 name: joyrun
-description: Install, configure, update, and operate JoyRun as an agent-friendly remote HPC execution backend over SSH and Slurm. Use when Codex needs to install or check a JoyRun release, create or modify cluster and target configuration from an existing HPC submission workflow, initialize a JoyRun project, inspect configured execution targets, preview or submit a local file/directory to an HPC cluster, check a remote task, read logs, pull selected results, cancel an explicitly identified task, inspect task history, diagnose JoyRun connectivity, or recover a task from remote metadata. Prefer this skill for computational work that should run asynchronously on a configured remote cluster instead of consuming the local machine.
+description: Install, configure, update, and operate JoyRun as an agent-friendly remote HPC execution backend over SSH and Slurm. Use when Codex needs to install or check JoyRun, create or modify cluster and target configuration from an existing HPC workflow, initialize a JoyRun project, inspect targets or current nodes, preview or submit one or many local files/directories, monitor tasks, read logs, pull one or many result sets, cancel an exact task, inspect history, diagnose connectivity, or recover from remote metadata. Prefer this skill for asynchronous computation on a configured remote cluster instead of consuming the local machine.
 ---
 
 # Use JoyRun
@@ -12,9 +12,9 @@ operating it.
 Use JoyRun as an execution layer. Prepare and analyze files locally; let JoyRun
 perform transport, Slurm submission, state tracking, and result retrieval.
 
-Run commands from the JoyRun project root or one of its descendants. Use
-`--json` for every command whose output will be interpreted programmatically.
-Treat stdout as the JSON interface and stderr as diagnostics.
+Run from the JoyRun project root or a descendant. Use `--config PATH` only
+when the user identifies an alternate configuration. Use `--json` for
+programmatic output; treat stdout as JSON and stderr as diagnostics.
 
 ## Establish context
 
@@ -55,32 +55,30 @@ Treat stdout as the JSON interface and stderr as diagnostics.
    authorization; invoke the installed absolute path when necessary.
 
    The Windows execution-policy setting applies only to that child process; do
-   not modify the persisted user or machine policy. After installation, verify
-   by name when available or by the reported absolute installation path:
+   not modify persisted policy. Verify the installed binary:
 
    ```bash
    joyrun version --json
-   "$HOME/.local/bin/joyrun" version --json
    ```
 
-   ```powershell
-   & "$env:LOCALAPPDATA\Programs\JoyRun\joyrun.exe" version --json
-   ```
+   If it is not yet on PATH, invoke the absolute path reported by the installer
+   (`$HOME/.local/bin/joyrun` on Unix or
+   `$env:LOCALAPPDATA\Programs\JoyRun\joyrun.exe` on Windows).
 
-   If configuration is missing, locate or create it explicitly:
+   Locate the active configuration:
 
    ```bash
    joyrun config path --json
-   joyrun config init --json
-   joyrun config validate --json
    ```
+
+   If it is missing, run `joyrun config init --json` only when the user asked
+   to configure JoyRun or otherwise authorized creating global configuration.
+   Otherwise report the missing configuration. Validate an existing or newly
+   created configuration with `joyrun config validate --json`.
 
 2. Locate `.joyrun/project.yaml` in the current directory or an ancestor. If
-   the user asked to use JoyRun and the project is not initialized, run:
-
-   ```bash
-   joyrun init --json
-   ```
+   initialization is in scope, run `joyrun init --json` for the current
+   directory or `joyrun init DIRECTORY --json` for an explicit project path.
 
 3. Discover targets instead of guessing:
 
@@ -93,6 +91,38 @@ Treat stdout as the JSON interface and stderr as diagnostics.
 4. If multiple targets are plausible and the user's intent does not determine
    one, ask the user to choose. Never infer an expensive target from a filename
    extension alone.
+
+## Understand selectors, IDs, and JSON
+
+Use the same public commands for one or many objects:
+
+- `submit` resolves positional Sources plus repeatable `--glob` and `--from`
+  selectors. One distinct Source uses the single-task path; 2–100 Sources use
+  one batch transport while preserving independent Tasks and Slurm jobs.
+- `pull` accepts explicit Task IDs or Sources, or exactly one of `--batch` and
+  `--finished`. One explicit Task uses the single-task path; multiple Tasks use
+  one transfer per cluster. Never combine these selector modes.
+- Quote `--glob` values so JoyRun expands them consistently across platforms.
+  A `--from` file contains one path or ID per line; blank lines and lines
+  beginning with `#` are ignored. Values resolve from the current directory.
+- All Sources in one submission share the Target, parameter overrides,
+  partition, and dependency includes. Split the submission if those differ.
+
+Keep the identifiers distinct:
+
+- `jr_...` identifies one immutable Task and is valid for exact operations;
+- `jb_...` identifies one multi-source submission and is valid only with
+  `pull --batch`;
+- `jp_...` correlates one batch pull operation and is not a selector.
+
+For successful non-preview submit and pull commands, parse
+`result.tasks` and `result.failures` even when only one Task was selected.
+Submit preview uses `result.previews`; multi-source submit also returns
+`result.batch_id`. A batch can partially succeed: JoyRun then emits a valid
+JSON result, records accepted Tasks, and exits nonzero because `failures` is
+non-empty. Preserve stdout and never repeat successful Tasks. After partial
+submission, pull accepted `jr_...` IDs explicitly instead of the entire
+batch. A total failure uses `ok: false` with a top-level `error`.
 
 ## Create or modify configuration
 
@@ -107,15 +137,11 @@ store credentials, or submit a real job while configuring JoyRun. Finish with
 `config validate`, `target show`, `target params`, `doctor`, and a representative
 `submit --dry-run`. A real submission requires a separate explicit request.
 
-When the user asks about available nodes or current capacity, use:
+When the user asks about current capacity, query only the Target's declared
+placements:
 
 ```bash
 joyrun target nodes TARGET --json
-```
-
-Select another declared placement only when needed:
-
-```bash
 joyrun target nodes TARGET --partition APPROVED_PARTITION --json
 ```
 
@@ -145,17 +171,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 ```
 
 The check is read-only. Upgrade only when the user explicitly requests it by
-running the same official installer without `--check`/`-Check`. Use an exact
-version when the user requests reproducibility:
-
-```bash
-sh install.sh --version vX.Y.Z
-```
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File .\install.ps1 -Version vX.Y.Z
-```
+running the same official installer without `--check`/`-Check`. For a
+reproducible version, pass `--version vX.Y.Z` on Unix or `-Version vX.Y.Z` on
+Windows.
 
 The default installer channel is the latest stable release and never selects a
 prerelease. Before upgrading across a documented database compatibility
@@ -173,7 +191,7 @@ combination, after changing target parameters, or after editing JoyRun config:
 joyrun submit SOURCE -t TARGET --dry-run --json
 ```
 
-Inspect:
+Inspect every item in `result.previews`:
 
 - resolved source kind, work directory, and entry file;
 - resolved `.Input`, `.Stem`, `.Name`, and `.WorkDir` values;
@@ -249,44 +267,40 @@ non-blocking; `fail` checks are blocking and make the command exit nonzero.
 
 ## Submit
 
-Submit only after preview succeeds:
-
-```bash
-joyrun submit SOURCE -t TARGET --json
-```
-
-Supply declared target parameters with repeatable flags:
+Submit only after preview succeeds. Supply declared parameters and optional
+dependencies with repeatable flags:
 
 ```bash
 joyrun submit SOURCE -t TARGET \
   --set cpus=64 \
   --set memory=220G \
-  --json
-```
-
-Supply optional input dependencies with repeatable `--include` flags:
-
-```bash
-joyrun submit SOURCE -t TARGET \
   --include structure.xyz \
   --json
 ```
 
-Record the returned `result.task.id`, which has the form `jr_...`. Use this
+Record each returned `result.tasks[].id`, which has the form `jr_...`. Use this
 exact task ID for all subsequent operations. A source path resolves to its
 newest task and can silently select a later submission.
 
-The target controls upload scope. `push.mode: entry` snapshots only the
-selected file, always-required target dependencies, and explicit
-per-submission `--include` dependencies. `push.mode: workdir` snapshots the
-directory. Respect upload limits, `.joyrunignore`, and target `push.exclude`;
-do not work around them without user intent. Treat
+Respect upload limits, `.joyrunignore`, and target `push.exclude`; do not work
+around them without user intent. Treat
 `UPLOAD_POLICY_EXCEEDED`, `SOURCE_ENTRY_EXCLUDED`, and
 `PROJECT_ROOT_UPLOAD_FORBIDDEN` as safety failures requiring review, not flags
 to bypass automatically.
 
 Submission is asynchronous. Return control after JoyRun returns the task ID.
 Do not keep a terminal occupied waiting for a long computation.
+
+For two or more sources using the same Target, prefer native batching:
+
+```bash
+joyrun submit path/a.inp other/different-name.inp -t TARGET --dry-run --json
+joyrun submit --glob "task*/*.inp" -t TARGET --json
+joyrun submit --from sources.txt -t TARGET --json
+```
+
+Review every Source in the preview. Treat its `jr_...` Task independently and
+never repeat the whole batch after a partial success.
 
 ## Monitor and diagnose
 
@@ -330,8 +344,10 @@ joyrun inspect jr_TASK_ID --json
 joyrun inspect jr_TASK_ID --events --json
 ```
 
-Use `joyrun status --all --json` to refresh all non-terminal tasks. Status
-refresh never submits a replacement task.
+Use `joyrun status --all --json` to refresh active tasks in batches by cluster.
+Tasks without a scheduler ID are left unchanged during bulk refresh; use
+`joyrun status jr_TASK_ID --json` when explicit reconciliation is required.
+Status refresh never submits a replacement task.
 
 Read logs without downloading the complete result:
 
@@ -361,6 +377,19 @@ task because its outputs may be incomplete. Use the target's default patterns:
 joyrun pull jr_TASK_ID --json
 ```
 
+For several Tasks, preview and use the native batch transfer:
+
+```bash
+joyrun pull jr_TASK1 jr_TASK2 --dry-run --json
+joyrun pull --batch jb_BATCH_ID --dry-run --json
+joyrun pull --finished --json
+```
+
+`--finished` selects the newest terminal, not-yet-pulled Task per Source. Use
+explicit IDs when remote post-processing created files for an already pulled
+Task. On `BATCH_LOCAL_CONFLICT`, separate the conflicting Tasks rather than
+choosing an arbitrary overwrite order.
+
 Inspect remote paths and preview the exact pull first when file sizes or
 artifact selection are uncertain:
 
@@ -377,6 +406,8 @@ joyrun pull jr_TASK_ID \
   --include "*.xyz" \
   --json
 ```
+
+`--include` and `--all` are mutually exclusive.
 
 Use `--all` only when the user needs every generated file; HPC outputs can be
 very large:

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,26 @@ type command struct {
 	json     bool
 	config   string
 	exitCode int
+}
+
+type submitOutput struct {
+	BatchID  string             `json:"batch_id,omitempty"`
+	Tasks    []model.Task       `json:"tasks"`
+	Failures []app.BatchFailure `json:"failures"`
+}
+
+type submitPreviewOutput struct {
+	Sources  []string      `json:"sources"`
+	Previews []app.Preview `json:"previews"`
+	Failures []any         `json:"failures"`
+}
+
+type pullOutput struct {
+	PullID        string             `json:"pull_id,omitempty"`
+	SourceBatchID string             `json:"source_batch_id,omitempty"`
+	Tasks         []app.PullManyItem `json:"tasks"`
+	Failures      []app.BatchFailure `json:"failures"`
+	DryRun        bool               `json:"dry_run,omitempty"`
 }
 
 func Run(ctx context.Context, args []string, version string) int {
@@ -274,47 +295,104 @@ func (c *command) target(application *app.App, args []string) error {
 
 func (c *command) submit(application *app.App, args []string) error {
 	flags := newFlags("submit", c.stderr)
-	var target string
-	var sets stringList
-	var includes stringList
-	var partition string
-	var dryRun bool
-	var allowProjectRoot bool
+	var target, partition string
+	var sets, includes, globs, files stringList
+	var dryRun, allowProjectRoot bool
 	flags.StringVar(&target, "target", "", "execution target")
 	flags.StringVar(&target, "t", "", "execution target")
 	flags.Var(&sets, "set", "target parameter key=value")
 	flags.Var(&includes, "include", "additional input dependency glob (repeatable; entry-mode targets only)")
+	flags.Var(&globs, "glob", "source glob expanded by JoyRun")
+	flags.Var(&files, "from", "file containing one source per line")
 	flags.StringVar(&partition, "partition", "", "allowed target partition")
 	flags.BoolVar(&dryRun, "dry-run", false, "preview without remote changes")
 	flags.BoolVar(&allowProjectRoot, "allow-project-root", false, "explicitly allow uploading from the project root")
 	if err := flags.Parse(interspersed(args,
-		map[string]bool{"--target": true, "-t": true, "--set": true, "--include": true, "--partition": true},
+		map[string]bool{
+			"--target": true, "-t": true, "--set": true, "--include": true,
+			"--glob": true, "--from": true, "--partition": true,
+		},
 		map[string]bool{"--dry-run": true, "--allow-project-root": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid submit arguments", false, err)
 	}
-	if flags.NArg() != 1 || target == "" {
+	if target == "" {
 		return fault.New("INVALID_ARGUMENT",
-			"usage: joyrun submit <source> -t <target> [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]", false)
+			"usage: joyrun submit SOURCE... -t TARGET [--glob PATTERN] [--from FILE]", false)
 	}
-	cwd, _ := os.Getwd()
-	if dryRun {
-		preview, _, _, err := application.Preview(
-			c.ctx, cwd, flags.Arg(0), target, sets, includes, partition, allowProjectRoot,
-		)
-		if err != nil {
-			return err
-		}
-		c.write(preview, formatPreview(preview))
-		return nil
-	}
-	fmt.Fprintln(c.stderr, "Preparing immutable input snapshot and uploading task...")
-	result, err := application.Submit(
-		c.ctx, cwd, flags.Arg(0), target, sets, includes, partition, allowProjectRoot,
-	)
+	sources, err := collectBatchValues(flags.Args(), globs, files)
 	if err != nil {
 		return err
 	}
-	c.write(result, "Submitted "+formatTask(result.Task))
+	if len(sources) == 0 {
+		return fault.New("INVALID_ARGUMENT", "submit requires at least one source", false)
+	}
+	if len(sources) > app.MaxBatchTasks {
+		return fault.New("BATCH_TOO_LARGE",
+			fmt.Sprintf("submit accepts at most %d sources", app.MaxBatchTasks), false)
+	}
+	cwd, _ := os.Getwd()
+	if dryRun {
+		previews := make([]app.Preview, 0, len(sources))
+		for _, source := range sources {
+			preview, _, _, err := application.Preview(
+				c.ctx, cwd, source, target, sets, includes, partition, allowProjectRoot)
+			if err != nil {
+				return err
+			}
+			previews = append(previews, preview)
+		}
+		if c.json {
+			c.write(submitPreviewOutput{
+				Sources: sources, Previews: previews, Failures: []any{},
+			}, "")
+			return nil
+		}
+		if len(previews) == 1 {
+			fmt.Fprint(c.stdout, formatPreview(previews[0]))
+			return nil
+		}
+		fmt.Fprintf(c.stdout, "Batch preview: %d task(s)\n", len(previews))
+		for _, preview := range previews {
+			fmt.Fprintf(c.stdout, "  %s  %s  %d file(s)\n",
+				preview.TaskID, preview.Source.RelativePath, len(preview.InputManifest))
+		}
+		return nil
+	}
+	if len(sources) == 1 {
+		fmt.Fprintln(c.stderr, "Preparing immutable input snapshot and uploading task...")
+		result, err := application.Submit(
+			c.ctx, cwd, sources[0], target, sets, includes, partition, allowProjectRoot)
+		if err != nil {
+			return err
+		}
+		output := submitOutput{Tasks: []model.Task{result.Task}, Failures: []app.BatchFailure{}}
+		c.write(output, "Submitted "+formatTask(result.Task))
+		return nil
+	}
+	fmt.Fprintf(c.stderr, "Preparing and submitting %d independent task(s)...\n", len(sources))
+	result, err := application.SubmitMany(
+		c.ctx, cwd, sources, target, sets, includes, partition, allowProjectRoot)
+	if err != nil {
+		return err
+	}
+	output := submitOutput{
+		BatchID: result.BatchID, Tasks: result.Tasks, Failures: result.Failures,
+	}
+	if c.json {
+		c.write(output, "")
+	} else {
+		fmt.Fprintf(c.stdout, "Batch %s\n", result.BatchID)
+		for _, task := range result.Tasks {
+			fmt.Fprint(c.stdout, formatTask(task))
+		}
+		for _, failure := range result.Failures {
+			fmt.Fprintf(c.stderr, "%s (%s): %s\n",
+				failure.TaskID, failure.Source, failure.Error.Error())
+		}
+	}
+	if len(result.Failures) > 0 {
+		c.exitCode = 1
+	}
 	return nil
 }
 
@@ -506,50 +584,168 @@ func (c *command) cancel(application *app.App, args []string) error {
 
 func (c *command) pull(application *app.App, args []string) error {
 	flags := newFlags("pull", c.stderr)
-	var options app.PullOptions
-	var includes stringList
+	var options app.PullManyOptions
+	var batchID string
+	var includes, globs, files stringList
 	flags.BoolVar(&options.All, "all", false, "pull all generated files")
 	flags.BoolVar(&options.OverwriteInputs, "overwrite-inputs", false, "allow submitted inputs to be overwritten")
-	flags.BoolVar(&options.Live, "live", false, "pull files while task is not complete")
-	flags.BoolVar(&options.DryRun, "dry-run", false, "preview selected files without downloading")
+	flags.BoolVar(&options.Live, "live", false, "pull files while tasks are not complete")
+	flags.BoolVar(&options.DryRun, "dry-run", false, "preview selected files")
+	flags.BoolVar(&options.Finished, "finished", false, "select all locally known finished tasks")
+	flags.StringVar(&batchID, "batch", "", "select tasks from a submit batch ID")
 	flags.Var(&includes, "include", "include glob (repeatable)")
+	flags.Var(&globs, "glob", "source glob expanded by JoyRun")
+	flags.Var(&files, "from", "file containing one task ID or source per line")
 	if err := flags.Parse(interspersed(args,
-		map[string]bool{"--include": true},
-		map[string]bool{"--all": true, "--overwrite-inputs": true, "--live": true, "--dry-run": true})); err != nil {
+		map[string]bool{
+			"--include": true, "--glob": true, "--from": true, "--batch": true,
+		},
+		map[string]bool{
+			"--all": true, "--overwrite-inputs": true, "--live": true,
+			"--dry-run": true, "--finished": true,
+		})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid pull arguments", false, err)
-	}
-	if flags.NArg() != 1 {
-		return fault.New("INVALID_ARGUMENT",
-			"usage: joyrun pull <source|task-id> [--all|--include glob] [--live] [--dry-run]", false)
 	}
 	if options.All && len(includes) > 0 {
 		return fault.New("INVALID_ARGUMENT", "--all and --include are mutually exclusive", false)
 	}
 	options.Include = includes
-	cwd, _ := os.Getwd()
-	if options.DryRun {
-		fmt.Fprintln(c.stderr, "Selecting remote files without downloading...")
-	} else {
-		fmt.Fprintln(c.stderr, "Selecting and pulling remote files...")
-	}
-	result, err := application.Pull(c.ctx, cwd, flags.Arg(0), options)
+	options.BatchID = batchID
+	identifiers, err := collectBatchValues(flags.Args(), globs, files)
 	if err != nil {
 		return err
 	}
-	if result.DryRun {
+	selectors := 0
+	if options.Finished {
+		selectors++
+	}
+	if options.BatchID != "" {
+		selectors++
+	}
+	if len(identifiers) > 0 {
+		selectors++
+	}
+	if selectors > 1 {
+		return fault.New("INVALID_ARGUMENT",
+			"--finished, --batch, and explicit selectors are mutually exclusive", false)
+	}
+	if selectors == 0 {
+		return fault.New("INVALID_ARGUMENT",
+			"usage: joyrun pull TASK_OR_SOURCE... | --batch BATCH_ID | --finished", false)
+	}
+	cwd, _ := os.Getwd()
+	if len(identifiers) == 1 && options.BatchID == "" && !options.Finished {
+		if options.DryRun {
+			fmt.Fprintln(c.stderr, "Selecting remote files without downloading...")
+		} else {
+			fmt.Fprintln(c.stderr, "Selecting and pulling remote files...")
+		}
+		result, err := application.Pull(c.ctx, cwd, identifiers[0], options.PullOptions)
+		if err != nil {
+			return err
+		}
+		output := pullOutput{
+			Tasks: []app.PullManyItem{{
+				TaskID: result.Task.ID, Source: result.Task.SourcePath,
+				Files: result.Files, Destination: result.Destination,
+				TotalBytes: result.TotalBytes, PullState: result.Task.PullState,
+			}},
+			Failures: []app.BatchFailure{}, DryRun: result.DryRun,
+		}
 		if c.json {
-			c.write(result, "")
+			c.write(output, "")
 			return nil
 		}
-		fmt.Fprintf(c.stdout, "Would pull %d file(s), %s, to %s:\n",
-			len(result.Files), humanBytes(result.TotalBytes), result.Destination)
-		for _, file := range result.Files {
-			fmt.Fprintln(c.stdout, "  "+file)
+		if result.DryRun {
+			fmt.Fprintf(c.stdout, "Would pull %d file(s), %s, to %s:\n",
+				len(result.Files), humanBytes(result.TotalBytes), result.Destination)
+			for _, file := range result.Files {
+				fmt.Fprintln(c.stdout, "  "+file)
+			}
+			return nil
 		}
+		fmt.Fprintf(c.stdout, "Pulled %d file(s) to %s\n",
+			len(result.Files), result.Destination)
 		return nil
 	}
-	c.write(result, fmt.Sprintf("Pulled %d file(s) to %s\n", len(result.Files), result.Destination))
+	result, err := application.PullMany(c.ctx, cwd, identifiers, options)
+	if err != nil {
+		return err
+	}
+	output := pullOutput{
+		PullID: result.PullID, SourceBatchID: result.SourceBatchID,
+		Tasks: result.Tasks, Failures: result.Failures, DryRun: result.DryRun,
+	}
+	if c.json {
+		c.write(output, "")
+	} else {
+		verb := "Pulled"
+		if result.DryRun {
+			verb = "Would pull"
+		}
+		fmt.Fprintf(c.stdout, "%s operation %s:\n", verb, result.PullID)
+		for _, item := range result.Tasks {
+			fmt.Fprintf(c.stdout, "  %s  %d file(s), %s -> %s\n",
+				item.TaskID, len(item.Files), humanBytes(item.TotalBytes), item.Destination)
+		}
+		for _, failure := range result.Failures {
+			fmt.Fprintf(c.stderr, "%s (%s): %s\n",
+				failure.TaskID, failure.Source, failure.Error.Error())
+		}
+	}
+	if len(result.Failures) > 0 {
+		c.exitCode = 1
+	}
 	return nil
+}
+
+func collectBatchValues(positional, globs, files []string) ([]string, error) {
+	values := append([]string{}, positional...)
+	for _, pattern := range globs {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, fault.Wrap("INVALID_ARGUMENT",
+				fmt.Sprintf("invalid batch glob %q", pattern), false, err)
+		}
+		if len(matches) == 0 {
+			return nil, fault.New("NO_SOURCES_MATCHED",
+				fmt.Sprintf("batch glob %q matched no paths", pattern), false)
+		}
+		values = append(values, matches...)
+	}
+	for _, name := range files {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return nil, fault.Wrap("INVALID_ARGUMENT",
+				"cannot read batch selection file "+name, false, err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			values = append(values, line)
+		}
+	}
+	result := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		value = filepath.Clean(value)
+		absolute, err := filepath.Abs(value)
+		if err != nil {
+			return nil, fault.Wrap("INVALID_ARGUMENT", "cannot resolve batch selector "+value, false, err)
+		}
+		key := filepath.Clean(absolute)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, value)
+		}
+	}
+	return result, nil
 }
 
 func (c *command) doctor(application *app.App, args []string) error {
@@ -663,7 +859,7 @@ func (c *command) usage() {
 Usage:
   joyrun config <path|init|validate>
   joyrun init [directory]
-  joyrun submit <source> -t <target> [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]
+  joyrun submit <source>... -t <target> [--glob pattern] [--from file] [--partition name] [--set key=value] [--include glob] [--dry-run]
   joyrun status <source|task-id>
   joyrun status --all
   joyrun list [source]
@@ -671,7 +867,7 @@ Usage:
   joyrun inspect <source|task-id> --events
   joyrun logs <source|task-id> [--lines N] [--file PATH]
   joyrun files <source|task-id>
-  joyrun pull <source|task-id> [--all|--include glob] [--live] [--dry-run]
+  joyrun pull <source|task-id>... [--glob pattern] [--from file] [--batch id|--finished] [--all|--include glob] [--live] [--dry-run]
   joyrun cancel <task-id>
   joyrun target list
   joyrun target show <target>
@@ -691,13 +887,13 @@ func (c *command) commandUsage(name string) bool {
 	usage := map[string]string{
 		"config":  "Usage: joyrun config <path|init|validate>\n",
 		"init":    "Usage: joyrun init [directory]\n",
-		"submit":  "Usage: joyrun submit <source> -t <target> [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]\n",
+		"submit":  "Usage: joyrun submit <source>... -t <target> [--glob pattern] [--from file] [--partition name] [--set key=value] [--include glob] [--dry-run] [--allow-project-root]\n",
 		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
 		"list":    "Usage: joyrun list [source]\n",
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
 		"logs":    "Usage: joyrun logs <source|task-id> [--lines N] [--file PATH]\n",
 		"files":   "Usage: joyrun files <source|task-id>\n",
-		"pull":    "Usage: joyrun pull <source|task-id> [--all|--include glob] [--live] [--dry-run]\n",
+		"pull":    "Usage: joyrun pull <source|task-id>... [--glob pattern] [--from file] [--batch id|--finished] [--all|--include glob] [--live] [--dry-run]\n",
 		"cancel":  "Usage: joyrun cancel <task-id>\n",
 		"target":  "Usage: joyrun target <list|show TARGET|params TARGET|nodes TARGET [--partition name]>\n",
 		"doctor":  "Usage: joyrun doctor <target>\n",

@@ -208,23 +208,35 @@ ON CONFLICT(id) DO UPDATE SET last_path=excluded.last_path,updated_at=excluded.u
 }
 
 func (s *Store) CreateTask(ctx context.Context, task *model.Task) error {
-	if task.Revision == 0 {
-		task.Revision = 1
+	return s.CreateTasks(ctx, []*model.Task{task})
+}
+
+// CreateTasks atomically creates a batch of independent task records.
+func (s *Store) CreateTasks(ctx context.Context, tasks []*model.Task) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	for _, task := range tasks {
+		if task.Revision == 0 {
+			task.Revision = 1
+		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fault.Wrap("DATABASE_BUSY", "cannot begin task transaction", true, err)
 	}
 	defer tx.Rollback()
-	if err := insertTask(ctx, tx, *task); err != nil {
-		return err
-	}
-	event := model.TaskEvent{
-		TaskID: task.ID, Type: "TASK_CREATED", Stage: "task",
-		Message: "Task record created", CreatedAt: task.CreatedAt,
-	}
-	if err := insertEvent(ctx, tx, event); err != nil {
-		return err
+	for _, task := range tasks {
+		if err := insertTask(ctx, tx, *task); err != nil {
+			return err
+		}
+		event := model.TaskEvent{
+			TaskID: task.ID, Type: "TASK_CREATED", Stage: "task",
+			Message: "Task record created", CreatedAt: task.CreatedAt,
+		}
+		if err := insertEvent(ctx, tx, event); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fault.Wrap("DATABASE_FAILED", "cannot commit task creation", true, err)
@@ -275,6 +287,50 @@ func (s *Store) UpdateTaskWithEvent(ctx context.Context, task *model.Task, event
 	return s.updateTask(ctx, task, &event)
 }
 
+// UpdateTasksWithEvents atomically updates a batch of task records and appends
+// one event for each task. Callers either observe the entire state transition
+// or none of it.
+func (s *Store) UpdateTasksWithEvents(
+	ctx context.Context,
+	tasks []*model.Task,
+	events []model.TaskEvent,
+) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	if len(events) != len(tasks) {
+		return fault.New("DATABASE_FAILED",
+			"batch task updates require one event per task", false)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fault.Wrap("DATABASE_BUSY", "cannot begin batch task update", true, err)
+	}
+	defer tx.Rollback()
+	revisions := make([]int64, len(tasks))
+	for index, task := range tasks {
+		event := events[index]
+		if event.TaskID == "" {
+			event.TaskID = task.ID
+		}
+		if event.CreatedAt.IsZero() {
+			event.CreatedAt = time.Now().UTC()
+		}
+		revision, err := updateTaskRecord(ctx, tx, task, &event)
+		if err != nil {
+			return err
+		}
+		revisions[index] = revision
+	}
+	if err := tx.Commit(); err != nil {
+		return fault.Wrap("DATABASE_FAILED", "cannot commit batch task update", true, err)
+	}
+	for index, task := range tasks {
+		task.Revision = revisions[index]
+	}
+	return nil
+}
+
 func (s *Store) updateTask(ctx context.Context, task *model.Task, event *model.TaskEvent) error {
 	if task.Revision < 1 {
 		return fault.New("DATABASE_CONFLICT", "task has no persistence revision", true)
@@ -284,11 +340,31 @@ func (s *Store) updateTask(ctx context.Context, task *model.Task, event *model.T
 		return fault.Wrap("DATABASE_BUSY", "cannot begin task update", true, err)
 	}
 	defer tx.Rollback()
+	revision, err := updateTaskRecord(ctx, tx, task, event)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fault.Wrap("DATABASE_FAILED", "cannot commit task update", true, err)
+	}
+	task.Revision = revision
+	return nil
+}
+
+func updateTaskRecord(
+	ctx context.Context,
+	tx *sql.Tx,
+	task *model.Task,
+	event *model.TaskEvent,
+) (int64, error) {
+	if task.Revision < 1 {
+		return 0, fault.New("DATABASE_CONFLICT", "task has no persistence revision", true)
+	}
 	updated := *task
 	updated.Revision++
 	values, err := encodeTask(updated)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	values = append(values[1:], task.ID, task.Revision)
 	result, err := tx.ExecContext(ctx, `
@@ -301,23 +377,19 @@ UPDATE tasks SET
  submitted_at=?,updated_at=?,pulled_at=?
 WHERE id=? AND revision=?`, values...)
 	if err != nil {
-		return fault.Wrap("DATABASE_FAILED", "cannot update task record", true, err)
+		return 0, fault.Wrap("DATABASE_FAILED", "cannot update task record", true, err)
 	}
 	count, _ := result.RowsAffected()
 	if count == 0 {
-		return fault.New("DATABASE_CONFLICT",
+		return 0, fault.New("DATABASE_CONFLICT",
 			fmt.Sprintf("task %s changed in another JoyRun process; reload it and retry", task.ID), true)
 	}
 	if event != nil {
 		if err := insertEvent(ctx, tx, *event); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fault.Wrap("DATABASE_FAILED", "cannot commit task update", true, err)
-	}
-	task.Revision = updated.Revision
-	return nil
+	return updated.Revision, nil
 }
 
 func (s *Store) AppendEvent(ctx context.Context, event model.TaskEvent) error {

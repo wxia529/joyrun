@@ -27,6 +27,17 @@ type JobStatus struct {
 	End      string
 }
 
+type BatchJob struct {
+	TaskID    string
+	WorkDir   string
+	Partition string
+}
+
+type BatchSubmitResult struct {
+	SchedulerIDs map[string]string
+	Failures     map[string]string
+}
+
 type NodeInfo struct {
 	Name      string `json:"name"`
 	State     string `json:"state"`
@@ -72,6 +83,71 @@ func (s Slurm) Submit(ctx context.Context, host, workDir, taskID, partition stri
 		return "", fault.Wrap("SUBMIT_FAILED", fmt.Sprintf("unexpected sbatch output %q", id), false, err)
 	}
 	return id, nil
+}
+
+// SubmitMany submits independent Slurm jobs through one remote shell. Each
+// accepted job receives its own atomic scheduler marker for reconciliation.
+func (s Slurm) SubmitMany(ctx context.Context, host string, jobs []BatchJob) (BatchSubmitResult, error) {
+	result := BatchSubmitResult{
+		SchedulerIDs: map[string]string{},
+		Failures:     map[string]string{},
+	}
+	if len(jobs) == 0 {
+		return result, nil
+	}
+	var command strings.Builder
+	for _, job := range jobs {
+		command.WriteString("taskid=")
+		command.WriteString(remote.Quote(job.TaskID))
+		command.WriteString("; output=$(cd ")
+		command.WriteString(remote.Quote(job.WorkDir))
+		command.WriteString(" && chmod 700 joyrun-job.sh && sbatch --parsable --comment=")
+		command.WriteString(remote.Quote("joyrun:" + job.TaskID))
+		command.WriteString(" --partition=")
+		command.WriteString(remote.Quote(job.Partition))
+		command.WriteString(" --output=joyrun-slurm-%j.log joyrun-job.sh 2>&1); status=$?; ")
+		command.WriteString("if [ \"$status\" -eq 0 ]; then jobid=${output%%;*}; ")
+		command.WriteString("if printf '%s' \"$jobid\" | grep -Eq '^[0-9]+$'; then ")
+		command.WriteString("printf '%s\\n' \"$jobid\" > ")
+		command.WriteString(remote.Quote(pathJoinParent(job.WorkDir, "scheduler_id.tmp")))
+		command.WriteString(" && mv ")
+		command.WriteString(remote.Quote(pathJoinParent(job.WorkDir, "scheduler_id.tmp")))
+		command.WriteString(" ")
+		command.WriteString(remote.Quote(pathJoinParent(job.WorkDir, "scheduler_id")))
+		command.WriteString("; printf 'OK\\0%s\\0%s\\0' \"$taskid\" \"$jobid\"; ")
+		command.WriteString("else printf 'ERR\\0%s\\0%s\\0' \"$taskid\" ")
+		command.WriteString("\"unexpected sbatch output: $output\"; fi; ")
+		command.WriteString("else printf 'ERR\\0%s\\0%s\\0' \"$taskid\" \"$output\"; fi; ")
+	}
+	stdout, stderr, err := s.Runner.Exec(ctx, host, command.String(), nil)
+	if err != nil {
+		return result, fault.Wrap("SUBMIT_FAILED",
+			message("batch Slurm submission connection failed", stderr), true, err)
+	}
+	records := strings.Split(stdout, "\x00")
+	for index := 0; index+2 < len(records); index += 3 {
+		kind, taskID, value := records[index], records[index+1], records[index+2]
+		switch kind {
+		case "OK":
+			if _, err := strconv.ParseUint(value, 10, 64); err == nil {
+				result.SchedulerIDs[taskID] = value
+			} else {
+				result.Failures[taskID] = "invalid scheduler ID: " + value
+			}
+		case "ERR":
+			result.Failures[taskID] = strings.TrimSpace(value)
+		}
+	}
+	return result, nil
+}
+
+func pathJoinParent(workDir, name string) string {
+	workDir = strings.TrimSuffix(workDir, "/")
+	index := strings.LastIndex(workDir, "/")
+	if index < 0 {
+		return "../" + name
+	}
+	return workDir[:index] + "/" + name
 }
 
 func SubmissionDefinitelyRejected(err error) bool {
@@ -159,6 +235,85 @@ func (s Slurm) Status(ctx context.Context, host, id string) (JobStatus, error) {
 		Start:    cleanTime(fields[4]),
 		End:      cleanTime(fields[5]),
 	}, nil
+}
+
+// Statuses queries multiple Slurm jobs in one remote shell invocation. Queue
+// rows take precedence over accounting rows because they describe the current
+// state of active jobs.
+func (s Slurm) Statuses(ctx context.Context, host string, ids []string) (map[string]JobStatus, error) {
+	result := make(map[string]JobStatus, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	seen := make(map[string]bool, len(ids))
+	ordered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+			return nil, fault.Wrap("STATUS_FAILED", fmt.Sprintf("invalid Slurm job ID %q", id), false, err)
+		}
+		seen[id] = true
+		ordered = append(ordered, id)
+		result[id] = JobStatus{State: "unknown"}
+	}
+	if len(ordered) == 0 {
+		return result, nil
+	}
+	idList := strings.Join(ordered, ",")
+	command :=
+		"ids=" + remote.Quote(idList) + "; " +
+			"queue_output=$(squeue -h -j \"$ids\" -o '%A|%T|%M||%R|%S|%e' 2>&1); queue_status=$?; " +
+			"account_output=$(sacct -n -X -j \"$ids\" --format=JobIDRaw,State,Elapsed,ExitCode,Reason,Start,End --parsable2 2>&1); account_status=$?; " +
+			"if [ \"$queue_status\" -ne 0 ] && [ \"$account_status\" -ne 0 ]; then " +
+			"printf 'squeue: %s\\nsacct: %s\\n' \"$queue_output\" \"$account_output\" >&2; exit 1; fi; " +
+			"if [ \"$account_status\" -eq 0 ]; then printf '%s\\n' \"$account_output\" | sed '/^[[:space:]]*$/d;s/^/A|/'; fi; " +
+			"if [ \"$queue_status\" -eq 0 ]; then printf '%s\\n' \"$queue_output\" | sed '/^[[:space:]]*$/d;s/^/Q|/'; fi"
+	stdout, stderr, err := s.Runner.Exec(ctx, host, command, nil)
+	if err != nil {
+		return nil, fault.Wrap("STATUS_FAILED", message("cannot query Slurm jobs", stderr), true, err)
+	}
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.SplitN(strings.TrimSpace(line), "|", 9)
+		if len(fields) < 3 {
+			continue
+		}
+		source := fields[0]
+		id := strings.TrimSpace(fields[1])
+		if !seen[id] {
+			continue
+		}
+		if source == "A" {
+			result[id] = statusFromFields(fields[2:])
+			continue
+		}
+		if source == "Q" {
+			// Queue information is printed last and intentionally overrides a
+			// possibly stale accounting row.
+			result[id] = statusFromFields(fields[2:])
+		}
+	}
+	return result, nil
+}
+
+func statusFromFields(fields []string) JobStatus {
+	for len(fields) < 6 {
+		fields = append(fields, "")
+	}
+	raw := strings.TrimSpace(strings.TrimSuffix(fields[0], "+"))
+	if raw == "" {
+		return JobStatus{State: "unknown"}
+	}
+	return JobStatus{
+		State: normalize(raw), RawState: raw,
+		Elapsed:  strings.TrimSpace(fields[1]),
+		ExitCode: strings.TrimSpace(fields[2]),
+		Reason:   strings.TrimSpace(fields[3]),
+		Start:    cleanTime(fields[4]),
+		End:      cleanTime(fields[5]),
+	}
 }
 
 func cleanTime(value string) string {

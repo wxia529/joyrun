@@ -84,6 +84,12 @@ func (m Manager) Check(ctx context.Context, cluster model.Cluster) (string, erro
 	return backend, nil
 }
 
+// Backend resolves the locally usable transfer backend without opening a
+// remote connection. Doctor uses it to include rsync in its shared SSH probe.
+func (m Manager) Backend(cluster model.Cluster) (string, error) {
+	return m.backend(context.Background(), cluster)
+}
+
 func (m Manager) backend(ctx context.Context, cluster model.Cluster) (string, error) {
 	requested := cluster.Transfer
 	if requested == "" {
