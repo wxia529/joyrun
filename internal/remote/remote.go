@@ -17,8 +17,9 @@ type Runner interface {
 }
 
 type SSH struct {
-	Stderr  io.Writer
-	Timeout time.Duration
+	Stderr      io.Writer
+	Timeout     time.Duration
+	ControlPath string
 }
 
 func (s SSH) Exec(ctx context.Context, host, command string, stdin io.Reader) (string, string, error) {
@@ -31,7 +32,7 @@ func (s SSH) Exec(ctx context.Context, host, command string, stdin io.Reader) (s
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	args := append(OpenSSHOptions(), host, command)
+	args := append(OpenSSHOptionsFor(s.ControlPath), host, command)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	cmd.Stdin = stdin
 	var stdout, stderr bytes.Buffer
@@ -42,17 +43,34 @@ func (s SSH) Exec(ctx context.Context, host, command string, stdin io.Reader) (s
 }
 
 func OpenSSHOptions() []string {
-	return []string{
+	return OpenSSHOptionsFor("")
+}
+
+func OpenSSHOptionsFor(controlPath string) []string {
+	options := []string{
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=15",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
 	}
+	if controlPath != "" {
+		options = append(options, "-o", "ControlMaster=auto", "-o", "ControlPersist=300", "-o", "ControlPath="+controlPath)
+	}
+	return options
 }
 
 func OpenSSHShell() string {
-	return "ssh -o BatchMode=yes -o ConnectTimeout=15 " +
-		"-o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+	return OpenSSHShellFor("")
+}
+
+func OpenSSHShellFor(controlPath string) string {
+	options := OpenSSHOptionsFor(controlPath)
+	parts := make([]string, 0, len(options)/2+1)
+	parts = append(parts, "ssh")
+	for index := 0; index+1 < len(options); index += 2 {
+		parts = append(parts, Quote(options[index]), Quote(options[index+1]))
+	}
+	return strings.Join(parts, " ")
 }
 
 func Check(ctx context.Context, runner Runner, host string) error {

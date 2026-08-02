@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/wxia529/joyrun/internal/fault"
 )
 
 type localShellRunner struct {
@@ -42,6 +44,8 @@ func TestSubmitForcesJoyRunSchedulerLog(t *testing.T) {
 	}
 	if id != "12345" ||
 		!strings.Contains(runner.command, "chmod 700 joyrun-job.sh") ||
+		!strings.Contains(runner.command, "submit_started") ||
+		!strings.Contains(runner.command, "JOYRUN_SUBMIT_REJECTED") ||
 		!strings.Contains(runner.command, "--output=joyrun-slurm-%j.log") ||
 		!strings.Contains(runner.command, "--comment='joyrun:jr_test'") ||
 		!strings.Contains(runner.command, "--partition='community'") {
@@ -101,8 +105,8 @@ func TestSubmitManyRemoteShellWritesIndependentMarkers(t *testing.T) {
 }
 
 func TestSubmissionDefinitelyRejectedDistinguishesSSHTransportFailure(t *testing.T) {
-	rejected := exec.Command("sh", "-c", "exit 1").Run()
-	transport := exec.Command("sh", "-c", "exit 255").Run()
+	rejected := fault.New("SUBMIT_REJECTED", "JOYRUN_SUBMIT_REJECTED", false)
+	transport := fault.New("SUBMIT_FAILED", "connection reset", true)
 	if !SubmissionDefinitelyRejected(rejected) {
 		t.Fatal("remote command exit 1 should be a definitive rejection")
 	}

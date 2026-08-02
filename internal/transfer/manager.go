@@ -13,11 +13,12 @@ import (
 )
 
 type Manager struct {
-	Stderr   io.Writer
-	GOOS     string
-	LookPath func(string) (string, error)
-	SFTP     *SFTP
-	Runner   remote.Runner
+	Stderr      io.Writer
+	GOOS        string
+	ControlPath string
+	LookPath    func(string) (string, error)
+	SFTP        *SFTP
+	Runner      remote.Runner
 }
 
 func (m Manager) Push(ctx context.Context, cluster model.Cluster, localDir, remoteDir string, excludes []string) error {
@@ -27,7 +28,7 @@ func (m Manager) Push(ctx context.Context, cluster model.Cluster, localDir, remo
 	}
 	switch backend {
 	case "rsync":
-		err := (Rsync{Stderr: m.Stderr}).Push(ctx, cluster.Host, localDir, remoteDir, excludes)
+		err := (Rsync{Stderr: m.Stderr, ControlPath: m.ControlPath}).Push(ctx, cluster.Host, localDir, remoteDir, excludes)
 		if err == nil || !autoTransfer(cluster) || ctx.Err() != nil {
 			return err
 		}
@@ -49,7 +50,7 @@ func (m Manager) Pull(ctx context.Context, cluster model.Cluster, remoteDir, loc
 	}
 	switch backend {
 	case "rsync":
-		err := (Rsync{Stderr: m.Stderr}).Pull(ctx, cluster.Host, remoteDir, localDir, files)
+		err := (Rsync{Stderr: m.Stderr, ControlPath: m.ControlPath}).Pull(ctx, cluster.Host, remoteDir, localDir, files)
 		if err == nil || !autoTransfer(cluster) || ctx.Err() != nil {
 			return err
 		}
@@ -141,5 +142,5 @@ func (m Manager) sftp() *SFTP {
 	if m.SFTP != nil {
 		return m.SFTP
 	}
-	return &SFTP{Stderr: m.Stderr}
+	return &SFTP{Stderr: m.Stderr, ControlPath: m.ControlPath}
 }

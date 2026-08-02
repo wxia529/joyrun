@@ -68,7 +68,9 @@ func (a *App) SubmitMany(
 	sets, includes []string,
 	partitionOverride string,
 	allowProjectRoot bool,
+	forceNewOption ...bool,
 ) (SubmitManyResult, error) {
+	forceNew := len(forceNewOption) > 0 && forceNewOption[0]
 	if len(sources) < 2 {
 		return SubmitManyResult{}, fault.New("INVALID_ARGUMENT",
 			"batch submission requires at least two distinct sources", false)
@@ -129,6 +131,12 @@ func (a *App) SubmitMany(
 			return SubmitManyResult{}, err
 		}
 		task.InputManifest = inputManifest
+		key, err := submissionKey(task)
+		if err != nil {
+			cleanup()
+			return SubmitManyResult{}, fault.Wrap("TASK_CREATE_FAILED", "cannot calculate submission key", false, err)
+		}
+		task.Metadata["submission_key"] = key
 		task.Metadata["batch_id"] = batchID
 		task.Metadata["batch_index"] = strconv.Itoa(len(tasks))
 		task.Revision = 1
@@ -165,8 +173,56 @@ func (a *App) SubmitMany(
 	if err := a.Store.BindProject(ctx, p); err != nil {
 		return SubmitManyResult{}, err
 	}
-	if err := a.Store.CreateTasks(ctx, taskPointers); err != nil {
+	// A daemon retry can arrive after the first worker admitted every task but
+	// before it finished submitting them. Reuse that complete admission rather
+	// than treating it as a fresh batch; the per-task scheduler fence then
+	// prevents duplicate Slurm jobs.
+	if !forceNew {
+		existingTasks := make([]model.Task, len(tasks))
+		allExisting := true
+		anyExisting := false
+		for index, task := range tasks {
+			existing, found, findErr := a.Store.FindTaskBySubmissionKey(
+				ctx, task.ProjectID, task.SourcePath, task.Metadata["submission_key"])
+			if findErr != nil {
+				return SubmitManyResult{}, findErr
+			}
+			if found {
+				existingTasks[index] = existing
+				anyExisting = true
+			} else {
+				allExisting = false
+			}
+		}
+		if anyExisting && allExisting {
+			batchID := existingTasks[0].Metadata["batch_id"]
+			return SubmitManyResult{BatchID: batchID, Tasks: existingTasks}, nil
+		}
+		if anyExisting {
+			for _, existing := range existingTasks {
+				if existing.ID != "" {
+					return SubmitManyResult{}, fault.New("DUPLICATE_SUBMISSION",
+						fmt.Sprintf("submission already exists as task %s; batch was not submitted", existing.ID), false).
+						WithAction("run joyrun status " + existing.ID + ", or add --force-new for an intentional new run")
+				}
+			}
+		}
+	}
+	if forceNew {
+		for _, task := range tasks {
+			if err := a.ensureForceNewSafe(ctx, task); err != nil {
+				return SubmitManyResult{}, err
+			}
+		}
+	}
+	duplicate, deduplicated, err := a.Store.CreateTasksIdempotent(ctx, taskPointers, forceNew)
+	if err != nil {
 		return SubmitManyResult{}, err
+	}
+	if deduplicated {
+		return SubmitManyResult{}, fault.New("DUPLICATE_SUBMISSION",
+			fmt.Sprintf("submission already exists as task %s; batch was not submitted", duplicate.ID), false).
+			WithAction("run joyrun status " + duplicate.ID + ", or add --force-new for an intentional new run")
 	}
 	a.progress("Uploading %d task snapshot(s) in one batch...", len(tasks))
 	if err := a.Transfer.Push(ctx, cluster, staging, cluster.RemoteRoot, nil); err != nil {
@@ -189,7 +245,7 @@ func (a *App) SubmitMany(
 	}
 	a.progress("Submitting %d independent Slurm job(s) in one remote session...", len(tasks))
 	submitCtx, cancelSubmit := a.batchSubmitContext(ctx, len(tasks))
-	submitted, submitErr := (scheduler.Slurm{Runner: a.Runner}).SubmitMany(
+	submitted, submitErr := a.scheduler().SubmitMany(
 		submitCtx, cluster.Host, jobs)
 	cancelSubmit()
 	if submitErr != nil {
@@ -224,8 +280,16 @@ func (a *App) SubmitMany(
 		}
 		if message := submitted.Failures[task.ID]; message != "" {
 			cause := errors.New(message)
-			failure := a.failSubmission(ctx, task, "SUBMIT_FAILED", "submit",
-				"Slurm rejected batch task", false, cause)
+			if submitted.Rejected[task.ID] {
+				failure := a.failSubmission(ctx, task, "SUBMIT_FAILED", "submit",
+					"Slurm rejected batch task", false, cause)
+				result.Failures = append(result.Failures, BatchFailure{
+					TaskID: task.ID, Source: task.SourcePath, Error: fault.As(failure),
+				})
+				continue
+			}
+			failure := a.failSubmissionUncertain(ctx, task, "submit",
+				"batch submission returned an invalid scheduler result; acceptance is uncertain", cause)
 			result.Failures = append(result.Failures, BatchFailure{
 				TaskID: task.ID, Source: task.SourcePath, Error: fault.As(failure),
 			})
@@ -564,7 +628,7 @@ func (a *App) refreshTaskBatch(ctx context.Context, tasks []model.Task) ([]model
 		for _, index := range indexes {
 			ids = append(ids, tasks[index].SchedulerID)
 		}
-		statuses, err := (scheduler.Slurm{Runner: a.Runner}).Statuses(ctx, cluster.Host, ids)
+		statuses, err := a.scheduler().Statuses(ctx, cluster.Host, ids)
 		if err != nil {
 			return nil, err
 		}

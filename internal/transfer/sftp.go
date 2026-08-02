@@ -22,8 +22,9 @@ import (
 type sftpConnect func(context.Context, string, io.Writer) (*sftp.Client, func() error, error)
 
 type SFTP struct {
-	Stderr  io.Writer
-	connect sftpConnect
+	Stderr      io.Writer
+	ControlPath string
+	connect     sftpConnect
 }
 
 func (s *SFTP) Check(ctx context.Context, host string) error {
@@ -154,7 +155,31 @@ func uploadFile(
 	}
 	defer input.Close()
 	tempPath := remotePath + ".joyrun-part"
-	output, err := client.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	inputInfo, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+	var offset int64
+	if existing, statErr := client.Stat(tempPath); statErr == nil {
+		offset = existing.Size()
+		if offset > inputInfo.Size() {
+			_ = client.Remove(tempPath)
+			offset = 0
+		}
+	}
+	if offset > inputInfo.Size() {
+		return fmt.Errorf("remote partial file is larger than local source")
+	}
+	if _, err := input.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	flags := os.O_WRONLY | os.O_CREATE
+	if offset > 0 {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+	output, err := client.OpenFile(tempPath, flags)
 	if err != nil {
 		return err
 	}
@@ -228,11 +253,11 @@ func downloadFile(client *sftp.Client, remotePath, localPath string, progress io
 	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
 		return err
 	}
-	output, err := os.CreateTemp(filepath.Dir(localPath), "."+filepath.Base(localPath)+".joyrun-*")
+	tempPath := filepath.Join(filepath.Dir(localPath), "."+filepath.Base(localPath)+".joyrun-part")
+	output, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
-	tempPath := output.Name()
 	keepTemp := true
 	defer func() {
 		_ = output.Close()
@@ -240,6 +265,18 @@ func downloadFile(client *sftp.Client, remotePath, localPath string, progress io
 			_ = os.Remove(tempPath)
 		}
 	}()
+	if existing, statErr := output.Stat(); statErr == nil {
+		if existing.Size() > info.Size() {
+			_ = output.Close()
+			_ = os.Remove(tempPath)
+			output, err = os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+		} else if _, err := input.Seek(existing.Size(), io.SeekStart); err != nil {
+			return err
+		}
+	}
 	if _, err := io.Copy(output,
 		newProgressReader(input, progress, "Downloading", relative, info.Size())); err != nil {
 		return err
@@ -337,11 +374,11 @@ func (s *SFTP) open(ctx context.Context, host string) (*sftp.Client, func() erro
 	if s.connect != nil {
 		return s.connect(ctx, host, s.Stderr)
 	}
-	return connectOpenSSH(ctx, host, s.Stderr)
+	return connectOpenSSH(ctx, host, s.Stderr, s.ControlPath)
 }
 
-func connectOpenSSH(ctx context.Context, host string, diagnostic io.Writer) (*sftp.Client, func() error, error) {
-	args := append(remote.OpenSSHOptions(), host, "-s", "sftp")
+func connectOpenSSH(ctx context.Context, host string, diagnostic io.Writer, controlPath string) (*sftp.Client, func() error, error) {
+	args := append(remote.OpenSSHOptionsFor(controlPath), host, "-s", "sftp")
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

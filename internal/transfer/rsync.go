@@ -16,11 +16,12 @@ import (
 )
 
 type Rsync struct {
-	Stderr io.Writer
+	Stderr      io.Writer
+	ControlPath string
 }
 
 func (r Rsync) Push(ctx context.Context, host, localDir, remoteDir string, excludes []string) error {
-	args := baseArgs()
+	args := baseArgs(r.ControlPath)
 	args = append(args, "--rsync-path", "mkdir -p "+remote.Quote(remoteDir)+" && rsync")
 	for _, pattern := range excludes {
 		args = append(args, "--exclude", pattern)
@@ -48,19 +49,23 @@ func (r Rsync) Pull(ctx context.Context, host, remoteDir, localDir string, files
 	if err := temp.Close(); err != nil {
 		return fault.Wrap("PULL_FAILED", "cannot finalize pull file list", false, err)
 	}
-	args := append(baseArgs(), "--from0", "--files-from", name,
+	args := append(baseArgs(r.ControlPath), "--from0", "--files-from", name,
 		host+":"+strings.TrimSuffix(remoteDir, "/")+"/", filepath.Clean(localDir)+string(filepath.Separator))
 	return r.run(ctx, "PULL_FAILED", "rsync pull failed", args, nil)
 }
 
-func baseArgs() []string {
+func baseArgs(controlPathArgs ...string) []string {
+	controlPath := ""
+	if len(controlPathArgs) > 0 {
+		controlPath = controlPathArgs[0]
+	}
 	return []string{
 		"-az",
 		"--partial",
 		"--protect-args",
 		"--info=progress2",
 		"--timeout=90",
-		"-e", remote.OpenSSHShell(),
+		"-e", remote.OpenSSHShellFor(controlPath),
 	}
 }
 

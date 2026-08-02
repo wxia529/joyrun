@@ -149,6 +149,18 @@ func TestSubmitManyUploadsAndSubmitsBatchOnce(t *testing.T) {
 		result.Tasks[0].Metadata["batch_id"] != result.Tasks[1].Metadata["batch_id"] {
 		t.Fatalf("batch identity was not frozen in tasks: %#v", result.Tasks)
 	}
+	second, err := application.SubmitMany(ctx, root,
+		[]string{"task01/a.inp", "task02/different.inp"},
+		"c/run", nil, nil, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Tasks) != 2 || second.BatchID != result.BatchID {
+		t.Fatalf("retry did not reuse admitted batch: %#v", second)
+	}
+	if transfer.pushCalls != 1 || runner.calls != 1 {
+		t.Fatalf("retry resubmitted batch: push=%d remote=%d", transfer.pushCalls, runner.calls)
+	}
 	runner.calls = 0
 	transfer.pushCalls = 0
 	if _, err := application.SubmitMany(ctx, root,

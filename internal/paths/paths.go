@@ -35,6 +35,13 @@ func DatabaseFile() string {
 	return databaseFile(runtime.GOOS, os.Getenv, home)
 }
 
+// OperationDataDir is private local state used for durable daemon operation
+// snapshots. It intentionally follows the database's per-user data root.
+func OperationDataDir() string {
+	database := DatabaseFile()
+	return filepath.Join(filepath.Dir(database), "operations")
+}
+
 func databaseFile(goos string, getenv func(string) string, home string) string {
 	base := getenv("XDG_DATA_HOME")
 	if base == "" {

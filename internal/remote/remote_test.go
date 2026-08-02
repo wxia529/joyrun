@@ -45,3 +45,12 @@ func TestOpenSSHOptionsBoundConnectionStalls(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenSSHOptionsForControlPath(t *testing.T) {
+	shell := OpenSSHShellFor("/tmp/joyrun/control-%C")
+	for _, expected := range []string{"ControlMaster=auto", "ControlPersist=300", "ControlPath=/tmp/joyrun/control-%C"} {
+		if !strings.Contains(shell, expected) {
+			t.Fatalf("control option %q missing from %q", expected, shell)
+		}
+	}
+}

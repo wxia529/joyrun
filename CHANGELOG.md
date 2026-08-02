@@ -3,7 +3,31 @@
 All notable user-visible changes are documented here. JoyRun follows semantic
 version tags, while the SQLite schema is versioned independently.
 
-## [Unreleased]
+## [v0.2.0] - 2026-08-02
+
+### Changed
+
+- Made submission admission idempotent using a content-based submission key;
+  retries after lost SSH responses reuse the existing Task instead of creating a
+  second Slurm job. Added explicit `--force-new` for intentional reruns.
+- Added the mandatory local daemon and authenticated IPC controller. Project,
+  task, scheduler, and remote commands no longer fall back to direct SSH or
+  SQLite access when the daemon is unavailable.
+- Added durable submit/pull Operations, explicit stable-1 to stable-2 database
+  upgrade, lease reclaim on restart, operation inspection/cancel/retry,
+  conservative Task polling, and opt-in automatic pull.
+- Added the cache-only global `joyrun watch` view with bounded attention-first
+  task listing, filters, one-shot JSON output, and no remote polling from the
+  client.
+- Added adaptive scheduler freshness reporting, immutable detached input and
+  configuration snapshots, resumable rsync/SFTP transfer staging, atomic pull
+  installation, and OpenSSH ControlPath reuse in daemon mode.
+- Fixed duplicate-admission fingerprints so changing pull or push selection
+  cannot create a second compute Task, and protected detached source paths
+  containing `=` during snapshot rewriting.
+- Added a remote safety refresh before `--force-new`; active or uncertain
+  identical Tasks now block intentional reruns until Slurm confirms a terminal
+  state.
 
 ## [v0.1.11] - 2026-07-30
 
@@ -147,7 +171,7 @@ The SQLite schema remains `stable/stable-1`.
 - First public release with asynchronous Slurm submission, status, logs,
   bounded pull, global SQLite state, Project identity, and remote recovery.
 
-[Unreleased]: https://github.com/wxia529/joyrun/compare/v0.1.5...HEAD
+[v0.2.0]: https://github.com/wxia529/joyrun/compare/v0.1.11...v0.2.0
 [v0.1.5]: https://github.com/wxia529/joyrun/compare/v0.1.4...v0.1.5
 [v0.1.4]: https://github.com/wxia529/joyrun/compare/v0.1.3...v0.1.4
 [v0.1.3]: https://github.com/wxia529/joyrun/compare/v0.1.2...v0.1.3

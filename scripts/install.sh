@@ -16,7 +16,7 @@ Usage:
   install.sh [--version VERSION] [--install-dir DIRECTORY] [--check]
 
 Options:
-  --version VERSION       Install a specific tag such as v0.1.5.
+  --version VERSION       Install a specific tag such as v0.2.0.
   --install-dir DIRECTORY Install into DIRECTORY (default: ~/.local/bin).
   --check                 Report the installed and latest versions without
                           changing any files.

@@ -219,8 +219,26 @@ func (f *fakeTransfer) Push(_ context.Context, _ model.Cluster, localDir, _ stri
 	return nil
 }
 
-func (f *fakeTransfer) Pull(_ context.Context, _ model.Cluster, _, _ string, files []string) error {
+func (f *fakeTransfer) Pull(_ context.Context, _ model.Cluster, _, localDir string, files []string) error {
 	f.pulled = append([]string{}, files...)
+	if f.pullErr == nil {
+		for _, file := range files {
+			path := filepath.Join(localDir, filepath.FromSlash(file))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			size := int64(1)
+			switch file {
+			case "eg.out":
+				size = 200
+			case "eg.gbw":
+				size = 300
+			}
+			if err := os.WriteFile(path, make([]byte, size), 0o600); err != nil {
+				return err
+			}
+		}
+	}
 	return f.pullErr
 }
 
@@ -378,6 +396,109 @@ func TestCompleteSubmitStatusPullFlow(t *testing.T) {
 	}
 	if recovered.ID != result.Task.ID || recovered.ComputeState != model.ComputeCompleted {
 		t.Fatalf("unexpected recovered task: %#v", recovered)
+	}
+}
+
+func TestExecuteReservedSubmitUsesFrozenTaskTemplateAndID(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	p, err := project.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	task := model.Task{ID: "jr_reserved", Revision: 1, ProjectID: p.ProjectID,
+		SourcePath: "task", SourceWorkDir: "task", TargetName: "cluster/test",
+		ClusterName: "cluster", RemoteDir: "/scratch/joyrun/jr_reserved",
+		ComputeState: model.ComputeCreated, PullState: model.PullNotPulled,
+		RenderedScript: "echo jr_reserved\n", InputManifest: []model.ManifestEntry{{Path: "job.inp", Size: 5}},
+		Metadata: map[string]string{"partition": "compute"}, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateTask(ctx, &task); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(t.TempDir(), "snapshot")
+	if err := os.MkdirAll(snapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapshot, "job.inp"), []byte("input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	xfer := &fakeTransfer{}
+	application := &App{Store: db, Runner: &fakeRunner{}, Transfer: xfer,
+		Config: model.Config{Clusters: map[string]model.Cluster{"cluster": {
+			Host: "cluster", Scheduler: "slurm", RemoteRoot: "/scratch/joyrun",
+		}}, Targets: map[string]model.Target{"cluster/test": {Cluster: "cluster"}}}}
+	result, err := application.ExecuteReservedSubmit(ctx, task.ID, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Task.ID != task.ID || result.Task.SchedulerID != "12345" {
+		t.Fatalf("reserved submit changed identity: %#v", result.Task)
+	}
+	if string(xfer.pushedScript) != task.RenderedScript {
+		t.Fatalf("uploaded script changed: %q", xfer.pushedScript)
+	}
+}
+
+func TestExecuteReservedSubmitReconcilesSubmitFenceWithoutResubmitting(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	runner := &fakeRunner{}
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
+			Targets:  map[string]model.Target{"c/run": {Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"}}},
+		},
+		Store: s, Runner: runner, Transfer: &fakeTransfer{},
+	}
+	first, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenced := first.Task
+	fenced.ComputeState = model.ComputeCreated
+	fenced.SchedulerID = ""
+	fenced.UpdatedAt = time.Now().UTC()
+	if err := s.UpdateTask(ctx, &fenced); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendEvent(ctx, model.TaskEvent{TaskID: fenced.ID, Type: "SUBMIT_STARTED", Stage: "submit", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	runner.schedulerID = ""
+	runner.reconcileID = "54321"
+	runner.execCalls = 0
+	result, err := application.ExecuteReservedSubmit(ctx, fenced.ID, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Task.SchedulerID != "54321" || result.Task.ComputeState != model.ComputeQueued {
+		t.Fatalf("submission fence was not reconciled: %#v", result.Task)
+	}
+	if runner.execCalls == 0 || runner.schedulerID != "" {
+		t.Fatalf("reserved reconciliation unexpectedly submitted a new job: calls=%d scheduler=%q", runner.execCalls, runner.schedulerID)
 	}
 }
 
@@ -920,6 +1041,67 @@ func TestSubmitReconcilesAcceptedJobAfterSSHDisconnect(t *testing.T) {
 	}
 	if result.Task.SchedulerID != "12345" || result.Task.ComputeState != model.ComputeQueued {
 		t.Fatalf("accepted Slurm job was not reconciled: %#v", result.Task)
+	}
+}
+
+func TestSubmitRetriesAreIdempotentAndForceNewIsExplicit(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "job.inp"), []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	runner := &fakeRunner{state: "PENDING"}
+	application := &App{
+		Config: model.Config{
+			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
+			Targets: map[string]model.Target{"c/run": {
+				Cluster: "c", Script: "run {{ .Input }}", Push: model.PushPolicy{Mode: "entry"},
+			}},
+		},
+		Store: s, Runner: runner, Transfer: &fakeTransfer{},
+	}
+	first, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callsAfterFirst := runner.execCalls
+	target := application.Config.Targets["c/run"]
+	target.Pull.Default = []string{"*.out"}
+	application.Config.Targets["c/run"] = target
+	second, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Deduplicated || second.Task.ID != first.Task.ID {
+		t.Fatalf("retry did not reuse first task: first=%#v second=%#v", first.Task, second)
+	}
+	if runner.execCalls != callsAfterFirst {
+		t.Fatalf("idempotent retry contacted remote: calls before=%d after=%d", callsAfterFirst, runner.execCalls)
+	}
+	runner.state = "COMPLETED"
+	third, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Deduplicated || third.Task.ID == first.Task.ID {
+		t.Fatalf("force-new did not create a distinct task: %#v", third)
+	}
+	runner.state = "RUNNING"
+	if _, err := application.Submit(ctx, root, "job.inp", "c/run", nil, nil, "", true, true); fault.As(err).Code != "SUBMISSION_SAFETY_UNCONFIRMED" {
+		t.Fatalf("force-new should block while prior work is running, got %v", err)
+	}
+	tasks, err := s.ListTasks(ctx, p.ProjectID)
+	if err != nil || len(tasks) != 2 {
+		t.Fatalf("unexpected task count after force-new: %d, %v", len(tasks), err)
 	}
 }
 

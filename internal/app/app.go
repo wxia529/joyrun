@@ -32,7 +32,9 @@ type App struct {
 	Config             model.Config
 	Store              *store.Store
 	Runner             remote.Runner
+	Scheduler          Scheduler
 	Transfer           Transfer
+	TransferInspector  TransferInspector
 	Progress           io.Writer
 	RemoteTimeout      time.Duration
 	SubmitTimeout      time.Duration
@@ -43,7 +45,33 @@ type App struct {
 type Transfer interface {
 	Push(ctx context.Context, cluster model.Cluster, localDir, remoteDir string, excludes []string) error
 	Pull(ctx context.Context, cluster model.Cluster, remoteDir, localDir string, files []string) error
+}
+
+// TransferInspector is the optional diagnostics seam used by doctor. It is
+// intentionally separate from the submit/pull data path so a transfer
+// implementation only needs to provide the operations it actually supports.
+type TransferInspector interface {
 	Check(ctx context.Context, cluster model.Cluster) (string, error)
+}
+
+// Scheduler is the execution scheduler seam used by the application layer.
+// Keeping it here lets tests and future scheduler adapters reuse the same
+// submit/status/cancel pipeline without constructing Slurm directly.
+type Scheduler interface {
+	Submit(context.Context, string, string, string, string) (string, error)
+	SubmitMany(context.Context, string, []scheduler.BatchJob) (scheduler.BatchSubmitResult, error)
+	FindByTaskID(context.Context, string, string, time.Time) (string, error)
+	Status(context.Context, string, string) (scheduler.JobStatus, error)
+	Statuses(context.Context, string, []string) (map[string]scheduler.JobStatus, error)
+	Cancel(context.Context, string, string) error
+	Nodes(context.Context, string, string) (scheduler.NodesResult, error)
+}
+
+func (a *App) scheduler() Scheduler {
+	if a.Scheduler != nil {
+		return a.Scheduler
+	}
+	return scheduler.Slurm{Runner: a.Runner}
 }
 
 type Preview struct {
@@ -74,7 +102,8 @@ type TemplateValues struct {
 }
 
 type SubmitResult struct {
-	Task model.Task `json:"task"`
+	Task         model.Task `json:"task"`
+	Deduplicated bool       `json:"deduplicated,omitempty"`
 }
 
 type PullOptions struct {
@@ -463,7 +492,9 @@ func (a *App) Submit(
 	includes []string,
 	partitionOverride string,
 	allowProjectRoot bool,
+	forceNewOption ...bool,
 ) (SubmitResult, error) {
+	forceNew := len(forceNewOption) > 0 && forceNewOption[0]
 	_, task, localWorkDir, err := a.prepare(
 		ctx, cwd, sourcePath, targetName, sets, includes, partitionOverride, false, allowProjectRoot,
 	)
@@ -491,9 +522,111 @@ func (a *App) Submit(
 		return SubmitResult{}, err
 	}
 	task.InputManifest = inputManifest
-	if err := a.Store.CreateTask(ctx, &task); err != nil {
+	key, err := submissionKey(task)
+	if err != nil {
+		return SubmitResult{}, fault.Wrap("TASK_CREATE_FAILED", "cannot calculate submission key", false, err)
+	}
+	if task.Metadata == nil {
+		task.Metadata = map[string]string{}
+	}
+	task.Metadata["submission_key"] = key
+	if forceNew {
+		if err := a.ensureForceNewSafe(ctx, task); err != nil {
+			return SubmitResult{}, err
+		}
+	}
+	existing, deduplicated, err := a.Store.CreateTaskIdempotent(ctx, &task, forceNew)
+	if err != nil {
 		return SubmitResult{}, err
 	}
+	if deduplicated {
+		// A daemon crash can leave a reserved Task in `created` before its
+		// remote metadata or scheduler submission is attempted. Reuse that
+		// exact immutable reservation and continue the safe stages instead of
+		// returning a permanently stuck Task or creating a second job.
+		if existing.ComputeState != model.ComputeCreated {
+			a.progress("Submission already exists; reusing task " + existing.ID)
+			return SubmitResult{Task: existing, Deduplicated: true}, nil
+		}
+		task = existing
+	}
+	return a.submitPrepared(ctx, task, snapshotDir, inputManifest)
+}
+
+// ExecuteReservedSubmit executes a Task that was admitted by the daemon. It
+// deliberately uses the frozen Task ID, rendered script, and input manifest;
+// re-running preparation here would change templates that reference .TaskID
+// or .RemoteDir and could defeat idempotency.
+func (a *App) ExecuteReservedSubmit(ctx context.Context, taskID, snapshotDir string) (SubmitResult, error) {
+	if a.Store == nil {
+		return SubmitResult{}, fault.New("DATABASE_FAILED", "task store is required", false)
+	}
+	task, err := a.Store.GetTask(ctx, taskID)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	if task.ComputeState == model.ComputeSubmissionUncertain {
+		return a.reconcileReservedSubmit(ctx, task)
+	}
+	if task.ComputeState != model.ComputeCreated {
+		return SubmitResult{Task: task, Deduplicated: true}, nil
+	}
+	// A process can die after the remote sbatch command is accepted but before
+	// the scheduler ID is persisted locally. The SUBMIT_STARTED event is the
+	// durable fence: reconcile it before ever issuing another sbatch command.
+	events, eventsErr := a.Store.Events(ctx, task.ID)
+	if eventsErr != nil {
+		return SubmitResult{}, eventsErr
+	}
+	for _, event := range events {
+		if event.Type == "SUBMIT_STARTED" {
+			return a.reconcileReservedSubmit(ctx, task)
+		}
+	}
+	return a.submitPrepared(ctx, task, snapshotDir, task.InputManifest)
+}
+
+func (a *App) reconcileReservedSubmit(ctx context.Context, task model.Task) (SubmitResult, error) {
+	cluster, ok := a.Config.Clusters[task.ClusterName]
+	if !ok {
+		return SubmitResult{}, fault.New("CLUSTER_NOT_FOUND",
+			fmt.Sprintf("cluster %q is no longer configured", task.ClusterName), false)
+	}
+	recoveryCtx, cancelRecovery := a.recoveryContext(ctx)
+	schedulerID, recoveryErr := a.recoverSchedulerID(recoveryCtx, cluster, task)
+	cancelRecovery()
+	if recoveryErr != nil {
+		if task.ComputeState == model.ComputeSubmissionUncertain {
+			return SubmitResult{}, fault.Wrap("SUBMISSION_UNCERTAIN",
+				"cannot reconcile a possibly accepted Slurm submission", true, recoveryErr).
+				WithTask("submit", "joyrun status "+task.ID, task.ComputeState, task.PullState)
+		}
+		return SubmitResult{}, a.failSubmissionUncertain(ctx, &task, "submit",
+			"Slurm submission may have succeeded; reconciliation failed", recoveryErr)
+	}
+	if schedulerID == "" {
+		cause := errors.New("no scheduler job matched the immutable JoyRun task marker")
+		if task.ComputeState == model.ComputeSubmissionUncertain {
+			return SubmitResult{}, fault.Wrap("SUBMISSION_UNCERTAIN",
+				"Slurm submission remains unconfirmed; refusing to submit again", true, cause).
+				WithTask("submit", "joyrun recover "+task.ID, task.ComputeState, task.PullState)
+		}
+		return SubmitResult{}, a.failSubmissionUncertain(ctx, &task, "submit",
+			"Slurm submission may have succeeded; refusing to submit again without confirmation", cause)
+	}
+	now := time.Now().UTC()
+	task.SchedulerID = schedulerID
+	task.ComputeState = model.ComputeQueued
+	task.SubmittedAt = &now
+	task.UpdatedAt = now
+	if err := a.Store.UpdateTaskWithEvent(ctx, &task, taskEvent(task, "SCHEDULER_ACCEPTED", "submit",
+		"Recovered scheduler acceptance without resubmitting", map[string]string{"scheduler_id": schedulerID})); err != nil {
+		return SubmitResult{}, err
+	}
+	return SubmitResult{Task: task}, nil
+}
+
+func (a *App) submitPrepared(ctx context.Context, task model.Task, snapshotDir string, inputManifest []model.ManifestEntry) (SubmitResult, error) {
 	cluster := a.Config.Clusters[task.ClusterName]
 	workDir := path.Join(task.RemoteDir, "work")
 	if err := a.recordStage(ctx, &task, "UPLOAD_STARTED", "upload",
@@ -502,7 +635,7 @@ func (a *App) Submit(
 	}
 	a.progress("Creating remote task and uploading recovery metadata...")
 	remoteCtx, cancelRemote := a.remoteContext(ctx)
-	err = a.writeMetadata(remoteCtx, cluster, task)
+	err := a.writeMetadata(remoteCtx, cluster, task)
 	remoteFailure := operationFailure(remoteCtx, "REMOTE_METADATA_FAILED", "SSH_TIMEOUT")
 	cancelRemote()
 	if err != nil {
@@ -544,9 +677,8 @@ func (a *App) Submit(
 		return SubmitResult{}, err
 	}
 	a.progress("Submitting task to Slurm...")
-	slurm := scheduler.Slurm{Runner: a.Runner}
 	submitCtx, cancelSubmit := a.submitContext(ctx)
-	schedulerID, err := slurm.Submit(
+	schedulerID, err := a.scheduler().Submit(
 		submitCtx, cluster.Host, workDir, task.ID, task.Metadata["partition"],
 	)
 	submitUncertain := submitCtx.Err() != nil
@@ -586,6 +718,43 @@ func (a *App) Submit(
 		return SubmitResult{}, err
 	}
 	return SubmitResult{Task: task}, nil
+}
+
+// ensureForceNewSafe performs the remote check required before intentionally
+// creating a second execution with the same immutable submission intent. A
+// local terminal row is not sufficient: it may be stale or may have lost the
+// scheduler response. Ambiguous state blocks the new run rather than risking
+// duplicate Slurm work.
+func (a *App) ensureForceNewSafe(ctx context.Context, candidate model.Task) error {
+	history, err := a.Store.History(ctx, candidate.ProjectID, candidate.SourcePath)
+	if err != nil {
+		return fault.Wrap("SUBMISSION_SAFETY_UNCONFIRMED", "cannot inspect prior submissions before --force-new", true, err)
+	}
+	for _, prior := range history {
+		if prior.Metadata["submission_key"] != candidate.Metadata["submission_key"] {
+			continue
+		}
+		if prior.ComputeState == model.ComputeSubmissionFailed {
+			continue
+		}
+		refreshed, refreshErr := a.refreshTask(ctx, prior)
+		if refreshErr != nil {
+			return fault.Wrap("SUBMISSION_SAFETY_UNCONFIRMED",
+				"cannot remotely confirm the previous identical submission before --force-new", true, refreshErr).
+				WithTask("submit", "joyrun status "+prior.ID, prior.ComputeState, prior.PullState)
+		}
+		prior = refreshed
+		if prior.ComputeState == model.ComputeCreated ||
+			prior.ComputeState == model.ComputeSubmissionUncertain ||
+			prior.ComputeState == model.ComputeQueued ||
+			prior.ComputeState == model.ComputeRunning ||
+			prior.ComputeState == model.ComputeUnknown {
+			return fault.New("SUBMISSION_SAFETY_UNCONFIRMED",
+				"an identical submission is still active or uncertain; wait for remote terminal confirmation before --force-new", true).
+				WithTask("submit", "joyrun status "+prior.ID, prior.ComputeState, prior.PullState)
+		}
+	}
+	return nil
 }
 
 func (a *App) ResolveTask(ctx context.Context, cwd, identifier string) (model.Task, model.Project, error) {
@@ -658,8 +827,21 @@ func (a *App) StatusAll(ctx context.Context, cwd string) StatusAllResult {
 		// A missing scheduler ID requires reconciliation, which can be
 		// expensive and ambiguous for legacy failed records. Keep bulk status
 		// bounded; exact `status TASK` remains the recovery path.
-		if !bulkRefreshableComputeState(task.ComputeState) || task.SchedulerID == "" {
+		if !bulkRefreshableComputeState(task.ComputeState) {
 			resolved[task.ID] = task
+			continue
+		}
+		if task.SchedulerID == "" {
+			if task.ComputeState == model.ComputeSubmissionUncertain {
+				updated, refreshErr := a.refreshTask(ctx, task)
+				if refreshErr != nil {
+					result.Failures = append(result.Failures, StatusFailure{TaskID: task.ID, Error: fault.As(refreshErr)})
+				} else {
+					resolved[task.ID] = updated
+				}
+			} else {
+				resolved[task.ID] = task
+			}
 			continue
 		}
 		cluster, ok := a.Config.Clusters[task.ClusterName]
@@ -683,10 +865,11 @@ func (a *App) StatusAll(ctx context.Context, cwd string) StatusAllResult {
 		for _, task := range batch.tasks {
 			ids = append(ids, task.SchedulerID)
 		}
-		statuses, err := (scheduler.Slurm{Runner: a.Runner}).Statuses(
+		statuses, err := a.scheduler().Statuses(
 			ctx, batch.cluster.Host, ids)
 		if err != nil {
 			for _, task := range batch.tasks {
+				a.markSchedulerStale(ctx, &task)
 				result.Failures = append(result.Failures, StatusFailure{
 					TaskID: task.ID, Error: fault.As(err),
 				})
@@ -696,6 +879,7 @@ func (a *App) StatusAll(ctx context.Context, cwd string) StatusAllResult {
 		for _, task := range batch.tasks {
 			updated, err := a.applySchedulerStatus(ctx, task, statuses[task.SchedulerID])
 			if err != nil {
+				a.markSchedulerStale(ctx, &task)
 				result.Failures = append(result.Failures, StatusFailure{
 					TaskID: task.ID, Error: fault.As(err),
 				})
@@ -731,6 +915,7 @@ func (a *App) refreshTask(ctx context.Context, task model.Task) (model.Task, err
 	if task.SchedulerID == "" {
 		schedulerID, err := a.recoverSchedulerID(ctx, cluster, task)
 		if err != nil {
+			a.markSchedulerStale(ctx, &task)
 			return task, fault.As(err).
 				WithTask("status", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 		}
@@ -746,12 +931,30 @@ func (a *App) refreshTask(ctx context.Context, task model.Task) (model.Task, err
 			return task, err
 		}
 	}
-	status, err := (scheduler.Slurm{Runner: a.Runner}).Status(ctx, cluster.Host, task.SchedulerID)
+	status, err := a.scheduler().Status(ctx, cluster.Host, task.SchedulerID)
 	if err != nil {
+		a.markSchedulerStale(ctx, &task)
 		return task, fault.As(err).
 			WithTask("status", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 	}
 	return a.applySchedulerStatus(ctx, task, status)
+}
+
+func (a *App) markSchedulerStale(ctx context.Context, task *model.Task) {
+	if task == nil || a.Store == nil {
+		return
+	}
+	if task.Metadata == nil {
+		task.Metadata = map[string]string{}
+	}
+	if task.Metadata["scheduler_stale_since"] == "" {
+		task.Metadata["scheduler_stale_since"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if task.Metadata["scheduler_observation"] == "" {
+		task.Metadata["scheduler_observation"] = "cache"
+	}
+	task.UpdatedAt = time.Now().UTC()
+	_ = a.Store.UpdateTask(ctx, task)
 }
 
 func (a *App) applySchedulerStatus(
@@ -759,6 +962,14 @@ func (a *App) applySchedulerStatus(
 	task model.Task,
 	status scheduler.JobStatus,
 ) (model.Task, error) {
+	now := time.Now().UTC()
+	if task.Metadata == nil {
+		task.Metadata = map[string]string{}
+	}
+	previousObservedAt := task.Metadata["scheduler_observed_at"]
+	task.Metadata["scheduler_observation"] = "remote"
+	task.Metadata["scheduler_observed_at"] = now.Format(time.RFC3339Nano)
+	delete(task.Metadata, "scheduler_stale_since")
 	previousCompute := task.ComputeState
 	previousRaw := task.SchedulerState
 	previousReason, previousElapsed, previousExitCode :=
@@ -790,11 +1001,20 @@ func (a *App) applySchedulerStatus(
 		previousExitCode == task.ExitCode &&
 		previousStart == task.SchedulerStart &&
 		previousEnd == task.SchedulerEnd {
-		// Elapsed time changes on every poll. Return the fresh value without
-		// creating a database revision and lifecycle event for a timer tick.
+		// Elapsed time changes on every poll. Persist a freshness timestamp
+		// without adding a lifecycle event, but avoid rewriting the row when a
+		// caller immediately asks for the same observation again.
+		if observed, err := time.Parse(time.RFC3339Nano, previousObservedAt); err == nil &&
+			time.Since(observed) < 5*time.Second {
+			return task, nil
+		}
+		task.UpdatedAt = now
+		if err := a.Store.UpdateTask(ctx, &task); err != nil {
+			return task, err
+		}
 		return task, nil
 	}
-	task.UpdatedAt = time.Now().UTC()
+	task.UpdatedAt = now
 	eventType := "SCHEDULER_STATUS_CHANGED"
 	eventMessage := "Scheduler diagnostics refreshed"
 	if previousCompute != task.ComputeState || previousRaw != task.SchedulerState {
@@ -832,7 +1052,7 @@ func (a *App) recoverSchedulerID(
 			}
 		}
 	}
-	id, err := (scheduler.Slurm{Runner: a.Runner}).FindByTaskID(
+	id, err := a.scheduler().FindByTaskID(
 		ctx, cluster.Host, task.ID, task.CreatedAt.Add(-time.Minute))
 	if err != nil {
 		return "", err
@@ -862,7 +1082,7 @@ func (a *App) Cancel(ctx context.Context, cwd, identifier string) (model.Task, e
 		"Cancellation requested", nil)); err != nil {
 		return task, err
 	}
-	if err := (scheduler.Slurm{Runner: a.Runner}).Cancel(ctx, cluster.Host, task.SchedulerID); err != nil {
+	if err := a.scheduler().Cancel(ctx, cluster.Host, task.SchedulerID); err != nil {
 		return task, fault.Wrap("CANCEL_FAILED", "cannot cancel scheduler job", true, err).
 			WithTask("cancel", "joyrun status "+task.ID, task.ComputeState, task.PullState)
 	}
@@ -998,6 +1218,7 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	}
 	var files []string
 	var totalBytes int64
+	remoteSizes := make(map[string]int64)
 	for _, remoteFile := range remoteFiles {
 		file := filepath.ToSlash(remoteFile.Path)
 		if file == "" || file == "joyrun-job.sh" {
@@ -1010,6 +1231,7 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 			continue
 		}
 		files = append(files, file)
+		remoteSizes[file] = remoteFile.Size
 		totalBytes += remoteFile.Size
 	}
 	sort.Strings(files)
@@ -1039,9 +1261,28 @@ func (a *App) Pull(ctx context.Context, cwd, identifier string, options PullOpti
 	if err != nil {
 		return PullResult{}, err
 	}
-	if err := a.Transfer.Pull(ctx, cluster, workDir, destination, files); err != nil {
+	staging := filepath.Join(filepath.Dir(destination), ".joyrun-pull-"+task.ID)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		return PullResult{}, a.failPull(ctx, &task, "staging", "cannot create local pull staging directory", err)
+	}
+	if err := a.Transfer.Pull(ctx, cluster, workDir, staging, files); err != nil {
 		return PullResult{}, a.failPull(ctx, &task, "transfer", "cannot pull selected task files", err)
 	}
+	for _, file := range files {
+		sourcePath := filepath.Join(staging, filepath.FromSlash(file))
+		destinationPath := filepath.Join(destination, filepath.FromSlash(file))
+		info, statErr := os.Stat(sourcePath)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() != remoteSizes[file] {
+			if statErr == nil {
+				statErr = fmt.Errorf("size mismatch: got %d bytes, expected %d", info.Size(), remoteSizes[file])
+			}
+			return PullResult{}, a.failPull(ctx, &task, "verify", "cannot verify pulled file "+file, statErr)
+		}
+		if err := localfs.InstallStagedFile(sourcePath, destinationPath); err != nil {
+			return PullResult{}, a.failPull(ctx, &task, "install", "cannot install pulled file "+file, err)
+		}
+	}
+	_ = os.RemoveAll(staging)
 	now := time.Now().UTC()
 	task.PulledAt, task.UpdatedAt = &now, now
 	if terminalComputeState(task.ComputeState) {
@@ -1214,6 +1455,12 @@ func (a *App) Doctor(ctx context.Context, targetName string) DoctorResult {
 			"load or install Slurm so `command -v "+executable+"` succeeds"))
 	}
 	var transferErr error
+	inspector := a.TransferInspector
+	if inspector == nil {
+		if candidate, ok := a.Transfer.(TransferInspector); ok {
+			inspector = candidate
+		}
+	}
 	if backendErr != nil {
 		transferErr = backendErr
 	} else if backend == "rsync" {
@@ -1221,8 +1468,10 @@ func (a *App) Doctor(ctx context.Context, targetName string) DoctorResult {
 			transferErr = fault.New("TRANSFER_UNAVAILABLE",
 				"rsync is not installed on the remote cluster", false)
 		}
+	} else if inspector == nil {
+		transferErr = fault.New("TRANSFER_UNAVAILABLE", "selected transfer backend does not support diagnostics", false)
 	} else {
-		backend, transferErr = a.Transfer.Check(ctx, cluster)
+		backend, transferErr = inspector.Check(ctx, cluster)
 	}
 	detail := errorMessage(transferErr)
 	if detail == "" {

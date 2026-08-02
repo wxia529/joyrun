@@ -28,6 +28,10 @@ func TestProjectRebindAndTaskRoundTrip(t *testing.T) {
 	if err := s.BindProject(ctx, project); err != nil {
 		t.Fatal(err)
 	}
+	bound, err := s.GetProject(ctx, project.ProjectID)
+	if err != nil || bound.Root != "/new/location" {
+		t.Fatalf("project binding lookup = %#v, err=%v", bound, err)
+	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	entry := "eg.inp"
 	task := model.Task{
@@ -119,6 +123,53 @@ func TestFreshDatabaseIsMarkedStable(t *testing.T) {
 	}
 	if values["release_channel"] != schemaChannel || values["schema_label"] != schemaLabel {
 		t.Fatalf("unexpected database metadata: %#v", values)
+	}
+}
+
+func TestListWatchTasksIsBoundedFilteredAndOrderedByAttention(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	project := model.Project{ProjectID: "pj_watch", Root: t.TempDir()}
+	if err := s.BindProject(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	makeTask := func(id, target, compute, pull string, updated time.Time) model.Task {
+		entry := "input.inp"
+		return model.Task{
+			ID: id, ProjectID: project.ProjectID, SourcePath: id + "/input.inp", SourceWorkDir: id,
+			SourceEntry: &entry, TargetName: target, ClusterName: "cluster", RemoteDir: "/remote/" + id,
+			ComputeState: compute, PullState: pull, ResolvedParams: map[string]any{},
+			RenderedScript: "echo test", InputManifest: []model.ManifestEntry{{Path: entry}},
+			CreatedAt: updated.Add(-time.Minute), UpdatedAt: updated, Metadata: map[string]string{},
+		}
+	}
+	for _, task := range []model.Task{
+		makeTask("jr_attention", "target/a", model.ComputeFailed, model.PullNotPulled, now),
+		makeTask("jr_running", "target/a", model.ComputeRunning, model.PullNotPulled, now.Add(-time.Second)),
+		makeTask("jr_done", "target/b", model.ComputeCompleted, model.PullSucceeded, now.Add(-2*time.Second)),
+	} {
+		if err := s.CreateTask(ctx, &task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, total, err := s.ListWatchTasks(ctx, 2, WatchFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(rows) != 2 || rows[0].ID != "jr_attention" || rows[1].ID != "jr_running" {
+		t.Fatalf("unexpected watch rows: total=%d rows=%#v", total, rows)
+	}
+	rows, total, err = s.ListWatchTasks(ctx, 100, WatchFilter{Target: "target/a", Attention: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(rows) != 1 || rows[0].ID != "jr_attention" {
+		t.Fatalf("unexpected filtered watch rows: total=%d rows=%#v", total, rows)
 	}
 }
 

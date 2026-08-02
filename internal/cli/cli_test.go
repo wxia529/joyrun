@@ -9,11 +9,13 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wxia529/joyrun/internal/app"
 	"github.com/wxia529/joyrun/internal/fault"
 	"github.com/wxia529/joyrun/internal/model"
 	"github.com/wxia529/joyrun/internal/project"
+	"github.com/wxia529/joyrun/internal/store"
 )
 
 func TestInterspersedCanonicalSubmitSyntax(t *testing.T) {
@@ -25,6 +27,191 @@ func TestInterspersedCanonicalSubmitSyntax(t *testing.T) {
 	want := []string{"-t", "gibbs/orca", "--partition", "community", "--set", "cpus=64", "--include", "coords.xyz", "--dry-run", "task01/eg.inp"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
+func TestShouldUseDaemonForRuntimeCommandsOnly(t *testing.T) {
+	for _, command := range []string{"init", "submit", "status", "watch", "target nodes", "doctor", "recover", "pull"} {
+		args := strings.Fields(command)
+		if !shouldUseDaemon(args) {
+			t.Fatalf("%v should require daemon", args)
+		}
+	}
+	for _, command := range []string{"config validate", "database upgrade", "target list", "target show", "target params", "version", "daemon status"} {
+		args := strings.Fields(command)
+		if shouldUseDaemon(args) {
+			t.Fatalf("%v should remain local/daemon control", args)
+		}
+	}
+}
+
+func TestFormatWatchMarksAttentionAndHiddenRows(t *testing.T) {
+	text := formatWatch(watchOutput{
+		Tasks: []model.TaskSummary{{ID: "jr_attention", ProjectID: "project", SourcePath: "task/eg.inp",
+			ComputeState: model.ComputeFailed, PullState: model.PullNotPulled, UpdatedAt: time.Now().UTC()}},
+		Total: 3, Hidden: 2, GeneratedAt: time.Now().UTC(),
+	})
+	if !strings.Contains(text, "!failed") || !strings.Contains(text, "2 hidden") || !strings.Contains(text, "jr_attention") {
+		t.Fatalf("watch output lacks expected markers: %s", text)
+	}
+}
+
+func TestDetachedSourceRewritePreservesEqualsInPath(t *testing.T) {
+	previews := []app.Preview{{Source: model.Source{RelativePath: "task/rewritten.inp"}}}
+	got, err := rewriteExplicitSources(
+		[]string{"task/original=name.inp", "-t", "cluster/target", "--set", "label=a=b"}, previews)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"task/rewritten.inp", "-t", "cluster/target", "--set", "label=a=b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
+func TestPollIntervalPrioritizesUncertainSubmission(t *testing.T) {
+	tasks := []model.Task{
+		{ComputeState: model.ComputeRunning, UpdatedAt: time.Now().UTC()},
+		{ComputeState: model.ComputeSubmissionUncertain, UpdatedAt: time.Now().UTC()},
+	}
+	interval, active := pollInterval(tasks)
+	if !active || interval != 10*time.Second {
+		t.Fatalf("got interval=%s active=%v, want 10s and active", interval, active)
+	}
+}
+
+func TestOperationTerminalStates(t *testing.T) {
+	for _, state := range []string{model.OperationSucceeded, model.OperationPartiallySucceeded, model.OperationFailed, model.OperationCancelled} {
+		if !operationTerminal(state) {
+			t.Fatalf("state %q should be terminal", state)
+		}
+	}
+	for _, state := range []string{model.OperationQueued, model.OperationRunning, model.OperationWaitingReconcile} {
+		if operationTerminal(state) {
+			t.Fatalf("state %q should not be terminal", state)
+		}
+	}
+}
+
+func TestFlagValueSplitsOnlyTheFirstEquals(t *testing.T) {
+	if got := flagValue([]string{"--set", "label=a=b"}, "--set"); got != "label=a=b" {
+		t.Fatalf("got %q, want preserved value", got)
+	}
+	if got := flagValue([]string{"--auto-pull=completed"}, "--auto-pull"); got != "completed" {
+		t.Fatalf("got %q, want completed", got)
+	}
+}
+
+func TestNormalizeDetachedSubmitArgsExpandsSelectorsFromRequestDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.inp"), []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.inp"), []byte("b"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := normalizeDetachedSubmitArgs([]string{"--glob", "*.inp", "-t", "cluster/orca"}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"-t", "cluster/orca", filepath.Join(root, "a.inp"), filepath.Join(root, "b.inp")}) {
+		t.Fatalf("normalized args = %#v", got)
+	}
+}
+
+func TestOperationWaitReturnsTerminalOperation(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	root := t.TempDir()
+	p, err := project.Init(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateOperation(ctx, &model.Operation{ID: "jo_wait", Kind: "pull", ProjectID: p.ProjectID,
+		State: model.OperationSucceeded, Stage: model.OperationSucceeded, Payload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	c := &command{ctx: ctx, stdout: &stdout, stderr: &stderr, json: true}
+	if err := c.operation(db, []string{"wait", "jo_wait", "--until", "terminal"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), `"jo_wait"`) || c.exitCode != 0 {
+		t.Fatalf("unexpected wait output=%q exit=%d", stdout.String(), c.exitCode)
+	}
+}
+
+func TestDaemonAdmissionPersistsTaskAndOperationWithoutRemoteIO(t *testing.T) {
+	root := t.TempDir()
+	if _, err := project.Init(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "task"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "task", "input.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.yaml")
+	config := "version: 1\nclusters:\n  cluster:\n    host: unavailable\n    scheduler: slurm\n    remote_root: /scratch/joyrun\n    partitions:\n      compute: {}\ntargets:\n  cluster/smoke:\n    cluster: cluster\n    software: {name: smoke}\n    placement: {default_partition: compute, allowed_partitions: [compute]}\n    source: {kind: file, patterns: [\"*.txt\"]}\n    push: {mode: entry}\n    script: |\n      #!/bin/bash\n      echo {{ .TaskID }}\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "joyrun.db")
+	t.Setenv("JOYRUN_DB", dbPath)
+	var stdout, stderr bytes.Buffer
+	admissionCtx := context.WithValue(context.Background(), daemonExecutionKey{}, true)
+	c := &command{ctx: admissionCtx, version: "test", stdout: &stdout, stderr: &stderr,
+		config: configPath, cwd: root, json: true}
+	if err := c.admitDetachedAt("submit", []string{"task/input.txt", "-t", "cluster/smoke"}, root); err != nil {
+		t.Fatalf("%v stderr=%q stdout=%q", err, stderr.String(), stdout.String())
+	}
+	stored, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stored.Close()
+	projects, err := stored.ListProjects(context.Background())
+	if err != nil || len(projects) != 1 {
+		t.Fatalf("projects=%#v err=%v", projects, err)
+	}
+	tasks, err := stored.ListTasks(context.Background(), projects[0].ProjectID)
+	if err != nil || len(tasks) != 1 || tasks[0].ComputeState != model.ComputeCreated {
+		t.Fatalf("tasks=%#v err=%v", tasks, err)
+	}
+	ops, err := stored.ListOperations(context.Background(), projects[0].ProjectID)
+	if err != nil || len(ops) != 1 || ops[0].State != model.OperationQueued {
+		t.Fatalf("operations=%#v err=%v", ops, err)
+	}
+	operationTasks, err := stored.OperationTasks(context.Background(), ops[0].ID)
+	if err != nil || len(operationTasks) != 1 || operationTasks[0].TaskID != tasks[0].ID || operationTasks[0].State != "admitted" {
+		t.Fatalf("operation tasks=%#v err=%v", operationTasks, err)
+	}
+	if !strings.Contains(stdout.String(), tasks[0].ID) || !strings.Contains(stdout.String(), ops[0].ID) {
+		t.Fatalf("admission output=%q", stdout.String())
+	}
+}
+
+func TestRunResolvesRelativeConfigAgainstRequestCWD(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("version: 1\nclusters: {}\ntargets: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"config", "validate", "--config", "config.yaml"},
+		"test", &stdout, &stderr, root, true); code != 0 {
+		t.Fatalf("validate exited %d: stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), configPath) {
+		t.Fatalf("validation did not resolve request-relative config: %q", stdout.String())
 	}
 }
 
@@ -372,5 +559,23 @@ func TestCollectBatchValuesSupportsDifferentNamesGlobAndManifest(t *testing.T) {
 	}
 	if strings.Join(values, "|") != strings.Join(want, "|") {
 		t.Fatalf("unexpected batch selection: got %#v want %#v", values, want)
+	}
+}
+
+func TestOperationTasksFromResult(t *testing.T) {
+	submit := `{"batch_id":"jb_one","tasks":[{"id":"jr_one","compute_state":"queued"},{"id":"jr_two","compute_state":"submission_failed"}]}`
+	tasks := operationTasksFromResult("jo_one", "submit", submit)
+	if len(tasks) != 2 || tasks[1].TaskID != "jr_two" || tasks[1].State != "submission_failed" {
+		t.Fatalf("unexpected submit operation tasks: %#v", tasks)
+	}
+	pull := `{"pull_id":"jp_one","tasks":[{"task_id":"jr_one","pull_state":"succeeded"}]}`
+	tasks = operationTasksFromResult("jo_two", "pull", pull)
+	if len(tasks) != 1 || tasks[0].TaskID != "jr_one" || tasks[0].State != "succeeded" {
+		t.Fatalf("unexpected pull operation tasks: %#v", tasks)
+	}
+	enveloped := `{"ok":true,"result":{"batch_id":"jb_one","tasks":[{"id":"jr_one","compute_state":"queued"}],"failures":[{"task_id":"jr_two"}]}}`
+	tasks = operationTasksFromResult("jo_three", "submit", enveloped)
+	if len(tasks) != 2 || tasks[1].TaskID != "jr_two" || tasks[1].State != "failed" {
+		t.Fatalf("unexpected enveloped operation tasks: %#v", tasks)
 	}
 }

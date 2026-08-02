@@ -2,9 +2,7 @@ package scheduler
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +34,7 @@ type BatchJob struct {
 type BatchSubmitResult struct {
 	SchedulerIDs map[string]string
 	Failures     map[string]string
+	Rejected     map[string]bool
 }
 
 type NodeInfo struct {
@@ -63,14 +62,26 @@ type NodesResult struct {
 func (s Slurm) Submit(ctx context.Context, host, workDir, taskID, partition string) (string, error) {
 	command := "cd " + remote.Quote(workDir) +
 		" && chmod 700 joyrun-job.sh" +
-		" && jobid=$(sbatch --parsable --comment=" + remote.Quote("joyrun:"+taskID) +
+		" && printf '%s\\n' " + remote.Quote(taskID) + " > ../submit_started.tmp" +
+		" && mv -f ../submit_started.tmp ../submit_started" +
+		" && sbatch_output=$(sbatch --parsable --comment=" + remote.Quote("joyrun:"+taskID) +
 		" --partition=" + remote.Quote(partition) +
-		" --output=joyrun-slurm-%j.log joyrun-job.sh) && jobid=${jobid%%;*}" +
-		" && printf '%s\\n' \"$jobid\" > ../scheduler_id.tmp" +
-		" && mv ../scheduler_id.tmp ../scheduler_id && printf '%s\\n' \"$jobid\""
+		" --output=joyrun-slurm-%j.log joyrun-job.sh 2>../submit_stderr.tmp); sbatch_status=$?; " +
+		"if [ \"$sbatch_status\" -ne 0 ]; then " +
+		"printf 'JOYRUN_SUBMIT_REJECTED\\n' >&2; cat ../submit_stderr.tmp >&2; " +
+		"rm -f ../submit_stderr.tmp; exit \"$sbatch_status\"; fi; " +
+		"rm -f ../submit_stderr.tmp; jobid=${sbatch_output%%;*}; " +
+		"if ! printf '%s' \"$jobid\" | grep -Eq '^[0-9]+$'; then " +
+		"printf 'JOYRUN_SUBMIT_UNCERTAIN: invalid scheduler output\\n' >&2; exit 1; fi; " +
+		"printf '%s\\n' \"$jobid\" > ../scheduler_id.tmp" +
+		" && mv -f ../scheduler_id.tmp ../scheduler_id && printf '%s\\n' \"$jobid\""
 	stdout, stderr, err := s.Runner.Exec(ctx, host, command, nil)
 	if err != nil {
-		return "", fault.Wrap("SUBMIT_FAILED", message("Slurm submission failed", stderr), true, err)
+		code := "SUBMIT_FAILED"
+		if strings.Contains(stderr, "JOYRUN_SUBMIT_REJECTED") {
+			code = "SUBMIT_REJECTED"
+		}
+		return "", fault.Wrap(code, message("Slurm submission failed", stderr), code != "SUBMIT_REJECTED", err)
 	}
 	id := strings.TrimSpace(stdout)
 	if head, _, ok := strings.Cut(id, ";"); ok {
@@ -91,6 +102,7 @@ func (s Slurm) SubmitMany(ctx context.Context, host string, jobs []BatchJob) (Ba
 	result := BatchSubmitResult{
 		SchedulerIDs: map[string]string{},
 		Failures:     map[string]string{},
+		Rejected:     map[string]bool{},
 	}
 	if len(jobs) == 0 {
 		return result, nil
@@ -99,9 +111,9 @@ func (s Slurm) SubmitMany(ctx context.Context, host string, jobs []BatchJob) (Ba
 	for _, job := range jobs {
 		command.WriteString("taskid=")
 		command.WriteString(remote.Quote(job.TaskID))
-		command.WriteString("; output=$(cd ")
+		command.WriteString("; cd ")
 		command.WriteString(remote.Quote(job.WorkDir))
-		command.WriteString(" && chmod 700 joyrun-job.sh && sbatch --parsable --comment=")
+		command.WriteString(" && chmod 700 joyrun-job.sh && printf '%s\\n' \"$taskid\" > ../submit_started.tmp && mv -f ../submit_started.tmp ../submit_started && output=$(sbatch --parsable --comment=")
 		command.WriteString(remote.Quote("joyrun:" + job.TaskID))
 		command.WriteString(" --partition=")
 		command.WriteString(remote.Quote(job.Partition))
@@ -117,7 +129,7 @@ func (s Slurm) SubmitMany(ctx context.Context, host string, jobs []BatchJob) (Ba
 		command.WriteString("; printf 'OK\\0%s\\0%s\\0' \"$taskid\" \"$jobid\"; ")
 		command.WriteString("else printf 'ERR\\0%s\\0%s\\0' \"$taskid\" ")
 		command.WriteString("\"unexpected sbatch output: $output\"; fi; ")
-		command.WriteString("else printf 'ERR\\0%s\\0%s\\0' \"$taskid\" \"$output\"; fi; ")
+		command.WriteString("else printf 'REJ\\0%s\\0%s\\0' \"$taskid\" \"$output\"; fi; ")
 	}
 	stdout, stderr, err := s.Runner.Exec(ctx, host, command.String(), nil)
 	if err != nil {
@@ -136,6 +148,9 @@ func (s Slurm) SubmitMany(ctx context.Context, host string, jobs []BatchJob) (Ba
 			}
 		case "ERR":
 			result.Failures[taskID] = strings.TrimSpace(value)
+		case "REJ":
+			result.Failures[taskID] = strings.TrimSpace(value)
+			result.Rejected[taskID] = true
 		}
 	}
 	return result, nil
@@ -151,12 +166,13 @@ func pathJoinParent(workDir, name string) string {
 }
 
 func SubmissionDefinitelyRejected(err error) bool {
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
+	if err == nil {
 		return false
 	}
-	code := exitErr.ExitCode()
-	return code >= 0 && code != 255
+	if fault.As(err).Code == "SUBMIT_REJECTED" || strings.Contains(err.Error(), "JOYRUN_SUBMIT_REJECTED") {
+		return true
+	}
+	return false
 }
 
 func (s Slurm) FindByTaskID(ctx context.Context, host, taskID string, since time.Time) (string, error) {

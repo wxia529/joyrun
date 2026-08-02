@@ -7,13 +7,20 @@ local project -> OpenSSH -> offline HPC -> Slurm -> rsync/SFTP results back
 ```
 
 Give JoyRun a bounded local source and a user-defined Target. It creates an
-isolated remote task, submits it without blocking, tracks Slurm state, and
-pulls selected results back beside the original input.
+isolated remote task, tracks Slurm state, and pulls selected results back beside
+the original input. The local daemon is the single controller for SQLite,
+SSH, transfers, and Slurm; routed commands fail clearly if it is not running.
 
 ```bash
+joyrun daemon start
 joyrun submit task01/eg.inp -t gibbs/orca
 joyrun status task01/eg.inp
 joyrun pull task01/eg.inp
+joyrun watch --once
+
+# Durable admission continues after the CLI exits
+joyrun submit task01/eg.inp -t gibbs/orca --json
+joyrun operation wait jo_OPERATION_ID --until terminal --json
 ```
 
 ## Scope
@@ -79,6 +86,9 @@ JoyRun uses the system OpenSSH client and never stores credentials. Linux and
 macOS prefer rsync when available on both ends and fall back to SFTP. Native
 Windows uses OpenSSH SFTP without requiring WSL, Cygwin, MSYS2, or rsync.
 
+The single-controller architecture and daemon-required contract are documented
+in the [local daemon development design](docs/daemon-design.md).
+
 ## Install with an AI Agent
 
 Copy this prompt to a coding Agent:
@@ -97,6 +107,15 @@ https://github.com/wxia529/joyrun/releases/download/vX.Y.Z/SKILL.md
 ## First run
 
 JoyRun needs one user configuration and one Project identity.
+
+Start the daemon before `init` and all project, task, scheduler, or remote
+commands:
+
+```bash
+joyrun daemon start
+```
+Only version, configuration inspection, database maintenance, and daemon
+control are local exceptions.
 
 ```bash
 joyrun config init
@@ -211,6 +230,16 @@ joyrun status jr_TASK_ID --json
 joyrun logs jr_TASK_ID --lines 200 --json
 ```
 
+Submission is idempotent by default. JoyRun fingerprints the Project, Source,
+immutable input manifest, Target, and resolved parameters before admission.
+Retrying the same command after a lost SSH response reuses the original `jr_...`
+Task and does not call Slurm again. If a genuinely new run is intended, make it
+explicit with `--force-new`:
+
+```bash
+joyrun submit task01/eg.inp -t gibbs/orca --force-new --json
+```
+
 The primary way to submit multiple jobs is to list every Source path directly.
 The paths do not need to share a directory, filename, or naming pattern:
 
@@ -284,8 +313,10 @@ pull_state:    not_pulled -> pulling -> pulled|partial|failed
 ```
 
 `submission_uncertain` means the `sbatch` connection ended before JoyRun could
-prove whether Slurm accepted the job. Run `status` on that exact Task ID;
-never repeat `submit` until reconciliation is complete.
+prove whether Slurm accepted the job. Retrying the original submit is safe
+because the same fingerprint reuses the existing Task; run `status` on that
+exact Task ID to reconcile it. Use `--force-new` only for an intentional new
+calculation.
 
 `status --all` batches active jobs into one Slurm query per cluster. Records
 without a scheduler ID remain local; reconcile one explicitly with
@@ -304,8 +335,13 @@ exactly one document; progress and diagnostics use stderr.
 ```
 
 Errors include a stable code, retryability, and recovery context when
-available. Agents must not blindly repeat `submit`, because Slurm may already
-have accepted the job.
+available. Agents should retry the same submit command only; JoyRun's
+idempotency key prevents a second scheduler job. Do not add `--force-new`
+unless a distinct calculation is explicitly requested.
+
+When the daemon is running, the submit response includes an operation ID. Use
+`joyrun operation wait OPERATION_ID --until accepted|terminal --json` when an
+Agent needs an explicit completion boundary; do not poll SSH or Slurm itself.
 
 The [JoyRun Skill](SKILL.md) defines safe Agent operation, including bounded
 uploads, resource review, monitoring, pull selection, cancellation, and
@@ -318,12 +354,14 @@ recovery.
 - [Installation and Upgrades](docs/install.md)
 - [Agent Configuration Guide](docs/agent-configuration.md)
 - [Design and state model](docs/design.md)
+- [Local daemon development design](docs/daemon-design.md)
 - [Real HPC Acceptance Checklist](docs/acceptance.md)
 - [Changelog](CHANGELOG.md)
 
-The first public SQLite schema is independently versioned as
-`stable/stable-1`. See the Changelog before upgrading across configuration or
-database compatibility boundaries.
+The current development SQLite schema is `stable/stable-2`. Existing
+stable-1 databases require the explicit command
+`joyrun database upgrade --to stable-2`; JoyRun never migrates a database
+silently. See the Changelog before crossing compatibility boundaries.
 
 ## License
 

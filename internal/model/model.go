@@ -142,34 +142,90 @@ type TaskEvent struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
+// Operation is a durable local intent executed by the JoyRun daemon.  Its
+// payload is an immutable, secret-free JSON command envelope; the daemon may
+// resume it after a process restart without relying on the original CLI.
+type Operation struct {
+	ID              string     `json:"id"`
+	Kind            string     `json:"kind"`
+	ProjectID       string     `json:"project_id"`
+	ClusterKey      string     `json:"cluster_key,omitempty"`
+	DedupKey        string     `json:"dedup_key,omitempty"`
+	State           string     `json:"state"`
+	Stage           string     `json:"stage"`
+	Payload         string     `json:"payload"`
+	Result          string     `json:"result"`
+	Attempt         int        `json:"attempt"`
+	MaxAttempts     int        `json:"max_attempts"`
+	RetryDeadlineAt *time.Time `json:"retry_deadline_at,omitempty"`
+	NextAttemptAt   *time.Time `json:"next_attempt_at,omitempty"`
+	LeaseOwner      string     `json:"lease_owner,omitempty"`
+	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
+	ErrorCode       string     `json:"error_code,omitempty"`
+	ErrorMessage    string     `json:"error_message,omitempty"`
+	Retryable       bool       `json:"retryable"`
+	CreatedAt       time.Time  `json:"created_at"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+}
+
+// OperationTask records the task-level progress associated with one durable
+// operation. It keeps batch progress queryable without decoding the command's
+// opaque result payload.
+type OperationTask struct {
+	OperationID string `json:"operation_id"`
+	TaskID      string `json:"task_id"`
+	Ordinal     int    `json:"ordinal"`
+	State       string `json:"state"`
+	Result      string `json:"result,omitempty"`
+}
+
+const (
+	OperationQueued             = "queued"
+	OperationRunning            = "running"
+	OperationWaitingReconcile   = "waiting_reconcile"
+	OperationSucceeded          = "succeeded"
+	OperationPartiallySucceeded = "partially_succeeded"
+	OperationFailed             = "failed"
+	OperationCancelled          = "cancelled"
+)
+
 type TaskSummary struct {
-	ID              string    `json:"id"`
-	SourcePath      string    `json:"source_path"`
-	TargetName      string    `json:"target"`
-	ClusterName     string    `json:"cluster"`
-	SchedulerID     string    `json:"scheduler_id,omitempty"`
-	ComputeState    string    `json:"compute_state"`
-	PullState       string    `json:"pull_state"`
-	SchedulerState  string    `json:"scheduler_state,omitempty"`
-	SchedulerReason string    `json:"scheduler_reason,omitempty"`
-	Elapsed         string    `json:"elapsed,omitempty"`
-	ExitCode        string    `json:"exit_code,omitempty"`
-	SchedulerStart  string    `json:"scheduler_start,omitempty"`
-	SchedulerEnd    string    `json:"scheduler_end,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID                   string    `json:"id"`
+	ProjectID            string    `json:"project_id"`
+	SourcePath           string    `json:"source_path"`
+	TargetName           string    `json:"target"`
+	ClusterName          string    `json:"cluster"`
+	SchedulerID          string    `json:"scheduler_id,omitempty"`
+	ComputeState         string    `json:"compute_state"`
+	PullState            string    `json:"pull_state"`
+	SchedulerState       string    `json:"scheduler_state,omitempty"`
+	SchedulerReason      string    `json:"scheduler_reason,omitempty"`
+	Elapsed              string    `json:"elapsed,omitempty"`
+	ExitCode             string    `json:"exit_code,omitempty"`
+	SchedulerStart       string    `json:"scheduler_start,omitempty"`
+	SchedulerEnd         string    `json:"scheduler_end,omitempty"`
+	SchedulerObservation string    `json:"scheduler_observation,omitempty"`
+	SchedulerObservedAt  string    `json:"scheduler_observed_at,omitempty"`
+	SchedulerStaleSince  string    `json:"scheduler_stale_since,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 func SummarizeTask(task Task) TaskSummary {
 	return TaskSummary{
-		ID: task.ID, SourcePath: task.SourcePath, TargetName: task.TargetName,
+		ID: task.ID, ProjectID: task.ProjectID, SourcePath: task.SourcePath, TargetName: task.TargetName,
 		ClusterName: task.ClusterName, SchedulerID: task.SchedulerID,
 		ComputeState: task.ComputeState, PullState: task.PullState,
 		SchedulerState: task.SchedulerState, SchedulerReason: task.SchedulerReason,
 		Elapsed: task.Elapsed, ExitCode: task.ExitCode,
 		SchedulerStart: task.SchedulerStart, SchedulerEnd: task.SchedulerEnd,
-		CreatedAt: task.CreatedAt,
-		UpdatedAt: task.UpdatedAt,
+		SchedulerObservation: task.Metadata["scheduler_observation"],
+		SchedulerObservedAt:  task.Metadata["scheduler_observed_at"],
+		SchedulerStaleSince:  task.Metadata["scheduler_stale_since"],
+		CreatedAt:            task.CreatedAt,
+		UpdatedAt:            task.UpdatedAt,
 	}
 }
 

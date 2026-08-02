@@ -7,7 +7,9 @@ joyrun COMMAND --json
 ```
 
 Report the error code, task ID, `compute_state`, `pull_state`, and suggested
-action. Do not blindly repeat `submit`: Slurm may already have accepted it.
+action. Repeating the exact same `submit` command is safe: JoyRun's
+submission key reuses an existing Task. Use `--force-new` only for an
+explicitly requested distinct run.
 
 ## Configuration and source selection
 
@@ -37,7 +39,8 @@ action. Do not blindly repeat `submit`: Slurm may already have accepted it.
   through the remote scheduler marker and immutable Slurm comment.
 - `SUBMISSION_UNCERTAIN`: Slurm may already have accepted the task. Run
   `joyrun status TASK` until the scheduler ID is recovered or investigate the
-  immutable `joyrun:TASK` Slurm comment. Do not run `submit` again.
+  immutable `joyrun:TASK` Slurm comment. Repeating the exact same `submit`
+  command is idempotent; do not add `--force-new` unless a new run is intended.
 - `LOG_NOT_READY`: no configured application or scheduler log exists yet.
   Retry later or inspect the candidate paths reported by the error.
 

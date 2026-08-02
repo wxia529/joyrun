@@ -1,4 +1,16 @@
-# JoyRun v0.1 design
+# JoyRun v0.2 design
+
+This document describes the core Task, Source, Target, persistence, transfer,
+and scheduler contracts. The daemon is the single execution backend; its
+mandatory contract is specified in the [local daemon development design](daemon-design.md).
+The daemon remains local: it does not install a process on HPC systems or
+expand JoyRun into scientific workflow logic.
+
+The daemon architecture and implementation contract are specified in the
+[local daemon development design](daemon-design.md). The development daemon
+now performs local admission, durable dispatch, per-cluster serialization,
+cache-first status, and explicit operation waiting; the remaining typed-service
+extraction is an internal follow-up and does not change the CLI contract.
 
 JoyRun models one execution as:
 
@@ -43,11 +55,11 @@ addressed by the ID in `.joyrun/project.yaml`, not by its absolute path. Each
 command rebinds that ID to the current path, so a project can be moved without
 losing source-path lookup.
 
-The first public database format is independently versioned as
-`release_channel=stable`, `schema_version=1`, and `schema_label=stable-1`.
-Pre-release `development/dev-3` databases are rejected rather than migrated;
-remote metadata remains available for deliberate recovery. Future stable
-schema changes require explicit, tested migrations.
+The current development database format is `release_channel=stable`,
+`schema_version=1`, and `schema_label=stable-2`. Existing stable-1 databases
+must be upgraded explicitly with `joyrun database upgrade --to stable-2`; JoyRun
+never migrates them silently. Remote metadata remains available for deliberate
+recovery. Future stable schema changes require explicit, tested migrations.
 
 Every remote task directory also contains immutable submission
 `metadata.json`; the atomically written `scheduler_id` marker completes its
@@ -119,6 +131,24 @@ Remote recovery metadata preserves submission identity; routine status and
 pull bookkeeping is authoritative in the local SQLite index and does not cause
 an extra metadata SSH write.
 
+## Idempotent submission admission
+
+Before admission, JoyRun computes a SHA-256 submission key from the Project ID,
+Source, immutable input manifest, Target name and cluster, selected partition,
+resolved parameters, and rendered execution script. Pull patterns, logs, push
+filters, and other result-selection policy are deliberately excluded. It
+excludes the random Task ID and remote directory, so
+retrying the same request addresses the same submission. SQLite serializes the
+key check and task insert, preventing two local processes racing with the same
+request from both reaching Slurm.
+
+When a matching Task already exists, JoyRun returns it without opening a new
+remote submission session. This includes `submission_uncertain`, the critical
+lost-SSH-response case. `--force-new` is the explicit escape hatch for a
+deliberate rerun. The key is also stored in remote `metadata.json`, allowing
+`recover --scan` to preserve the same submission identity if the local index is
+lost.
+
 ## Remote layout
 
 Each submission gets an isolated directory:
@@ -175,12 +205,14 @@ SFTP writes uploads and downloads to same-directory temporary files before
 renaming them. Windows-specific pull validation rejects paths that NTFS cannot
 represent safely.
 
-## v0.1 boundaries
+## v0.2 boundaries
 
 - OpenSSH command-line client
 - rsync and OpenSSH/SFTP transfer backends
 - Slurm only
-- no daemon, workflow DAG, software auto-detection, or automatic restart
+- local daemon, durable detached Operations, adaptive reconciliation, and
+  resumable transfers
+- no workflow DAG, software auto-detection, or automatic restart
 - no scientific interpretation, arbitrary remote shell API, or automatic
   resubmission
 - no tar/zstd packing; a future transfer strategy can add it without changing

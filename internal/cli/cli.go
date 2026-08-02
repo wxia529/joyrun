@@ -8,17 +8,20 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/wxia529/joyrun/internal/app"
 	"github.com/wxia529/joyrun/internal/config"
+	"github.com/wxia529/joyrun/internal/daemon"
 	"github.com/wxia529/joyrun/internal/fault"
 	"github.com/wxia529/joyrun/internal/model"
 	"github.com/wxia529/joyrun/internal/paths"
 	"github.com/wxia529/joyrun/internal/project"
 	"github.com/wxia529/joyrun/internal/remote"
+	"github.com/wxia529/joyrun/internal/scheduler"
 	"github.com/wxia529/joyrun/internal/store"
 	"github.com/wxia529/joyrun/internal/transfer"
 )
@@ -30,18 +33,32 @@ type command struct {
 	stderr   io.Writer
 	json     bool
 	config   string
+	cwd      string
+	inDaemon bool
 	exitCode int
 }
 
+// daemonExecutionKey marks requests that are being handled by the resident
+// daemon. A separate context marker prevents asynchronous admission from
+// recursively forwarding an IPC request back to the daemon.
+type daemonExecutionKey struct{}
+
+func daemonExecution(ctx context.Context) bool {
+	value, _ := ctx.Value(daemonExecutionKey{}).(bool)
+	return value
+}
+
 type submitOutput struct {
-	BatchID  string             `json:"batch_id,omitempty"`
-	Tasks    []model.Task       `json:"tasks"`
-	Failures []app.BatchFailure `json:"failures"`
+	BatchID      string             `json:"batch_id,omitempty"`
+	Tasks        []model.Task       `json:"tasks"`
+	Failures     []app.BatchFailure `json:"failures"`
+	Deduplicated bool               `json:"deduplicated,omitempty"`
 }
 
 type submitPreviewOutput struct {
 	Sources  []string      `json:"sources"`
 	Previews []app.Preview `json:"previews"`
+	Tasks    []model.Task  `json:"tasks,omitempty"`
 	Failures []any         `json:"failures"`
 }
 
@@ -54,8 +71,17 @@ type pullOutput struct {
 }
 
 func Run(ctx context.Context, args []string, version string) int {
-	c := &command{ctx: ctx, version: version, stdout: os.Stdout, stderr: os.Stderr, config: paths.ConfigFile()}
-	args = c.extractGlobals(args)
+	cwd, _ := os.Getwd()
+	return run(ctx, args, version, os.Stdout, os.Stderr, cwd, false)
+}
+
+func run(ctx context.Context, originalArgs []string, version string, stdout, stderr io.Writer, cwd string, inDaemon bool) int {
+	c := &command{ctx: ctx, version: version, stdout: stdout, stderr: stderr,
+		config: paths.ConfigFile(), cwd: cwd, inDaemon: inDaemon}
+	args := c.extractGlobals(append([]string(nil), originalArgs...))
+	if !filepath.IsAbs(c.config) {
+		c.config = filepath.Join(c.cwd, c.config)
+	}
 	if len(args) == 0 || (len(args) == 1 && (args[0] == "help" || args[0] == "--help" || args[0] == "-h")) {
 		c.usage()
 		return 0
@@ -82,9 +108,22 @@ func Run(ctx context.Context, args []string, version string) int {
 		c.write(map[string]any{"version": version}, "joyrun "+version+"\n")
 		return 0
 	}
+	if args[0] == "daemon" {
+		return c.daemonCommand(args[1:])
+	}
+	if !inDaemon && args[0] == "watch" {
+		return c.watchClient(args)
+	}
+	if !inDaemon && shouldUseDaemon(args) {
+		return c.forwardToDaemon(originalArgs)
+	}
 	if !knownCommand(args[0]) {
 		c.writeError(fault.New("UNKNOWN_COMMAND", fmt.Sprintf("unknown command %q", args[0]), false))
 		return 1
+	}
+	if inDaemon && args[0] == "status" {
+		daemonStatusMu.Lock()
+		defer daemonStatusMu.Unlock()
 	}
 	if err := c.execute(args[0], args[1:]); err != nil {
 		c.writeError(err)
@@ -121,6 +160,9 @@ func (c *command) execute(name string, args []string) error {
 	if name == "config" {
 		return c.configure(args)
 	}
+	if name == "database" {
+		return c.database(args)
+	}
 	if name == "init" {
 		db, err := store.Open(paths.DatabaseFile())
 		if err != nil {
@@ -129,15 +171,39 @@ func (c *command) execute(name string, args []string) error {
 		defer db.Close()
 		return c.init(db, args)
 	}
+	if name == "operation" {
+		db, err := store.Open(paths.DatabaseFile())
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		return c.operation(db, args)
+	}
+	if name == "watch" {
+		db, err := store.Open(paths.DatabaseFile())
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		return c.watch(db, args)
+	}
 	cfg, err := config.Load(c.config)
 	if err != nil {
 		return err
 	}
-	runner := remote.SSH{Stderr: c.stderr}
+	controlPath := ""
+	if c.inDaemon && runtime.GOOS != "windows" {
+		if runtimePaths, pathErr := daemon.DefaultPaths(); pathErr == nil {
+			controlPath = filepath.Join(filepathDir(runtimePaths.Endpoint), "control-%C")
+		}
+	}
+	runner := remote.SSH{Stderr: c.stderr, ControlPath: controlPath}
 	application := &app.App{
 		Config: cfg, Runner: runner,
-		Transfer: transfer.Manager{Stderr: c.stderr, Runner: runner},
-		Progress: c.stderr,
+		Scheduler:         scheduler.Slurm{Runner: runner},
+		Transfer:          transfer.Manager{Stderr: c.stderr, Runner: runner, ControlPath: controlPath},
+		TransferInspector: transfer.Manager{Stderr: c.stderr, Runner: runner, ControlPath: controlPath},
+		Progress:          c.stderr,
 	}
 	if name == "target" {
 		return c.target(application, args)
@@ -210,6 +276,36 @@ func (c *command) configure(args []string) error {
 	default:
 		return fault.New("INVALID_ARGUMENT", "usage: joyrun config <path|init|validate>", false)
 	}
+}
+
+func (c *command) database(args []string) error {
+	runtime, err := daemon.DefaultPaths()
+	if err != nil {
+		return fault.Wrap("DAEMON_LOCK_FAILED", "cannot determine daemon runtime paths", false, err)
+	}
+	lock, err := daemon.AcquireLock(runtime.Lock)
+	if err != nil {
+		return fault.New("DAEMON_RUNNING", "stop the JoyRun daemon before upgrading the database", false)
+	}
+	defer lock.Close()
+	if len(args) < 3 || args[0] != "upgrade" || args[1] != "--to" || args[2] != "stable-2" {
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun database upgrade --to stable-2 [--dry-run]", false)
+	}
+	dryRun := containsFlag(args[3:], "--dry-run")
+	backup, err := store.UpgradeStable2(c.ctx, paths.DatabaseFile(), dryRun)
+	if err != nil {
+		return err
+	}
+	result := map[string]any{"database": paths.DatabaseFile(), "to": "stable-2", "dry_run": dryRun}
+	if backup != "" {
+		result["backup"] = backup
+	}
+	if dryRun {
+		c.write(result, "Database is ready for stable-2 upgrade. No changes written.\n")
+	} else {
+		c.write(result, "Database upgraded to stable-2. Backup retained at "+backup+"\n")
+	}
+	return nil
 }
 
 func (c *command) init(db *store.Store, args []string) error {
@@ -297,7 +393,8 @@ func (c *command) submit(application *app.App, args []string) error {
 	flags := newFlags("submit", c.stderr)
 	var target, partition string
 	var sets, includes, globs, files stringList
-	var dryRun, allowProjectRoot bool
+	var dryRun, allowProjectRoot, forceNew bool
+	var autoPull string
 	flags.StringVar(&target, "target", "", "execution target")
 	flags.StringVar(&target, "t", "", "execution target")
 	flags.Var(&sets, "set", "target parameter key=value")
@@ -307,17 +404,22 @@ func (c *command) submit(application *app.App, args []string) error {
 	flags.StringVar(&partition, "partition", "", "allowed target partition")
 	flags.BoolVar(&dryRun, "dry-run", false, "preview without remote changes")
 	flags.BoolVar(&allowProjectRoot, "allow-project-root", false, "explicitly allow uploading from the project root")
+	flags.BoolVar(&forceNew, "force-new", false, "intentionally create a new task when an identical submission exists")
+	flags.StringVar(&autoPull, "auto-pull", "off", "background pull policy: off, completed, or terminal")
 	if err := flags.Parse(interspersed(args,
 		map[string]bool{
 			"--target": true, "-t": true, "--set": true, "--include": true,
-			"--glob": true, "--from": true, "--partition": true,
+			"--glob": true, "--from": true, "--partition": true, "--auto-pull": true,
 		},
-		map[string]bool{"--dry-run": true, "--allow-project-root": true})); err != nil {
+		map[string]bool{"--dry-run": true, "--allow-project-root": true, "--force-new": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid submit arguments", false, err)
 	}
 	if target == "" {
 		return fault.New("INVALID_ARGUMENT",
 			"usage: joyrun submit SOURCE... -t TARGET [--glob PATTERN] [--from FILE]", false)
+	}
+	if autoPull != "off" && autoPull != "completed" && autoPull != "terminal" {
+		return fault.New("INVALID_ARGUMENT", "--auto-pull must be off, completed, or terminal", false)
 	}
 	sources, err := collectBatchValues(flags.Args(), globs, files)
 	if err != nil {
@@ -326,24 +428,33 @@ func (c *command) submit(application *app.App, args []string) error {
 	if len(sources) == 0 {
 		return fault.New("INVALID_ARGUMENT", "submit requires at least one source", false)
 	}
+	// A resident daemon owns the clock for remote work. Normal submit calls
+	// therefore perform only local admission (snapshot, durable Task and
+	// Operation) and return; the dispatcher performs SSH/Slurm work in the
+	// background.
+	if c.inDaemon && daemonExecution(c.ctx) && !dryRun {
+		return c.admitDetached("submit", args)
+	}
 	if len(sources) > app.MaxBatchTasks {
 		return fault.New("BATCH_TOO_LARGE",
 			fmt.Sprintf("submit accepts at most %d sources", app.MaxBatchTasks), false)
 	}
-	cwd, _ := os.Getwd()
+	cwd := c.cwd
 	if dryRun {
 		previews := make([]app.Preview, 0, len(sources))
+		tasks := make([]model.Task, 0, len(sources))
 		for _, source := range sources {
-			preview, _, _, err := application.Preview(
+			preview, task, _, err := application.Preview(
 				c.ctx, cwd, source, target, sets, includes, partition, allowProjectRoot)
 			if err != nil {
 				return err
 			}
 			previews = append(previews, preview)
+			tasks = append(tasks, task)
 		}
 		if c.json {
 			c.write(submitPreviewOutput{
-				Sources: sources, Previews: previews, Failures: []any{},
+				Sources: sources, Previews: previews, Tasks: tasks, Failures: []any{},
 			}, "")
 			return nil
 		}
@@ -361,22 +472,40 @@ func (c *command) submit(application *app.App, args []string) error {
 	if len(sources) == 1 {
 		fmt.Fprintln(c.stderr, "Preparing immutable input snapshot and uploading task...")
 		result, err := application.Submit(
-			c.ctx, cwd, sources[0], target, sets, includes, partition, allowProjectRoot)
+			c.ctx, cwd, sources[0], target, sets, includes, partition, allowProjectRoot, forceNew)
 		if err != nil {
 			return err
 		}
-		output := submitOutput{Tasks: []model.Task{result.Task}, Failures: []app.BatchFailure{}}
-		c.write(output, "Submitted "+formatTask(result.Task))
+		output := submitOutput{Tasks: []model.Task{result.Task}, Failures: []app.BatchFailure{}, Deduplicated: result.Deduplicated}
+		if autoPull != "off" && !result.Deduplicated {
+			if err := c.setAutoPull(application.Store, &result.Task, autoPull); err != nil {
+				return err
+			}
+			output.Tasks[0] = result.Task
+		}
+		message := "Submitted " + formatTask(result.Task)
+		if result.Deduplicated {
+			message = "Reused existing submission " + formatTask(result.Task)
+		}
+		c.write(output, message)
 		return nil
 	}
 	fmt.Fprintf(c.stderr, "Preparing and submitting %d independent task(s)...\n", len(sources))
 	result, err := application.SubmitMany(
-		c.ctx, cwd, sources, target, sets, includes, partition, allowProjectRoot)
+		c.ctx, cwd, sources, target, sets, includes, partition, allowProjectRoot, forceNew)
 	if err != nil {
 		return err
 	}
 	output := submitOutput{
 		BatchID: result.BatchID, Tasks: result.Tasks, Failures: result.Failures,
+	}
+	if autoPull != "off" {
+		for index := range result.Tasks {
+			if err := c.setAutoPull(application.Store, &result.Tasks[index], autoPull); err != nil {
+				return err
+			}
+		}
+		output.Tasks = result.Tasks
 	}
 	if c.json {
 		c.write(output, "")
@@ -398,17 +527,31 @@ func (c *command) submit(application *app.App, args []string) error {
 
 func (c *command) status(application *app.App, args []string) error {
 	flags := newFlags("status", c.stderr)
-	var all bool
+	var all, cached, refresh bool
 	flags.BoolVar(&all, "all", false, "refresh all non-terminal tasks")
-	if err := flags.Parse(interspersed(args, map[string]bool{}, map[string]bool{"--all": true})); err != nil {
+	flags.BoolVar(&cached, "cached", false, "use local task state without contacting the cluster")
+	flags.BoolVar(&refresh, "refresh", false, "force a remote scheduler refresh")
+	if err := flags.Parse(interspersed(args, map[string]bool{}, map[string]bool{"--all": true, "--cached": true, "--refresh": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid status arguments", false, err)
 	}
-	cwd, _ := os.Getwd()
+	if cached && refresh {
+		return fault.New("INVALID_ARGUMENT", "--cached and --refresh are mutually exclusive", false)
+	}
+	cwd := c.cwd
 	if all {
 		if flags.NArg() != 0 {
-			return fault.New("INVALID_ARGUMENT", "usage: joyrun status --all", false)
+			return fault.New("INVALID_ARGUMENT", "usage: joyrun status --all [--cached|--refresh]", false)
 		}
-		result := application.StatusAll(c.ctx, cwd)
+		var result app.StatusAllResult
+		if cached || (c.inDaemon && daemonExecution(c.ctx) && !refresh) {
+			tasks, err := application.List(c.ctx, cwd)
+			if err != nil {
+				return err
+			}
+			result.Tasks = tasks
+		} else {
+			result = application.StatusAll(c.ctx, cwd)
+		}
 		if c.json {
 			failures := result.Failures
 			if failures == nil {
@@ -438,9 +581,15 @@ func (c *command) status(application *app.App, args []string) error {
 		return nil
 	}
 	if flags.NArg() != 1 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun status <source|task-id> | joyrun status --all", false)
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun status <source|task-id> [--cached|--refresh] | joyrun status --all [--cached|--refresh]", false)
 	}
-	task, err := application.Status(c.ctx, cwd, flags.Arg(0))
+	var task model.Task
+	var err error
+	if cached || (c.inDaemon && daemonExecution(c.ctx) && !refresh) {
+		task, err = application.Inspect(c.ctx, cwd, flags.Arg(0))
+	} else {
+		task, err = application.Status(c.ctx, cwd, flags.Arg(0))
+	}
 	if err != nil {
 		return err
 	}
@@ -452,7 +601,7 @@ func (c *command) list(application *app.App, args []string) error {
 	if len(args) > 1 {
 		return fault.New("INVALID_ARGUMENT", "usage: joyrun list [source]", false)
 	}
-	cwd, _ := os.Getwd()
+	cwd := c.cwd
 	var tasks []model.Task
 	var err error
 	if len(args) == 1 {
@@ -488,7 +637,7 @@ func (c *command) inspect(application *app.App, args []string) error {
 	if flags.NArg() != 1 {
 		return fault.New("INVALID_ARGUMENT", "usage: joyrun inspect <source|task-id> [--events]", false)
 	}
-	cwd, _ := os.Getwd()
+	cwd := c.cwd
 	if events {
 		result, err := application.Trace(c.ctx, cwd, flags.Arg(0))
 		if err != nil {
@@ -529,7 +678,7 @@ func (c *command) logs(application *app.App, args []string) error {
 		return fault.New("INVALID_ARGUMENT",
 			"usage: joyrun logs <source|task-id> [--lines N] [--file PATH]", false)
 	}
-	cwd, _ := os.Getwd()
+	cwd := c.cwd
 	result, err := application.Logs(c.ctx, cwd, flags.Arg(0), lines, file)
 	if err != nil {
 		return err
@@ -542,7 +691,7 @@ func (c *command) files(application *app.App, args []string) error {
 	if len(args) != 1 {
 		return fault.New("INVALID_ARGUMENT", "usage: joyrun files <source|task-id>", false)
 	}
-	cwd, _ := os.Getwd()
+	cwd := c.cwd
 	files, err := application.RemoteFiles(c.ctx, cwd, args[0])
 	if err != nil {
 		return err
@@ -573,7 +722,7 @@ func (c *command) cancel(application *app.App, args []string) error {
 	if len(args) != 1 {
 		return fault.New("INVALID_ARGUMENT", "usage: joyrun cancel <task-id>", false)
 	}
-	cwd, _ := os.Getwd()
+	cwd := c.cwd
 	task, err := application.Cancel(c.ctx, cwd, args[0])
 	if err != nil {
 		return err
@@ -629,7 +778,10 @@ func (c *command) pull(application *app.App, args []string) error {
 		return fault.New("INVALID_ARGUMENT",
 			"usage: joyrun pull TASK_OR_SOURCE... | --batch BATCH_ID", false)
 	}
-	cwd, _ := os.Getwd()
+	if c.inDaemon && daemonExecution(c.ctx) && !options.DryRun {
+		return c.admitDetached("pull", args)
+	}
+	cwd := c.cwd
 	if len(identifiers) == 1 && options.BatchID == "" {
 		if options.DryRun {
 			fmt.Fprintln(c.stderr, "Selecting remote files without downloading...")
@@ -696,8 +848,15 @@ func (c *command) pull(application *app.App, args []string) error {
 }
 
 func collectBatchValues(positional, globs, files []string) ([]string, error) {
+	return collectBatchValuesAt("", positional, globs, files)
+}
+
+func collectBatchValuesAt(base string, positional, globs, files []string) ([]string, error) {
 	values := append([]string{}, positional...)
 	for _, pattern := range globs {
+		if base != "" && !filepath.IsAbs(pattern) {
+			pattern = filepath.Join(base, pattern)
+		}
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			return nil, fault.Wrap("INVALID_ARGUMENT",
@@ -710,7 +869,11 @@ func collectBatchValues(positional, globs, files []string) ([]string, error) {
 		values = append(values, matches...)
 	}
 	for _, name := range files {
-		data, err := os.ReadFile(name)
+		readName := name
+		if base != "" && !filepath.IsAbs(readName) {
+			readName = filepath.Join(base, readName)
+		}
+		data, err := os.ReadFile(readName)
 		if err != nil {
 			return nil, fault.Wrap("INVALID_ARGUMENT",
 				"cannot read batch selection file "+name, false, err)
@@ -719,6 +882,9 @@ func collectBatchValues(positional, globs, files []string) ([]string, error) {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
+			}
+			if base != "" && !filepath.IsAbs(line) {
+				line = filepath.Join(base, line)
 			}
 			values = append(values, line)
 		}
@@ -742,6 +908,62 @@ func collectBatchValues(positional, globs, files []string) ([]string, error) {
 		}
 	}
 	return result, nil
+}
+
+// normalizeDetachedSubmitArgs expands --glob/--from before a daemon takes an
+// immutable snapshot. The daemon process may have been started from a
+// different directory, so all expansion is explicitly relative to the
+// request's working directory.
+func normalizeDetachedSubmitArgs(args []string, cwd string) ([]string, error) {
+	var target, partition, autoPull string
+	var sets, includes, globs, files stringList
+	var dryRun, allowProjectRoot, forceNew bool
+	flags := newFlags("detached-submit", io.Discard)
+	flags.StringVar(&target, "target", "", "")
+	flags.StringVar(&target, "t", "", "")
+	flags.Var(&sets, "set", "")
+	flags.Var(&includes, "include", "")
+	flags.Var(&globs, "glob", "")
+	flags.Var(&files, "from", "")
+	flags.StringVar(&partition, "partition", "", "")
+	flags.BoolVar(&dryRun, "dry-run", false, "")
+	flags.BoolVar(&allowProjectRoot, "allow-project-root", false, "")
+	flags.BoolVar(&forceNew, "force-new", false, "")
+	flags.StringVar(&autoPull, "auto-pull", "off", "")
+	valueFlags := map[string]bool{"--target": true, "-t": true, "--set": true, "--include": true, "--glob": true, "--from": true, "--partition": true, "--auto-pull": true}
+	boolFlags := map[string]bool{"--dry-run": true, "--allow-project-root": true, "--force-new": true}
+	if err := flags.Parse(interspersed(args, valueFlags, boolFlags)); err != nil {
+		return nil, fault.Wrap("INVALID_ARGUMENT", "invalid detached submit arguments", false, err)
+	}
+	sources, err := collectBatchValuesAt(cwd, flags.Args(), globs, files)
+	if err != nil {
+		return nil, err
+	}
+	// Keep all non-selector options exactly as supplied, then append the
+	// normalized source paths. This is the canonical form understood by the
+	// immutable snapshot rewriter and the worker's ordinary submit parser.
+	normalized := make([]string, 0, len(args)+len(sources))
+	ordered := interspersed(args, valueFlags, boolFlags)
+	for i := 0; i < len(ordered); i++ {
+		arg := ordered[i]
+		if arg == "--glob" || arg == "--from" {
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "--glob=") || strings.HasPrefix(arg, "--from=") {
+			continue
+		}
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		normalized = append(normalized, arg)
+		if valueFlags[arg] && i+1 < len(ordered) {
+			normalized = append(normalized, ordered[i+1])
+			i++
+		}
+	}
+	normalized = append(normalized, sources...)
+	return normalized, nil
 }
 
 func (c *command) doctor(application *app.App, args []string) error {
@@ -779,7 +1001,7 @@ func (c *command) recover(application *app.App, args []string) error {
 		map[string]bool{"--target": true, "-t": true}, map[string]bool{"--scan": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid recover arguments", false, err)
 	}
-	cwd, _ := os.Getwd()
+	cwd := c.cwd
 	if scan {
 		if flags.NArg() != 0 || target == "" {
 			return fault.New("INVALID_ARGUMENT", "usage: joyrun recover --scan -t <target>", false)
@@ -854,10 +1076,14 @@ func (c *command) usage() {
 
 Usage:
   joyrun config <path|init|validate>
+  joyrun database upgrade --to stable-2 [--dry-run]
+	joyrun operation <list|show|tasks|wait|cancel|retry> [operation-id]
+  joyrun daemon <start|run --foreground|status|stop|logs>
   joyrun init [directory]
-  joyrun submit <source>... -t <target> [--glob pattern] [--from file] [--partition name] [--set key=value] [--include glob] [--dry-run]
-  joyrun status <source|task-id>
-  joyrun status --all
+  joyrun submit <source>... -t <target> [--glob pattern] [--from file] [--partition name] [--set key=value] [--include glob] [--force-new] [--dry-run] [--auto-pull completed|terminal]
+  joyrun status <source|task-id> [--cached|--refresh]
+  joyrun status --all [--cached|--refresh]
+  joyrun watch [--once] [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]
   joyrun list [source]
   joyrun inspect <source|task-id>
   joyrun inspect <source|task-id> --events
@@ -881,8 +1107,11 @@ Global options:
 
 func (c *command) commandUsage(name string) bool {
 	usage := map[string]string{
-		"config": "Usage: joyrun config <path|init|validate>\n",
-		"init":   "Usage: joyrun init [directory]\n",
+		"config":    "Usage: joyrun config <path|init|validate>\n",
+		"database":  "Usage: joyrun database upgrade --to stable-2 [--dry-run]\n",
+		"operation": "Usage: joyrun operation <list|show|tasks|wait|cancel|retry> [operation-id]\n",
+		"daemon":    "Usage: joyrun daemon <start|run --foreground|status|stop|logs>\n",
+		"init":      "Usage: joyrun init [directory]\n",
 		"submit": `Usage:
   joyrun submit <source> [<source>...] -t <target> [options]
   joyrun submit --glob <pattern> -t <target> [options]
@@ -890,8 +1119,11 @@ func (c *command) commandUsage(name string) bool {
 
 List multiple source paths directly; they do not need matching filenames.
 Use --glob for a reliable shared pattern or --from for a reviewed source list.
+Repeated submissions are idempotent; use --force-new only for an intentional rerun.
+JoyRun commands require a running daemon; start it with: joyrun daemon start.
 `,
 		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
+		"watch":   "Usage: joyrun watch [--once] [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]\n",
 		"list":    "Usage: joyrun list [source]\n",
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
 		"logs":    "Usage: joyrun logs <source|task-id> [--lines N] [--file PATH]\n",
@@ -912,8 +1144,8 @@ Use --glob for a reliable shared pattern or --from for a reviewed source list.
 
 func knownCommand(name string) bool {
 	switch name {
-	case "config", "init", "submit", "status", "list", "inspect", "logs",
-		"files", "pull", "cancel", "target", "doctor", "recover":
+	case "config", "database", "operation", "init", "submit", "status", "watch", "list", "inspect", "logs",
+		"files", "pull", "cancel", "target", "doctor", "recover", "daemon":
 		return true
 	default:
 		return false

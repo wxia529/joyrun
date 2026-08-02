@@ -43,7 +43,7 @@ values from an unrelated cluster.
 
 ## Define a cluster
 
-JoyRun v0.1 supports Slurm:
+JoyRun v0.2 supports Slurm:
 
 ```yaml
 version: 1

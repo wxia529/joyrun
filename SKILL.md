@@ -132,6 +132,11 @@ non-empty. Preserve stdout and never repeat successful Tasks. After partial
 submission, pull accepted `jr_...` IDs explicitly instead of the entire
 batch. A total failure uses `ok: false` with a top-level `error`.
 
+When a local daemon is running, normal submit/pull returns an admitted
+Operation instead (`result.operation_id`, and `result.task_ids` for a
+single-source submit). Use `joyrun operation wait ...` rather than issuing
+remote polling from the Agent.
+
 ## Create or modify configuration
 
 When asked to create a cluster or target, read and follow the complete
@@ -237,6 +242,19 @@ file is part of the task. Never add
 `--allow-project-root` merely to bypass `PROJECT_ROOT_UPLOAD_FORBIDDEN`; use it
 only when the user explicitly intends to upload from the complete project
 root.
+
+### Submission idempotency
+
+JoyRun admission is idempotent by default. It fingerprints the Project, Source,
+immutable input manifest, Target, partition, resolved parameters, and transfer
+policy. If an SSH response is lost, repeat the exact same `joyrun submit`
+command: JoyRun returns the existing `jr_...` Task and does not call Slurm a
+second time. Do not change inputs, parameters, or Target just to retry a
+transport failure.
+
+Use `--force-new` only after the user explicitly requests a distinct rerun of
+the same submission. It intentionally creates a new Task and scheduler job;
+never infer this flag from a generic request to “try again”.
 
 ## Review scientific resource consistency
 
@@ -375,6 +393,18 @@ Tasks without a scheduler ID are left unchanged during bulk refresh; use
 `joyrun status jr_TASK_ID --json` when explicit reconciliation is required.
 Status refresh never submits a replacement task.
 
+For a global, cache-only squeue-style view from any directory, use:
+
+```bash
+joyrun watch
+joyrun watch --once --json
+joyrun watch --attention --limit 100
+```
+
+`watch` redraws locally every few seconds; it never opens SSH. Do not add an
+interval flag or replace it with a tight `status` loop. `--json` and `--once`
+produce one JSON document for an Agent.
+
 Read logs without downloading the complete result:
 
 ```bash
@@ -487,9 +517,38 @@ Retry only the failed stage when `retryable` is true:
 - retry `status`, `logs`, or `pull` after transient SSH failures;
 - retry transfer after `UPLOAD_FAILED` or `PULL_FAILED` only after checking the
   task record;
-- never blindly repeat `submit`, because the scheduler may already have
-  accepted the job;
+- repeat the exact same `submit` command after a transport error; JoyRun's
+  submission key reuses the existing Task and does not call Slurm again;
+- do not add `--force-new` unless the user explicitly requests a distinct run;
 - do not treat `PULL_FAILED` as a reason to recompute.
 
 Report the error code, task ID if available, compute state, pull state, and
 safest next action to the user.
+
+## Local daemon and durable work
+
+Start the local daemon before any project, task, scheduler, or remote command.
+The daemon is mandatory: the CLI never falls back to direct SSH or SQLite
+access. Normal `submit` and `pull` commands are local admissions and return
+immediately:
+
+```bash
+joyrun daemon start
+joyrun submit SOURCE -t TARGET --json
+joyrun operation list --json
+joyrun operation show jo_OPERATION_ID --json
+joyrun operation tasks jo_OPERATION_ID --json
+joyrun operation wait jo_OPERATION_ID --until accepted --json
+joyrun operation wait jo_OPERATION_ID --until terminal --json
+```
+
+Use `operation cancel` to stop local queued or running pull work; a running
+submit is rejected as unsafe and it never cancels Slurm. Normal daemon-mode
+`status` is cache-first; use `status --refresh` when remote confirmation is
+required.
+Use the exact `jr_...` task ID for scheduler cancellation. The daemon refreshes
+active tasks and supports opt-in `--auto-pull=completed|terminal`; it never
+changes scientific inputs or deletes remote task data. If the daemon is not
+running, report `DAEMON_REQUIRED` and start it; do not invent a second
+background process. Existing stable-1 databases require the explicit
+`joyrun database upgrade --to stable-2` command; never silently migrate them.

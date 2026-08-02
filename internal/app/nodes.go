@@ -44,7 +44,7 @@ func (a *App) TargetNodes(
 	if err != nil {
 		return TargetNodesResult{}, err
 	}
-	nodes, err := (scheduler.Slurm{Runner: a.Runner}).Nodes(
+	nodes, err := a.scheduler().Nodes(
 		ctx, cluster.Host, partition.Name,
 	)
 	if err != nil {

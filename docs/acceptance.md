@@ -3,6 +3,26 @@
 Run this checklist before publishing a JoyRun release. Unit tests do not
 replace validation against a real OpenSSH server and Slurm installation.
 
+## Release gate
+
+The release commit must be clean and the binary version must match the tag.
+Run these checks from the release commit:
+
+```bash
+go mod verify
+go test ./...
+go test -race ./...
+go vet ./...
+git diff --check
+make build
+```
+
+Build and smoke-test the daemon on Linux, macOS, and native Windows. Start the
+daemon before every project/task command; a stopped daemon must return
+`DAEMON_REQUIRED` and must never open SSH. Record the exact JoyRun, Go,
+OpenSSH, transfer-backend, Slurm, and operating-system versions with the
+release notes.
+
 ## Prepare a smoke target
 
 Adapt [`examples/smoke-config.yaml`](../examples/smoke-config.yaml) with the
@@ -57,6 +77,18 @@ test project and run `joyrun doctor TARGET` before the scenarios below.
 - Move the local project and confirm source lookup still works.
 - Delete or redirect the SQLite database, run `recover --scan`, recover one
   candidate, and refresh its status.
+- Start the local daemon, admit a harmless `submit` operation, close
+  the client, and verify `operation show` reaches a terminal state.
+- Stop the daemon while a durable operation is queued, restart it, and verify
+  the operation lease is reclaimed exactly once.
+- Run `operation cancel` on queued work and verify the worker does not replace
+  the cancelled state with a later success.
+- Submit with `--auto-pull=completed`, wait for a terminal scheduler state, and
+  verify the daemon creates at most one background pull without overwriting
+  submitted inputs.
+- Upgrade a copied stable-1 database with `database upgrade --dry-run` and
+  then the explicit upgrade command; verify the backup remains and a second
+  upgrade is refused rather than silently changing data.
 
 ## Platform matrix
 

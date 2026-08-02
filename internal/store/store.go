@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/wxia529/joyrun/internal/fault"
@@ -18,8 +19,11 @@ import (
 const (
 	schemaVersion = 1
 	schemaChannel = "stable"
-	schemaLabel   = "stable-1"
+	schemaLabel   = "stable-2"
 )
+
+// SchemaLabel is exposed to the daemon handshake and diagnostics.
+const SchemaLabel = schemaChannel + "/" + schemaLabel
 
 type Store struct {
 	db *sql.DB
@@ -122,6 +126,10 @@ WHERE type='table' AND name='joyrun_meta'`).Scan(&metadataTable); err != nil {
 		return fault.Wrap("DATABASE_FAILED", "cannot read database schema label", false, err)
 	}
 	if channel != schemaChannel || label != schemaLabel {
+		if channel == schemaChannel && label == "stable-1" && schemaLabel == "stable-2" {
+			return fault.New("DATABASE_UPGRADE_REQUIRED",
+				"database is stable/stable-1; run `joyrun database upgrade --to stable-2` before using this build", false)
+		}
 		return fault.New("DATABASE_UNSUPPORTED",
 			fmt.Sprintf("database is %s/%s; this build requires %s/%s",
 				channel, label, schemaChannel, schemaLabel), false)
@@ -142,7 +150,7 @@ CREATE TABLE IF NOT EXISTS joyrun_meta (
 );
 INSERT OR IGNORE INTO joyrun_meta(key,value) VALUES
   ('release_channel','stable'),
-  ('schema_label','stable-1');
+  ('schema_label','stable-2');
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   last_path TEXT NOT NULL,
@@ -194,6 +202,87 @@ CREATE TABLE IF NOT EXISTS task_events (
 CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(project_id, source_path, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, id);
+CREATE TABLE IF NOT EXISTS operations (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  cluster_key TEXT NOT NULL DEFAULT '',
+  dedup_key TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  result TEXT NOT NULL DEFAULT '{}',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 0,
+  retry_deadline_at TEXT,
+  next_attempt_at TEXT,
+  lease_owner TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  error_code TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  retryable INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  updated_at TEXT NOT NULL,
+  finished_at TEXT,
+  FOREIGN KEY(project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_operations_state ON operations(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_operations_project ON operations(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operations_cluster ON operations(cluster_key, state);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_dedup
+  ON operations(kind, dedup_key) WHERE dedup_key <> '';
+CREATE TABLE IF NOT EXISTS operation_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  operation_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  message TEXT NOT NULL DEFAULT '',
+  data TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(operation_id) REFERENCES operations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_operation_events ON operation_events(operation_id, id);
+CREATE TABLE IF NOT EXISTS operation_tasks (
+  operation_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending',
+  result TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY(operation_id, task_id),
+  UNIQUE(operation_id, ordinal),
+  FOREIGN KEY(operation_id) REFERENCES operations(id) ON DELETE CASCADE,
+  FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_operation_tasks_task ON operation_tasks(task_id, operation_id);
+CREATE TABLE IF NOT EXISTS transfer_items (
+  operation_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  remote_path TEXT NOT NULL,
+  local_path TEXT NOT NULL,
+  expected_size INTEGER NOT NULL DEFAULT 0,
+  expected_sha256 TEXT NOT NULL DEFAULT '',
+  transferred_size INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL,
+  error_code TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(operation_id, task_id, remote_path),
+  FOREIGN KEY(operation_id) REFERENCES operations(id) ON DELETE CASCADE,
+  FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_transfer_items_operation ON transfer_items(operation_id, ordinal);
+CREATE TABLE IF NOT EXISTS cluster_runtime (
+  cluster_key TEXT PRIMARY KEY,
+  config_hash TEXT NOT NULL,
+  cluster_name TEXT NOT NULL,
+  last_contact_at TEXT,
+  last_success_at TEXT,
+  last_error_code TEXT NOT NULL DEFAULT '',
+  next_poll_at TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 `
 
 func (s *Store) BindProject(ctx context.Context, project model.Project) error {
@@ -207,8 +296,138 @@ ON CONFLICT(id) DO UPDATE SET last_path=excluded.last_path,updated_at=excluded.u
 	return nil
 }
 
+func (s *Store) ListProjects(ctx context.Context) ([]model.Project, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id,last_path FROM projects ORDER BY updated_at DESC")
+	if err != nil {
+		return nil, fault.Wrap("DATABASE_FAILED", "cannot list projects", true, err)
+	}
+	defer rows.Close()
+	var result []model.Project
+	for rows.Next() {
+		var p model.Project
+		if err := rows.Scan(&p.ProjectID, &p.Root); err != nil {
+			return nil, fault.Wrap("DATABASE_FAILED", "cannot decode project", false, err)
+		}
+		result = append(result, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fault.Wrap("DATABASE_FAILED", "cannot finish listing projects", true, err)
+	}
+	return result, nil
+}
+
+// GetProject returns the most recently bound local path for a Project ID. The
+// daemon uses this indirection so queued Operations continue to find a moved
+// Project without trusting the absolute path captured at admission time.
+func (s *Store) GetProject(ctx context.Context, projectID string) (model.Project, error) {
+	var p model.Project
+	err := s.db.QueryRowContext(ctx, "SELECT id,last_path FROM projects WHERE id=?", projectID).
+		Scan(&p.ProjectID, &p.Root)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Project{}, fault.New("PROJECT_NOT_FOUND", fmt.Sprintf("project %s is not registered", projectID), false)
+	}
+	if err != nil {
+		return model.Project{}, fault.Wrap("DATABASE_FAILED", "cannot read project binding", true, err)
+	}
+	return p, nil
+}
+
 func (s *Store) CreateTask(ctx context.Context, task *model.Task) error {
 	return s.CreateTasks(ctx, []*model.Task{task})
+}
+
+// FindTaskBySubmissionKey returns the newest non-rejected task for one source
+// and immutable submission fingerprint. It is used to make a retried batch
+// operation reuse tasks already admitted before a worker crash.
+func (s *Store) FindTaskBySubmissionKey(ctx context.Context, projectID, sourcePath, key string) (model.Task, bool, error) {
+	if projectID == "" || sourcePath == "" || key == "" {
+		return model.Task{}, false, fault.New("DATABASE_FAILED", "project, source, and submission key are required", false)
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT "+columns+
+		" FROM tasks WHERE project_id=? AND source_path=? ORDER BY created_at DESC",
+		projectID, sourcePath)
+	if err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot inspect task submissions", true, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		task, scanErr := scanTask(rows)
+		if scanErr != nil {
+			return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot decode task submission", false, scanErr)
+		}
+		if task.Metadata["submission_key"] == key && task.ComputeState != model.ComputeSubmissionFailed {
+			return task, true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot finish task submission inspection", true, err)
+	}
+	return model.Task{}, false, nil
+}
+
+// CreateTaskIdempotent reserves a task submission fingerprint while creating
+// the task record. SQLite serializes the project UPDATE, so two JoyRun
+// processes racing with the same fingerprint cannot both pass the duplicate
+// check. A previously definitely rejected submission may be retried; an
+// accepted, uncertain, or otherwise active submission is returned instead.
+func (s *Store) CreateTaskIdempotent(ctx context.Context, task *model.Task, forceNew bool) (model.Task, bool, error) {
+	if forceNew {
+		return model.Task{}, false, s.CreateTask(ctx, task)
+	}
+	if task.Metadata == nil || task.Metadata["submission_key"] == "" {
+		return model.Task{}, false, fault.New("DATABASE_FAILED",
+			"cannot reserve task without a submission key", false)
+	}
+	if task.Revision == 0 {
+		task.Revision = 1
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_BUSY", "cannot begin task reservation", true, err)
+	}
+	defer tx.Rollback()
+	// Acquire SQLite's write lock before reading candidates. This makes the
+	// check-and-insert operation atomic across independent JoyRun processes.
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE projects SET updated_at=updated_at WHERE id=?", task.ProjectID); err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_BUSY", "cannot reserve task submission", true, err)
+	}
+	rows, err := tx.QueryContext(ctx, "SELECT "+columns+
+		" FROM tasks WHERE project_id=? AND source_path=? ORDER BY created_at DESC",
+		task.ProjectID, task.SourcePath)
+	if err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot inspect task submissions", true, err)
+	}
+	for rows.Next() {
+		existing, scanErr := scanTask(rows)
+		if scanErr != nil {
+			rows.Close()
+			return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot decode task submission", false, scanErr)
+		}
+		if existing.Metadata["submission_key"] == task.Metadata["submission_key"] &&
+			existing.ComputeState != model.ComputeSubmissionFailed {
+			rows.Close()
+			return existing, true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot finish task submission inspection", true, err)
+	}
+	rows.Close()
+	if err := insertTask(ctx, tx, *task); err != nil {
+		return model.Task{}, false, err
+	}
+	if err := insertEvent(ctx, tx, model.TaskEvent{
+		TaskID: task.ID, Type: "TASK_CREATED", Stage: "task",
+		Message: "Task record created", CreatedAt: task.CreatedAt,
+	}); err != nil {
+		return model.Task{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot commit task reservation", true, err)
+	}
+	return model.Task{}, false, nil
 }
 
 // CreateTasks atomically creates a batch of independent task records.
@@ -242,6 +461,76 @@ func (s *Store) CreateTasks(ctx context.Context, tasks []*model.Task) error {
 		return fault.Wrap("DATABASE_FAILED", "cannot commit task creation", true, err)
 	}
 	return nil
+}
+
+// CreateTasksIdempotent is the batch equivalent of CreateTaskIdempotent. A
+// duplicate aborts the whole batch before any new scheduler submission can be
+// attempted, preserving all-or-nothing admission semantics.
+func (s *Store) CreateTasksIdempotent(ctx context.Context, tasks []*model.Task, forceNew bool) (model.Task, bool, error) {
+	if forceNew {
+		return model.Task{}, false, s.CreateTasks(ctx, tasks)
+	}
+	if len(tasks) == 0 {
+		return model.Task{}, false, nil
+	}
+	for _, task := range tasks {
+		if task.Metadata == nil || task.Metadata["submission_key"] == "" {
+			return model.Task{}, false, fault.New("DATABASE_FAILED",
+				"cannot reserve task without a submission key", false)
+		}
+		if task.Revision == 0 {
+			task.Revision = 1
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_BUSY", "cannot begin task reservation", true, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE projects SET updated_at=updated_at WHERE id=?", tasks[0].ProjectID); err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_BUSY", "cannot reserve task submission", true, err)
+	}
+	for _, task := range tasks {
+		rows, err := tx.QueryContext(ctx, "SELECT "+columns+
+			" FROM tasks WHERE project_id=? AND source_path=? ORDER BY created_at DESC",
+			task.ProjectID, task.SourcePath)
+		if err != nil {
+			return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot inspect task submissions", true, err)
+		}
+		for rows.Next() {
+			existing, scanErr := scanTask(rows)
+			if scanErr != nil {
+				rows.Close()
+				return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot decode task submission", false, scanErr)
+			}
+			if existing.Metadata["submission_key"] == task.Metadata["submission_key"] &&
+				existing.ComputeState != model.ComputeSubmissionFailed {
+				rows.Close()
+				return existing, true, nil
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot finish task submission inspection", true, err)
+		}
+		rows.Close()
+	}
+	for _, task := range tasks {
+		if err := insertTask(ctx, tx, *task); err != nil {
+			return model.Task{}, false, err
+		}
+		if err := insertEvent(ctx, tx, model.TaskEvent{
+			TaskID: task.ID, Type: "TASK_CREATED", Stage: "task",
+			Message: "Task record created", CreatedAt: task.CreatedAt,
+		}); err != nil {
+			return model.Task{}, false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Task{}, false, fault.Wrap("DATABASE_FAILED", "cannot commit task reservation", true, err)
+	}
+	return model.Task{}, false, nil
 }
 
 func (s *Store) ImportTask(ctx context.Context, task *model.Task) error {
@@ -438,6 +727,106 @@ WHERE project_id=? AND source_path=? ORDER BY created_at DESC`, projectID, sourc
 func (s *Store) ListTasks(ctx context.Context, projectID string) ([]model.Task, error) {
 	return s.queryTasks(ctx, `SELECT `+columns+` FROM tasks
 WHERE project_id=? ORDER BY created_at DESC`, projectID)
+}
+
+// WatchFilter limits the cache-only watch view without contacting a cluster.
+// Empty fields mean no filter. Attention selects submission/pull failures and
+// other states that need user intervention.
+type WatchFilter struct {
+	ProjectID string
+	Target    string
+	State     string
+	Attention bool
+}
+
+// ListWatchTasks returns a bounded, cache-only view for the global daemon
+// dashboard. It deliberately selects summary columns instead of decoding full
+// immutable Task snapshots, so a project with thousands of historical tasks
+// does not make watch allocate or scan every input manifest and script.
+func (s *Store) ListWatchTasks(ctx context.Context, limit int, filter WatchFilter) ([]model.TaskSummary, int, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	where := make([]string, 0, 4)
+	args := make([]any, 0, 4)
+	if filter.ProjectID != "" {
+		where = append(where, "project_id=?")
+		args = append(args, filter.ProjectID)
+	}
+	if filter.Target != "" {
+		where = append(where, "target_name=?")
+		args = append(args, filter.Target)
+	}
+	if filter.State != "" {
+		where = append(where, "compute_state=?")
+		args = append(args, filter.State)
+	}
+	if filter.Attention {
+		where = append(where, "(compute_state IN ('submission_failed','submission_uncertain','failed') OR pull_state IN ('failed','partial'))")
+	}
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " WHERE " + strings.Join(where, " AND ")
+	}
+	var total int
+	if err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM tasks"+whereSQL, args...).Scan(&total); err != nil {
+		return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot count watch tasks", true, err)
+	}
+	query := `
+SELECT id,project_id,source_path,target_name,cluster_name,scheduler_id,
+       compute_state,pull_state,scheduler_state,scheduler_reason,elapsed,
+       exit_code,scheduler_start,scheduler_end,metadata,created_at,updated_at
+FROM tasks` + whereSQL + `
+ORDER BY CASE
+  WHEN compute_state IN ('submission_failed','submission_uncertain','failed')
+    OR pull_state IN ('failed','partial') THEN 0
+  WHEN compute_state IN ('created','queued','running','unknown')
+    OR pull_state='pulling' THEN 1
+  ELSE 2
+END, updated_at DESC
+
+LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot list watch tasks", true, err)
+	}
+	defer rows.Close()
+	result := make([]model.TaskSummary, 0, limit)
+	for rows.Next() {
+		var task model.TaskSummary
+		var metadata, created, updated string
+		if err := rows.Scan(&task.ID, &task.ProjectID, &task.SourcePath, &task.TargetName,
+			&task.ClusterName, &task.SchedulerID, &task.ComputeState, &task.PullState,
+			&task.SchedulerState, &task.SchedulerReason, &task.Elapsed, &task.ExitCode,
+			&task.SchedulerStart, &task.SchedulerEnd, &metadata, &created, &updated); err != nil {
+			return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot decode watch task", false, err)
+		}
+		parsedCreated, parseErr := time.Parse(time.RFC3339Nano, created)
+		if parseErr != nil {
+			return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot decode watch task creation time", false, parseErr)
+		} else {
+			task.CreatedAt = parsedCreated
+		}
+		parsedUpdated, parseErr := time.Parse(time.RFC3339Nano, updated)
+		if parseErr != nil {
+			return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot decode watch task update time", false, parseErr)
+		} else {
+			task.UpdatedAt = parsedUpdated
+		}
+		var values map[string]string
+		if err := decodeJSON(metadata, &values); err != nil {
+			return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot decode watch task metadata", false, err)
+		}
+		task.SchedulerObservation = values["scheduler_observation"]
+		task.SchedulerObservedAt = values["scheduler_observed_at"]
+		task.SchedulerStaleSince = values["scheduler_stale_since"]
+		result = append(result, task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot finish listing watch tasks", true, err)
+	}
+	return result, total, nil
 }
 
 func (s *Store) queryTasks(ctx context.Context, query string, args ...any) ([]model.Task, error) {
