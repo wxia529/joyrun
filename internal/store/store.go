@@ -761,8 +761,26 @@ func (s *Store) ListWatchTasks(ctx context.Context, limit int, filter WatchFilte
 		where = append(where, "compute_state=?")
 		args = append(args, filter.State)
 	}
+	failure := "(compute_state IN ('submission_failed','submission_uncertain','failed') OR pull_state IN ('failed','partial'))"
+	active := "(compute_state IN ('created','queued','running','unknown','submission_uncertain') OR pull_state='pulling')"
+	superseded := `NOT EXISTS (
+  SELECT 1 FROM tasks newer
+  WHERE newer.project_id=tasks.project_id
+    AND newer.source_path=tasks.source_path
+    AND newer.created_at > tasks.created_at
+)`
 	if filter.Attention {
-		where = append(where, "(compute_state IN ('submission_failed','submission_uncertain','failed') OR pull_state IN ('failed','partial'))")
+		// Attention is an explicit historical failure view, but a failure is
+		// superseded as soon as a newer Task is created for the same Source.
+		where = append(where, failure)
+		where = append(where, superseded)
+	} else if filter.State == "" {
+		// The default view is squeue-like: active work plus failures that
+		// happened recently enough to require attention. Historical terminal
+		// records remain available through list/inspect, not this dashboard.
+		cutoff := time.Now().UTC().Add(-12 * time.Hour).Format(time.RFC3339Nano)
+		where = append(where, "("+active+" OR ("+failure+" AND updated_at>=? AND "+superseded+"))")
+		args = append(args, cutoff)
 	}
 	whereSQL := ""
 	if len(where) > 0 {

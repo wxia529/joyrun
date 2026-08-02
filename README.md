@@ -16,7 +16,7 @@ joyrun daemon start
 joyrun submit task01/eg.inp -t gibbs/orca
 joyrun status task01/eg.inp
 joyrun pull task01/eg.inp
-joyrun watch --once
+joyrun watch
 
 # Durable admission continues after the CLI exits
 joyrun submit task01/eg.inp -t gibbs/orca --json

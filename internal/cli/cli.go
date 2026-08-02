@@ -1083,7 +1083,7 @@ Usage:
   joyrun submit <source>... -t <target> [--glob pattern] [--from file] [--partition name] [--set key=value] [--include glob] [--force-new] [--dry-run] [--auto-pull completed|terminal]
   joyrun status <source|task-id> [--cached|--refresh]
   joyrun status --all [--cached|--refresh]
-  joyrun watch [--once] [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]
+  joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]
   joyrun list [source]
   joyrun inspect <source|task-id>
   joyrun inspect <source|task-id> --events
@@ -1123,7 +1123,7 @@ Repeated submissions are idempotent; use --force-new only for an intentional rer
 JoyRun commands require a running daemon; start it with: joyrun daemon start.
 `,
 		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
-		"watch":   "Usage: joyrun watch [--once] [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]\n",
+		"watch":   "Usage: joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]\n",
 		"list":    "Usage: joyrun list [source]\n",
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
 		"logs":    "Usage: joyrun logs <source|task-id> [--lines N] [--file PATH]\n",

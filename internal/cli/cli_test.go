@@ -226,6 +226,7 @@ func TestUsageExposesCompressedCommandSurface(t *testing.T) {
 		"joyrun pull <source|task-id>...",
 		"joyrun list [source]",
 		"joyrun status --all",
+		"joyrun watch [--project ID]",
 		"joyrun inspect <source|task-id> --events",
 	} {
 		if !strings.Contains(help, expected) {
@@ -237,6 +238,7 @@ func TestUsageExposesCompressedCommandSurface(t *testing.T) {
 		"joyrun history",
 		"joyrun trace",
 		"joyrun reconcile",
+		"joyrun watch --once",
 		"target <show|params>",
 	} {
 		if strings.Contains(help, removed) {

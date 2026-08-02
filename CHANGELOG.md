@@ -3,6 +3,24 @@
 All notable user-visible changes are documented here. JoyRun follows semantic
 version tags, while the SQLite schema is versioned independently.
 
+## [v0.2.1] - 2026-08-02
+
+### Changed
+
+- Made `joyrun watch` a one-shot, cache-only squeue-style query. It no longer
+  starts a resident client loop or accepts an interval flag.
+- Limited the default watch view to active Tasks and failures from the last
+  12 hours; newer Tasks supersede older failures for the same Source. Use
+  `--attention` or an explicit `--state` filter for historical inspection.
+- Clarified the watch contract in the CLI help, README, command guide, and
+  Agent Skill, including the JSON usage for Agents.
+
+### Database compatibility
+
+This release does not change the SQLite schema. Existing `stable-2` databases
+continue to work without migration. Databases still marked `stable-1` must be
+upgraded explicitly with `joyrun database upgrade --to stable-2` before use.
+
 ## [v0.2.0] - 2026-08-02
 
 ### Changed
@@ -171,6 +189,7 @@ The SQLite schema remains `stable/stable-1`.
 - First public release with asynchronous Slurm submission, status, logs,
   bounded pull, global SQLite state, Project identity, and remote recovery.
 
+[v0.2.1]: https://github.com/wxia529/joyrun/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/wxia529/joyrun/compare/v0.1.11...v0.2.0
 [v0.1.5]: https://github.com/wxia529/joyrun/compare/v0.1.4...v0.1.5
 [v0.1.4]: https://github.com/wxia529/joyrun/compare/v0.1.3...v0.1.4

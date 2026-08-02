@@ -161,7 +161,7 @@ func TestListWatchTasksIsBoundedFilteredAndOrderedByAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 3 || len(rows) != 2 || rows[0].ID != "jr_attention" || rows[1].ID != "jr_running" {
+	if total != 2 || len(rows) != 2 || rows[0].ID != "jr_attention" || rows[1].ID != "jr_running" {
 		t.Fatalf("unexpected watch rows: total=%d rows=%#v", total, rows)
 	}
 	rows, total, err = s.ListWatchTasks(ctx, 100, WatchFilter{Target: "target/a", Attention: true})
@@ -170,6 +170,63 @@ func TestListWatchTasksIsBoundedFilteredAndOrderedByAttention(t *testing.T) {
 	}
 	if total != 1 || len(rows) != 1 || rows[0].ID != "jr_attention" {
 		t.Fatalf("unexpected filtered watch rows: total=%d rows=%#v", total, rows)
+	}
+}
+
+func TestListWatchTasksHidesOldAndSupersededFailures(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	project := model.Project{ProjectID: "pj_watch_retention", Root: t.TempDir()}
+	if err := s.BindProject(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	makeTask := func(id, source, state string, created, updated time.Time) model.Task {
+		entry := "input.inp"
+		return model.Task{
+			ID: id, ProjectID: project.ProjectID, SourcePath: source, SourceWorkDir: filepath.Dir(source),
+			SourceEntry: &entry, TargetName: "target/a", ClusterName: "cluster", RemoteDir: "/remote/" + id,
+			ComputeState: state, PullState: model.PullNotPulled, ResolvedParams: map[string]any{},
+			RenderedScript: "echo test", InputManifest: []model.ManifestEntry{{Path: entry}},
+			CreatedAt: created, UpdatedAt: updated, Metadata: map[string]string{},
+		}
+	}
+	tasks := []model.Task{
+		makeTask("jr_recent_failed", "recent/input.inp", model.ComputeFailed, now.Add(-time.Hour), now.Add(-time.Hour)),
+		makeTask("jr_old_failed", "old/input.inp", model.ComputeFailed, now.Add(-13*time.Hour), now.Add(-13*time.Hour)),
+		makeTask("jr_previous_failed", "retry/input.inp", model.ComputeFailed, now.Add(-2*time.Hour), now.Add(-2*time.Hour)),
+		makeTask("jr_replacement", "retry/input.inp", model.ComputeRunning, now.Add(-time.Minute), now),
+		makeTask("jr_completed", "done/input.inp", model.ComputeCompleted, now, now),
+	}
+	for i := range tasks {
+		if err := s.CreateTask(ctx, &tasks[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, total, err := s.ListWatchTasks(ctx, 100, WatchFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(rows) != 2 || rows[0].ID != "jr_recent_failed" || rows[1].ID != "jr_replacement" {
+		t.Fatalf("unexpected default watch rows: total=%d rows=%#v", total, rows)
+	}
+	rows, total, err = s.ListWatchTasks(ctx, 100, WatchFilter{Attention: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(rows) != 2 || rows[0].ID != "jr_recent_failed" || rows[1].ID != "jr_old_failed" {
+		t.Fatalf("unexpected attention rows: total=%d rows=%#v", total, rows)
+	}
+	rows, total, err = s.ListWatchTasks(ctx, 100, WatchFilter{State: model.ComputeFailed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 || len(rows) != 3 {
+		t.Fatalf("explicit state filter should expose history: total=%d rows=%#v", total, rows)
 	}
 }
 

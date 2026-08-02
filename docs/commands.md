@@ -37,6 +37,11 @@ batch or pull operation without decoding its result payload.
 The daemon refreshes active Tasks and honors opt-in `--auto-pull=completed` or
 `terminal`.
 
+`watch` is a one-shot, cache-only squeue-style view. By default it shows active
+Tasks and failures from the last 12 hours; a newer Task for the same Source
+supersedes an older failure. Use `--attention` for unresolved failures of any
+age or `--state` for an explicit historical state query.
+
 ## Project and configuration
 
 ```bash
@@ -73,7 +78,7 @@ joyrun submit --glob GLOB -t TARGET
 joyrun submit --from FILE -t TARGET
 joyrun status SOURCE_OR_TASK [--cached|--refresh]
 joyrun status --all [--cached|--refresh]
-joyrun watch [--once] [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]
+joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]
 joyrun list [SOURCE]
 joyrun inspect SOURCE_OR_TASK [--events]
 joyrun logs SOURCE_OR_TASK [--file PATH] [--lines N]

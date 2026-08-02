@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -12,8 +11,6 @@ import (
 	"github.com/wxia529/joyrun/internal/model"
 	"github.com/wxia529/joyrun/internal/store"
 )
-
-const watchRefreshInterval = 5 * time.Second
 
 type watchOutput struct {
 	Tasks       []model.TaskSummary `json:"tasks"`
@@ -26,11 +23,9 @@ type watchOutput struct {
 	Attention   bool                `json:"attention_only,omitempty"`
 }
 
-// watchClient owns the continuous presentation loop. Every iteration is a
-// cheap daemon IPC/cache read; the daemon's reconciliation worker owns all
-// remote scheduler polling. --json and --once intentionally make one request.
+// watchClient is a one-shot, cache-only query. The daemon's reconciliation
+// worker owns remote scheduler polling; the client never stays resident.
 func (c *command) watchClient(args []string) int {
-	once := containsFlag(args, "--once") || c.json
 	requestArgs := append([]string(nil), args...)
 	if !containsFlag(requestArgs, "--once") {
 		requestArgs = append(requestArgs, "--once")
@@ -38,37 +33,18 @@ func (c *command) watchClient(args []string) int {
 	if c.json && !containsFlag(requestArgs, "--json") {
 		requestArgs = append(requestArgs, "--json")
 	}
-	first := true
-	for {
-		response, err := c.callDaemon(requestArgs)
-		if err != nil {
-			c.writeError(err)
-			return 1
-		}
-		if response.Stdout != "" {
-			if !first && !c.json && isTerminalWriter(c.stdout) {
-				_, _ = io.WriteString(c.stdout, "\033[H\033[2J")
-			}
-			_, _ = io.WriteString(c.stdout, response.Stdout)
-		}
-		if response.Stderr != "" {
-			_, _ = io.WriteString(c.stderr, response.Stderr)
-		}
-		if response.ExitCode != 0 {
-			return response.ExitCode
-		}
-		if once {
-			return 0
-		}
-		first = false
-		timer := time.NewTimer(watchRefreshInterval)
-		select {
-		case <-c.ctx.Done():
-			timer.Stop()
-			return 0
-		case <-timer.C:
-		}
+	response, err := c.callDaemon(requestArgs)
+	if err != nil {
+		c.writeError(err)
+		return 1
 	}
+	if response.Stdout != "" {
+		_, _ = io.WriteString(c.stdout, response.Stdout)
+	}
+	if response.Stderr != "" {
+		_, _ = io.WriteString(c.stderr, response.Stderr)
+	}
+	return response.ExitCode
 }
 
 func (c *command) callDaemon(args []string) (daemon.Response, error) {
@@ -104,13 +80,13 @@ func (c *command) watch(db *store.Store, args []string) error {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid watch arguments", false, err)
 	}
 	if flags.NArg() != 0 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun watch [--once] [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]", false)
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]", false)
 	}
 	if limit < 1 || limit > 1000 {
 		return fault.New("INVALID_ARGUMENT", "watch --limit must be between 1 and 1000", false)
 	}
 	if !once {
-		return fault.New("INVALID_ARGUMENT", "watch is controlled by the daemon client; use `joyrun watch` without --once", false)
+		return fault.New("INVALID_ARGUMENT", "watch is a cache-only query and must be called through the JoyRun client", false)
 	}
 	rows, total, err := db.ListWatchTasks(c.ctx, limit, store.WatchFilter{
 		ProjectID: projectID, Target: target, State: state, Attention: attention,
@@ -154,16 +130,18 @@ func formatWatch(output watchOutput) string {
 		b.WriteString("No tasks.\n")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%-22s %-12s %-24s %-10s %-10s %-8s\n", "TASK", "PROJECT", "SOURCE", "STATE", "PULL", "AGE")
+	fmt.Fprintf(&b, "%-30s %-28s %-56s %-17s %-14s %-8s\n",
+		"TASK ID", "PROJECT ID", "SOURCE PATH", "COMPUTE STATE", "PULL STATE", "AGE")
 	for _, task := range output.Tasks {
 		state := task.ComputeState
 		if isWatchAttention(task) {
 			state = "!" + state
 		}
-		fmt.Fprintf(&b, "%-22s %-12s %-24s %-10s %-10s %-8s\n",
-			shortID(task.ID, 21), shortID(task.ProjectID, 11), shortText(task.SourcePath, 23),
-			shortText(state, 9), shortText(task.PullState, 9), watchAge(task.UpdatedAt))
+		fmt.Fprintf(&b, "%-30s %-28s %-56s %-17s %-14s %-8s\n",
+			shortID(task.ID, 30), shortID(task.ProjectID, 28), shortText(task.SourcePath, 56),
+			shortText(state, 16), shortText(task.PullState, 13), watchAge(task.UpdatedAt))
 	}
+	b.WriteString("\nLong values are shortened with ...; use `joyrun inspect TASK_ID --json` for full details.\n")
 	return b.String()
 }
 
@@ -195,22 +173,17 @@ func watchAge(updated time.Time) string {
 }
 
 func shortID(value string, width int) string {
-	if len(value) <= width {
+	runes := []rune(value)
+	if len(runes) <= width {
 		return value
 	}
-	return value[:width-1] + "~"
+	if width <= 3 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-3]) + "..."
 }
 
 func shortText(value string, width int) string {
 	value = strings.ReplaceAll(value, "\n", " ")
 	return shortID(value, width)
-}
-
-func isTerminalWriter(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	info, err := f.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }

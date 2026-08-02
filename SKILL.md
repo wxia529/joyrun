@@ -397,13 +397,17 @@ For a global, cache-only squeue-style view from any directory, use:
 
 ```bash
 joyrun watch
-joyrun watch --once --json
+joyrun watch --json
 joyrun watch --attention --limit 100
 ```
 
-`watch` redraws locally every few seconds; it never opens SSH. Do not add an
-interval flag or replace it with a tight `status` loop. `--json` and `--once`
-produce one JSON document for an Agent.
+`watch` prints one cache-only squeue-style snapshot and exits. By default it
+shows active work plus failures from the last 12 hours; a newer Task for the
+same Source supersedes an older failure. It never opens SSH, starts a resident
+client, or redraws the terminal. Do not add an interval flag or replace it
+with a tight `status` loop. `--json` produces one JSON document for an Agent.
+Use `--attention` for unresolved failures regardless of age, and `--state`
+when historical state inspection is intentional.
 
 Read logs without downloading the complete result:
 
