@@ -3,6 +3,20 @@
 All notable user-visible changes are documented here. JoyRun follows semantic
 version tags, while the SQLite schema is versioned independently.
 
+## [v0.2.2] - 2026-08-02
+
+### Fixed
+
+- Fixed daemon-reserved submissions for nested single-file Sources. The
+  detached snapshot now uploads the selected input at the remote `work/` root,
+  matching `.Input` and `.Stem` in the rendered script.
+- Added a regression test for nested single-file daemon snapshots.
+
+### Database compatibility
+
+This release does not change the SQLite schema. Existing `stable-2` databases
+continue to work without migration.
+
 ## [v0.2.1] - 2026-08-02
 
 ### Changed
@@ -189,6 +203,7 @@ The SQLite schema remains `stable/stable-1`.
 - First public release with asynchronous Slurm submission, status, logs,
   bounded pull, global SQLite state, Project identity, and remote recovery.
 
+[v0.2.2]: https://github.com/wxia529/joyrun/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/wxia529/joyrun/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/wxia529/joyrun/compare/v0.1.11...v0.2.0
 [v0.1.5]: https://github.com/wxia529/joyrun/compare/v0.1.4...v0.1.5

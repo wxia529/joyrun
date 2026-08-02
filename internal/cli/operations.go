@@ -151,6 +151,14 @@ func (c *command) admitDetachedAt(kind string, args []string, workingDir string)
 			if policy := flagValue(clean, "--auto-pull"); policy != "" && policy != "off" {
 				_ = c.setAutoPull(db, &task, policy)
 			}
+			// The detached snapshot is project-shaped so the ordinary batch
+			// submit path can resolve every source. A reserved single-source
+			// execution bypasses that preparation and uploads SnapshotRoot
+			// directly as remote work/. Point it at the source work directory so
+			// .Input and its dependencies are present at the paths used by the
+			// rendered script, rather than under project-relative prefixes.
+			payload.SnapshotRoot = filepath.Join(root,
+				filepath.FromSlash(submitPreview.Previews[0].Source.WorkDir))
 		}
 	}
 	payloadBytes, _ := json.Marshal(payload)

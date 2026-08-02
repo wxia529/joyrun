@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -196,6 +197,16 @@ func TestDaemonAdmissionPersistsTaskAndOperationWithoutRemoteIO(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), tasks[0].ID) || !strings.Contains(stdout.String(), ops[0].ID) {
 		t.Fatalf("admission output=%q", stdout.String())
+	}
+	var payload detachedPayload
+	if err := json.Unmarshal([]byte(ops[0].Payload), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := filepath.Base(payload.SnapshotRoot), "task"; got != want {
+		t.Fatalf("reserved single-source snapshot root = %q, want source work directory %q", payload.SnapshotRoot, want)
+	}
+	if _, err := os.Stat(filepath.Join(payload.SnapshotRoot, "input.txt")); err != nil {
+		t.Fatalf("reserved snapshot did not expose the entry at work root: %v", err)
 	}
 }
 
