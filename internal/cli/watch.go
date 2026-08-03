@@ -13,14 +13,15 @@ import (
 )
 
 type watchOutput struct {
-	Tasks       []model.TaskSummary `json:"tasks"`
-	Total       int                 `json:"total"`
-	Hidden      int                 `json:"hidden"`
-	GeneratedAt time.Time           `json:"generated_at"`
-	ProjectID   string              `json:"project_id,omitempty"`
-	Target      string              `json:"target,omitempty"`
-	State       string              `json:"state,omitempty"`
-	Attention   bool                `json:"attention_only,omitempty"`
+	Tasks         []model.TaskSummary `json:"tasks"`
+	Total         int                 `json:"total"`
+	Hidden        int                 `json:"hidden"`
+	GeneratedAt   time.Time           `json:"generated_at"`
+	ProjectID     string              `json:"project_id,omitempty"`
+	Target        string              `json:"target,omitempty"`
+	State         string              `json:"state,omitempty"`
+	Attention     bool                `json:"attention_only,omitempty"`
+	IncludeDryRun bool                `json:"include_dry_run,omitempty"`
 }
 
 // watchClient is a one-shot, cache-only query. The daemon's reconciliation
@@ -65,7 +66,7 @@ func (c *command) callDaemon(args []string) (daemon.Response, error) {
 
 func (c *command) watch(db *store.Store, args []string) error {
 	flags := newFlags("watch", c.stderr)
-	var once, attention bool
+	var once, attention, includeDryRun bool
 	var projectID, target, state string
 	var limit int
 	flags.BoolVar(&once, "once", false, "render one cache snapshot")
@@ -73,14 +74,15 @@ func (c *command) watch(db *store.Store, args []string) error {
 	flags.StringVar(&target, "target", "", "filter by target")
 	flags.StringVar(&state, "state", "", "filter by compute state")
 	flags.BoolVar(&attention, "attention", false, "show only tasks needing attention")
+	flags.BoolVar(&includeDryRun, "include-dry-run", false, "include persisted dry-run previews")
 	flags.IntVar(&limit, "limit", 100, "maximum visible tasks")
 	if err := flags.Parse(interspersed(args,
 		map[string]bool{"--project": true, "--target": true, "--state": true, "--limit": true},
-		map[string]bool{"--once": true, "--attention": true})); err != nil {
+		map[string]bool{"--once": true, "--attention": true, "--include-dry-run": true})); err != nil {
 		return fault.Wrap("INVALID_ARGUMENT", "invalid watch arguments", false, err)
 	}
 	if flags.NArg() != 0 {
-		return fault.New("INVALID_ARGUMENT", "usage: joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]", false)
+		return fault.New("INVALID_ARGUMENT", "usage: joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--include-dry-run] [--limit N]", false)
 	}
 	if limit < 1 || limit > 1000 {
 		return fault.New("INVALID_ARGUMENT", "watch --limit must be between 1 and 1000", false)
@@ -90,6 +92,7 @@ func (c *command) watch(db *store.Store, args []string) error {
 	}
 	rows, total, err := db.ListWatchTasks(c.ctx, limit, store.WatchFilter{
 		ProjectID: projectID, Target: target, State: state, Attention: attention,
+		IncludeDryRun: includeDryRun,
 	})
 	if err != nil {
 		return err
@@ -97,6 +100,7 @@ func (c *command) watch(db *store.Store, args []string) error {
 	output := watchOutput{
 		Tasks: rows, Total: total, Hidden: total - len(rows), GeneratedAt: time.Now().UTC(),
 		ProjectID: projectID, Target: target, State: state, Attention: attention,
+		IncludeDryRun: includeDryRun,
 	}
 	if c.json {
 		c.write(output, "")
@@ -121,6 +125,9 @@ func formatWatch(output watchOutput) string {
 	if output.Attention {
 		b.WriteString("Attention only  ")
 	}
+	if output.IncludeDryRun {
+		b.WriteString("Including dry-run  ")
+	}
 	fmt.Fprintf(&b, "Tasks: %d", output.Total)
 	if output.Hidden > 0 {
 		fmt.Fprintf(&b, " (%d hidden)", output.Hidden)
@@ -130,19 +137,44 @@ func formatWatch(output watchOutput) string {
 		b.WriteString("No tasks.\n")
 		return b.String()
 	}
-	fmt.Fprintf(&b, "%-30s %-28s %-56s %-17s %-14s %-8s\n",
-		"TASK ID", "PROJECT ID", "SOURCE PATH", "COMPUTE STATE", "PULL STATE", "AGE")
+	showProject := watchShowsProjectID(output)
+	if showProject {
+		fmt.Fprintf(&b, "%-30s %-28s %-56s %-17s %-14s %-8s\n",
+			"TASK ID", "PROJECT ID", "SOURCE PATH", "COMPUTE STATE", "PULL STATE", "AGE")
+	} else {
+		fmt.Fprintf(&b, "%-30s %-56s %-17s %-14s %-8s\n",
+			"TASK ID", "SOURCE PATH", "COMPUTE STATE", "PULL STATE", "AGE")
+	}
 	for _, task := range output.Tasks {
 		state := task.ComputeState
 		if isWatchAttention(task) {
 			state = "!" + state
 		}
-		fmt.Fprintf(&b, "%-30s %-28s %-56s %-17s %-14s %-8s\n",
-			shortID(task.ID, 30), shortID(task.ProjectID, 28), shortText(task.SourcePath, 56),
-			shortText(state, 16), shortText(task.PullState, 13), watchAge(task.UpdatedAt))
+		if showProject {
+			fmt.Fprintf(&b, "%-30s %-28s %-56s %-17s %-14s %-8s\n",
+				shortID(task.ID, 30), shortID(task.ProjectID, 28), shortText(task.SourcePath, 56),
+				shortText(state, 16), shortText(task.PullState, 13), watchAge(task.UpdatedAt))
+		} else {
+			fmt.Fprintf(&b, "%-30s %-56s %-17s %-14s %-8s\n",
+				shortID(task.ID, 30), shortText(task.SourcePath, 56),
+				shortText(state, 16), shortText(task.PullState, 13), watchAge(task.UpdatedAt))
+		}
 	}
 	b.WriteString("\nLong values are shortened with ...; use `joyrun inspect TASK_ID --json` for full details.\n")
 	return b.String()
+}
+
+func watchShowsProjectID(output watchOutput) bool {
+	if output.ProjectID != "" {
+		return false
+	}
+	projects := map[string]struct{}{}
+	for _, task := range output.Tasks {
+		if task.ProjectID != "" {
+			projects[task.ProjectID] = struct{}{}
+		}
+	}
+	return len(projects) > 1
 }
 
 func isWatchAttention(task model.TaskSummary) bool {

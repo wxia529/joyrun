@@ -300,7 +300,7 @@ func (a *App) prepare(
 		metadata["submit_includes"] = string(encoded)
 	}
 	task := model.Task{
-		ID: taskID, ProjectID: p.ProjectID, SourcePath: src.RelativePath, SourceWorkDir: src.WorkDir,
+		ID: taskID, DryRun: scanManifest, ProjectID: p.ProjectID, SourcePath: src.RelativePath, SourceWorkDir: src.WorkDir,
 		SourceEntry: src.Entry, TargetName: targetName, ClusterName: target.Cluster,
 		RemoteDir: remoteDir, ComputeState: model.ComputeCreated, PullState: model.PullNotPulled,
 		ResolvedParams: params,

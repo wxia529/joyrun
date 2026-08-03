@@ -173,6 +173,59 @@ func TestListWatchTasksIsBoundedFilteredAndOrderedByAttention(t *testing.T) {
 	}
 }
 
+func TestListWatchTasksExcludesDryRunPreviewsByDefault(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(filepath.Join(t.TempDir(), "joyrun.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	project := model.Project{ProjectID: "pj_watch_preview", Root: t.TempDir()}
+	if err := s.BindProject(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	makeTask := func(id string, dryRun bool) model.Task {
+		entry := "input.inp"
+		return model.Task{
+			ID: id, DryRun: dryRun, ProjectID: project.ProjectID, SourcePath: id + "/input.inp",
+			SourceWorkDir: id, SourceEntry: &entry, TargetName: "target/a", ClusterName: "cluster",
+			RemoteDir: "/remote/" + id, ComputeState: model.ComputeCreated,
+			PullState: model.PullNotPulled, ResolvedParams: map[string]any{},
+			RenderedScript: "echo test", InputManifest: []model.ManifestEntry{{Path: entry}},
+			CreatedAt: now, UpdatedAt: now,
+		}
+	}
+	preview, actual := makeTask("jr_preview", true), makeTask("jr_actual", false)
+	actual.ComputeState = model.ComputeRunning
+	if err := s.CreateTasks(ctx, []*model.Task{&preview, &actual}); err != nil {
+		t.Fatal(err)
+	}
+	rows, total, err := s.ListWatchTasks(ctx, 100, WatchFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(rows) != 1 || rows[0].ID != actual.ID || rows[0].DryRun {
+		t.Fatalf("default watch included dry-run preview: total=%d rows=%#v", total, rows)
+	}
+	rows, total, err = s.ListWatchTasks(ctx, 100, WatchFilter{IncludeDryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(rows) != 2 {
+		t.Fatalf("explicit dry-run inclusion returned total=%d rows=%#v", total, rows)
+	}
+	var foundPreview bool
+	for _, row := range rows {
+		if row.ID == preview.ID && row.DryRun {
+			foundPreview = true
+		}
+	}
+	if !foundPreview {
+		t.Fatalf("explicit watch view did not mark preview: %#v", rows)
+	}
+}
+
 func TestListWatchTasksHidesOldAndSupersededFailures(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(filepath.Join(t.TempDir(), "joyrun.db"))

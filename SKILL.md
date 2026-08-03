@@ -407,7 +407,9 @@ same Source supersedes an older failure. It never opens SSH, starts a resident
 client, or redraws the terminal. Do not add an interval flag or replace it
 with a tight `status` loop. `--json` produces one JSON document for an Agent.
 Use `--attention` for unresolved failures regardless of age, and `--state`
-when historical state inspection is intentional.
+when historical state inspection is intentional. Submit dry-runs are retained
+as local audit records marked `dry_run` but are excluded from `watch` by
+default; use `watch --include-dry-run` only when reviewing preview history.
 
 Read logs without downloading the complete result:
 

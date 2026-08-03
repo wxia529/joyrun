@@ -3,6 +3,17 @@
 All notable user-visible changes are documented here. JoyRun follows semantic
 version tags, while the SQLite schema is versioned independently.
 
+## [v0.2.3] - 2026-08-03
+
+### Changed
+
+- Persisted submit dry-runs as local audit Tasks marked `dry_run`, without
+  opening SSH or creating Slurm jobs.
+- Excluded dry-run audit Tasks from `joyrun watch` by default, with
+  `--include-dry-run` available for explicit history review.
+- Simplified human-readable `watch` output by showing Project ID only for
+  mixed-Project results; JSON output remains unchanged.
+
 ## [v0.2.2] - 2026-08-02
 
 ### Fixed
@@ -204,6 +215,7 @@ The SQLite schema remains `stable/stable-1`.
   bounded pull, global SQLite state, Project identity, and remote recovery.
 
 [v0.2.2]: https://github.com/wxia529/joyrun/compare/v0.2.1...v0.2.2
+[v0.2.3]: https://github.com/wxia529/joyrun/compare/v0.2.2...v0.2.3
 [v0.2.1]: https://github.com/wxia529/joyrun/compare/v0.2.0...v0.2.1
 [v0.2.0]: https://github.com/wxia529/joyrun/compare/v0.1.11...v0.2.0
 [v0.1.5]: https://github.com/wxia529/joyrun/compare/v0.1.4...v0.1.5

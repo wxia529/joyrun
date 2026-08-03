@@ -100,7 +100,8 @@ func (c *command) admitDetachedAt(kind string, args []string, workingDir string)
 		previewArgs := append([]string{kind}, clean...)
 		previewArgs = append(previewArgs, "--dry-run", "--json", "--config", c.config)
 		var previewOut, previewErr bytes.Buffer
-		if code := run(c.ctx, previewArgs, c.version, &previewOut, &previewErr, workingDir, true); code != 0 {
+		previewCtx := context.WithValue(c.ctx, suppressDryRunPersistenceKey{}, true)
+		if code := run(previewCtx, previewArgs, c.version, &previewOut, &previewErr, workingDir, true); code != 0 {
 			if previewErr.Len() > 0 {
 				return fault.New("DETACH_PREVIEW_FAILED", strings.TrimSpace(previewErr.String()), false)
 			}
@@ -132,6 +133,9 @@ func (c *command) admitDetachedAt(kind string, args []string, workingDir string)
 		if len(submitPreview.Tasks) == 1 && !containsFlag(clean, "--force-new") &&
 			!hasFlagPrefix(clean, "--force-new=") {
 			task := submitPreview.Tasks[0]
+			// The preview above is an internal planning artifact. The reserved
+			// Task represents a real submission and must not inherit its marker.
+			task.DryRun = false
 			key, keyErr := app.SubmissionKey(task)
 			if keyErr != nil {
 				return fault.Wrap("OPERATION_CREATE_FAILED", "cannot calculate task admission key", false, keyErr)

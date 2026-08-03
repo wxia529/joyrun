@@ -914,7 +914,7 @@ func TestLogsSupportLegacySchedulerOutput(t *testing.T) {
 	}
 }
 
-func TestDryRunMakesNoTaskRecord(t *testing.T) {
+func TestDryRunPreviewIsMarkedWithoutRemoteSubmission(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	p, err := project.Init(root)
@@ -929,6 +929,9 @@ func TestDryRunMakesNoTaskRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	if err := s.BindProject(ctx, p); err != nil {
+		t.Fatal(err)
+	}
 	application := &App{
 		Config: model.Config{
 			Clusters: map[string]model.Cluster{"c": {Host: "c", Scheduler: "slurm", RemoteRoot: "/tmp/joyrun"}},
@@ -938,15 +941,25 @@ func TestDryRunMakesNoTaskRecord(t *testing.T) {
 		},
 		Store: s,
 	}
-	preview, _, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, "", true)
+	preview, task, _, err := application.Preview(ctx, root, "job.inp", "c/run", nil, nil, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if preview.RenderedScript != "run 'job.inp'" {
 		t.Fatalf("unexpected preview: %#v", preview)
 	}
-	if _, err := s.LatestTask(ctx, p.ProjectID, "job.inp"); err == nil {
-		t.Fatal("dry run unexpectedly persisted a task")
+	if !task.DryRun {
+		t.Fatal("preview task was not marked as dry-run")
+	}
+	if err := s.CreateTask(ctx, &task); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LatestTask(ctx, p.ProjectID, "job.inp")
+	if err != nil {
+		t.Fatalf("dry run preview was not persisted: %v", err)
+	}
+	if !got.DryRun || got.SchedulerID != "" || got.ComputeState != model.ComputeCreated {
+		t.Fatalf("unexpected dry-run task: %#v", got)
 	}
 }
 

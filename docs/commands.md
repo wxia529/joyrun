@@ -40,7 +40,11 @@ The daemon refreshes active Tasks and honors opt-in `--auto-pull=completed` or
 `watch` is a one-shot, cache-only squeue-style view. By default it shows active
 Tasks and failures from the last 12 hours; a newer Task for the same Source
 supersedes an older failure. Use `--attention` for unresolved failures of any
-age or `--state` for an explicit historical state query.
+age or `--state` for an explicit historical state query. Submit dry-runs are
+persisted as local audit records marked `dry_run` but excluded by default; add
+`--include-dry-run` to include them. Text output shows Task ID, Source path,
+compute state, pull state, and age; Project ID is added only when the result
+contains multiple Projects. JSON output remains complete.
 
 ## Project and configuration
 
@@ -78,7 +82,7 @@ joyrun submit --glob GLOB -t TARGET
 joyrun submit --from FILE -t TARGET
 joyrun status SOURCE_OR_TASK [--cached|--refresh]
 joyrun status --all [--cached|--refresh]
-joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]
+joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--include-dry-run] [--limit N]
 joyrun list [SOURCE]
 joyrun inspect SOURCE_OR_TASK [--events]
 joyrun logs SOURCE_OR_TASK [--file PATH] [--lines N]

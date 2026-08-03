@@ -55,6 +55,11 @@ addressed by the ID in `.joyrun/project.yaml`, not by its absolute path. Each
 command rebinds that ID to the current path, so a project can be moved without
 losing source-path lookup.
 
+Submit previews are retained as local audit records with `dry_run` metadata.
+They remain in task history and never open SSH or create a Slurm job. The
+cache-only `watch` dashboard excludes them by default; `--include-dry-run`
+explicitly includes preview history.
+
 The current development database format is `release_channel=stable`,
 `schema_version=1`, and `schema_label=stable-2`. Existing stable-1 databases
 must be upgraded explicitly with `joyrun database upgrade --to stable-2`; JoyRun

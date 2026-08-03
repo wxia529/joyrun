@@ -43,6 +43,11 @@ type command struct {
 // recursively forwarding an IPC request back to the daemon.
 type daemonExecutionKey struct{}
 
+// suppressDryRunPersistenceKey marks an internal preview used to freeze a
+// detached daemon operation. It must not create an audit Task before the
+// operation reserves its real immutable Task ID.
+type suppressDryRunPersistenceKey struct{}
+
 func daemonExecution(ctx context.Context) bool {
 	value, _ := ctx.Value(daemonExecutionKey{}).(bool)
 	return value
@@ -212,6 +217,12 @@ func (c *command) execute(name string, args []string) error {
 		return c.doctor(application, args)
 	}
 	if name == "submit" && containsFlag(args, "--dry-run") {
+		db, err := store.Open(paths.DatabaseFile())
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		application.Store = db
 		return c.submit(application, args)
 	}
 	if name == "recover" && containsFlag(args, "--scan") {
@@ -451,6 +462,25 @@ func (c *command) submit(application *app.App, args []string) error {
 			}
 			previews = append(previews, preview)
 			tasks = append(tasks, task)
+		}
+		if _, suppressed := c.ctx.Value(suppressDryRunPersistenceKey{}).(bool); !suppressed {
+			projectRoot, err := project.Discover(cwd)
+			if err != nil {
+				return err
+			}
+			if application.Store == nil {
+				return fault.New("DATABASE_FAILED", "task store is required to record a dry-run preview", false)
+			}
+			if err := application.Store.BindProject(c.ctx, projectRoot); err != nil {
+				return err
+			}
+			pointers := make([]*model.Task, 0, len(tasks))
+			for index := range tasks {
+				pointers = append(pointers, &tasks[index])
+			}
+			if err := application.Store.CreateTasks(c.ctx, pointers); err != nil {
+				return err
+			}
 		}
 		if c.json {
 			c.write(submitPreviewOutput{
@@ -1083,7 +1113,7 @@ Usage:
   joyrun submit <source>... -t <target> [--glob pattern] [--from file] [--partition name] [--set key=value] [--include glob] [--force-new] [--dry-run] [--auto-pull completed|terminal]
   joyrun status <source|task-id> [--cached|--refresh]
   joyrun status --all [--cached|--refresh]
-  joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]
+  joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--include-dry-run] [--limit N]
   joyrun list [source]
   joyrun inspect <source|task-id>
   joyrun inspect <source|task-id> --events
@@ -1123,7 +1153,7 @@ Repeated submissions are idempotent; use --force-new only for an intentional rer
 JoyRun commands require a running daemon; start it with: joyrun daemon start.
 `,
 		"status":  "Usage: joyrun status <source|task-id> | joyrun status --all\n",
-		"watch":   "Usage: joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--limit N]\n",
+		"watch":   "Usage: joyrun watch [--project ID] [--target TARGET] [--state STATE] [--attention] [--include-dry-run] [--limit N]\n",
 		"list":    "Usage: joyrun list [source]\n",
 		"inspect": "Usage: joyrun inspect <source|task-id> [--events]\n",
 		"logs":    "Usage: joyrun logs <source|task-id> [--lines N] [--file PATH]\n",

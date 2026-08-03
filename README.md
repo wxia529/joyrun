@@ -144,9 +144,12 @@ Always preview a new source/Target combination:
 joyrun submit task01/eg.inp -t gibbs/orca --dry-run
 ```
 
-Preview performs no SSH operation and creates no database task. Check the
-source contract, software identity, partition facts, parameters, exact upload
-manifest, remote directory, and rendered script before submitting.
+Preview performs no SSH operation and creates no Slurm job. JoyRun records the
+preview locally as a Task marked `dry_run` for auditability; the default
+`watch` view excludes it. Use `joyrun watch --include-dry-run` when reviewing
+preview history. Check the source contract, software identity, partition
+facts, parameters, exact upload manifest, remote directory, and rendered
+script before submitting.
 
 ## Configuration model
 

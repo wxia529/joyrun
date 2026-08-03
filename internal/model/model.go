@@ -102,6 +102,7 @@ type ManifestEntry struct {
 type Task struct {
 	ID              string            `json:"id"`
 	Revision        int64             `json:"revision"`
+	DryRun          bool              `json:"dry_run,omitempty"`
 	ProjectID       string            `json:"project_id"`
 	SourcePath      string            `json:"source_path"`
 	SourceWorkDir   string            `json:"source_workdir"`
@@ -193,6 +194,7 @@ const (
 
 type TaskSummary struct {
 	ID                   string    `json:"id"`
+	DryRun               bool      `json:"dry_run,omitempty"`
 	ProjectID            string    `json:"project_id"`
 	SourcePath           string    `json:"source_path"`
 	TargetName           string    `json:"target"`
@@ -215,7 +217,7 @@ type TaskSummary struct {
 
 func SummarizeTask(task Task) TaskSummary {
 	return TaskSummary{
-		ID: task.ID, ProjectID: task.ProjectID, SourcePath: task.SourcePath, TargetName: task.TargetName,
+		ID: task.ID, DryRun: task.DryRun, ProjectID: task.ProjectID, SourcePath: task.SourcePath, TargetName: task.TargetName,
 		ClusterName: task.ClusterName, SchedulerID: task.SchedulerID,
 		ComputeState: task.ComputeState, PullState: task.PullState,
 		SchedulerState: task.SchedulerState, SchedulerReason: task.SchedulerReason,

@@ -20,6 +20,7 @@ const (
 	schemaVersion = 1
 	schemaChannel = "stable"
 	schemaLabel   = "stable-2"
+	dryRunKey     = "dry_run"
 )
 
 // SchemaLabel is exposed to the daemon handshake and diagnostics.
@@ -733,10 +734,11 @@ WHERE project_id=? ORDER BY created_at DESC`, projectID)
 // Empty fields mean no filter. Attention selects submission/pull failures and
 // other states that need user intervention.
 type WatchFilter struct {
-	ProjectID string
-	Target    string
-	State     string
-	Attention bool
+	ProjectID     string
+	Target        string
+	State         string
+	Attention     bool
+	IncludeDryRun bool
 }
 
 // ListWatchTasks returns a bounded, cache-only view for the global daemon
@@ -760,6 +762,11 @@ func (s *Store) ListWatchTasks(ctx context.Context, limit int, filter WatchFilte
 	if filter.State != "" {
 		where = append(where, "compute_state=?")
 		args = append(args, filter.State)
+	}
+	if !filter.IncludeDryRun {
+		// Dry-run records are persisted for auditability, but are not compute
+		// work and must not appear in the operational dashboard by default.
+		where = append(where, `(metadata NOT LIKE '%"dry_run":"1"%' AND metadata NOT LIKE '%"dry_run":true%')`)
 	}
 	failure := "(compute_state IN ('submission_failed','submission_uncertain','failed') OR pull_state IN ('failed','partial'))"
 	active := "(compute_state IN ('created','queued','running','unknown','submission_uncertain') OR pull_state='pulling')"
@@ -836,6 +843,7 @@ LIMIT ?`
 		if err := decodeJSON(metadata, &values); err != nil {
 			return nil, 0, fault.Wrap("DATABASE_FAILED", "cannot decode watch task metadata", false, err)
 		}
+		task.DryRun = values[dryRunKey] == "1" || values[dryRunKey] == "true"
 		task.SchedulerObservation = values["scheduler_observation"]
 		task.SchedulerObservedAt = values["scheduler_observed_at"]
 		task.SchedulerStaleSince = values["scheduler_stale_since"]
@@ -984,6 +992,7 @@ func scanTask(row scanner) (model.Task, error) {
 	if err := decodeJSON(metadata, &task.Metadata); err != nil {
 		return task, err
 	}
+	task.DryRun = task.Metadata[dryRunKey] == "1" || task.Metadata[dryRunKey] == "true"
 	task.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
 	if err != nil {
 		return task, err
@@ -1018,7 +1027,16 @@ func encodeTask(task model.Task) ([]any, error) {
 	pull, _ := json.Marshal(task.PullPatterns)
 	push, _ := json.Marshal(task.PushExcludes)
 	logs, _ := json.Marshal(task.Logs)
-	metadata, _ := json.Marshal(task.Metadata)
+	metadataValues := make(map[string]string, len(task.Metadata)+1)
+	for key, value := range task.Metadata {
+		metadataValues[key] = value
+	}
+	if task.DryRun {
+		metadataValues[dryRunKey] = "1"
+	} else {
+		delete(metadataValues, dryRunKey)
+	}
+	metadata, _ := json.Marshal(metadataValues)
 	var entry, submitted, pulled any
 	if task.SourceEntry != nil {
 		entry = *task.SourceEntry

@@ -15,6 +15,7 @@ import (
 	"github.com/wxia529/joyrun/internal/app"
 	"github.com/wxia529/joyrun/internal/fault"
 	"github.com/wxia529/joyrun/internal/model"
+	"github.com/wxia529/joyrun/internal/paths"
 	"github.com/wxia529/joyrun/internal/project"
 	"github.com/wxia529/joyrun/internal/store"
 )
@@ -52,8 +53,23 @@ func TestFormatWatchMarksAttentionAndHiddenRows(t *testing.T) {
 			ComputeState: model.ComputeFailed, PullState: model.PullNotPulled, UpdatedAt: time.Now().UTC()}},
 		Total: 3, Hidden: 2, GeneratedAt: time.Now().UTC(),
 	})
-	if !strings.Contains(text, "!failed") || !strings.Contains(text, "2 hidden") || !strings.Contains(text, "jr_attention") {
+	if !strings.Contains(text, "!failed") || !strings.Contains(text, "2 hidden") || !strings.Contains(text, "jr_attention") || strings.Contains(text, "PROJECT ID") {
 		t.Fatalf("watch output lacks expected markers: %s", text)
+	}
+}
+
+func TestFormatWatchShowsProjectIDOnlyForMixedProjects(t *testing.T) {
+	base := model.TaskSummary{ID: "jr_one", ProjectID: "project-a", SourcePath: "task/eg.inp",
+		ComputeState: model.ComputeRunning, PullState: model.PullNotPulled, UpdatedAt: time.Now().UTC()}
+	text := formatWatch(watchOutput{Tasks: []model.TaskSummary{base}, Total: 1})
+	if strings.Contains(text, "PROJECT ID") {
+		t.Fatalf("single-project watch unexpectedly shows project column: %s", text)
+	}
+	base.ID = "jr_two"
+	base.ProjectID = "project-b"
+	text = formatWatch(watchOutput{Tasks: []model.TaskSummary{{ID: "jr_one", ProjectID: "project-a", SourcePath: "a", ComputeState: model.ComputeRunning, UpdatedAt: time.Now().UTC()}, base}, Total: 2})
+	if !strings.Contains(text, "PROJECT ID") || !strings.Contains(text, "project-a") || !strings.Contains(text, "project-b") {
+		t.Fatalf("mixed-project watch omitted project column: %s", text)
 	}
 }
 
@@ -184,7 +200,7 @@ func TestDaemonAdmissionPersistsTaskAndOperationWithoutRemoteIO(t *testing.T) {
 		t.Fatalf("projects=%#v err=%v", projects, err)
 	}
 	tasks, err := stored.ListTasks(context.Background(), projects[0].ProjectID)
-	if err != nil || len(tasks) != 1 || tasks[0].ComputeState != model.ComputeCreated {
+	if err != nil || len(tasks) != 1 || tasks[0].ComputeState != model.ComputeCreated || tasks[0].DryRun {
 		t.Fatalf("tasks=%#v err=%v", tasks, err)
 	}
 	ops, err := stored.ListOperations(context.Background(), projects[0].ProjectID)
@@ -455,7 +471,7 @@ targets:
 	}
 }
 
-func TestDryRunDoesNotRequireTaskDatabase(t *testing.T) {
+func TestDryRunPersistsMarkedPreviewWithoutRemoteSubmission(t *testing.T) {
 	root := t.TempDir()
 	if _, err := project.Init(root); err != nil {
 		t.Fatal(err)
@@ -500,7 +516,7 @@ targets:
 		t.Fatal(err)
 	}
 	defer os.Chdir(old)
-	t.Setenv("JOYRUN_DB", t.TempDir())
+	t.Setenv("JOYRUN_DB", filepath.Join(t.TempDir(), "joyrun.db"))
 	var stdout, stderr bytes.Buffer
 	c := &command{
 		ctx: context.Background(), config: configPath,
@@ -509,7 +525,7 @@ targets:
 	if err := c.execute("submit", []string{
 		"input.dat", "-t", "c/run", "--include", "dependency.dat", "--dry-run", "--allow-project-root",
 	}); err != nil {
-		t.Fatalf("dry-run unexpectedly required the task database: %v", err)
+		t.Fatalf("dry-run preview failed: %v", err)
 	}
 	if !bytes.Contains(stdout.Bytes(), []byte("dependency.dat")) {
 		t.Fatalf("dry-run omitted explicit dependency: %q", stdout.String())
@@ -518,7 +534,7 @@ targets:
 	if err := c.execute("submit", []string{
 		"input.dat", "input-two.dat", "-t", "c/run", "--dry-run", "--allow-project-root",
 	}); err != nil {
-		t.Fatalf("batch dry-run unexpectedly required the task database: %v", err)
+		t.Fatalf("batch dry-run preview failed: %v", err)
 	}
 	if !bytes.Contains(stdout.Bytes(), []byte("Batch preview: 2 task(s)")) {
 		t.Fatalf("unexpected batch preview: %q", stdout.String())
@@ -533,6 +549,27 @@ targets:
 	for _, expected := range []string{`"previews":[`, `"failures":[]`} {
 		if !bytes.Contains(stdout.Bytes(), []byte(expected)) {
 			t.Fatalf("unified submit JSON omitted %s: %q", expected, stdout.String())
+		}
+	}
+	db, err := store.Open(paths.DatabaseFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	p, err := project.Discover(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := db.ListTasks(context.Background(), p.ProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 4 {
+		t.Fatalf("dry-run created %d task records, want 4", len(tasks))
+	}
+	for _, task := range tasks {
+		if !task.DryRun || task.SchedulerID != "" || task.ComputeState != model.ComputeCreated {
+			t.Fatalf("unexpected dry-run task record: %#v", task)
 		}
 	}
 }
